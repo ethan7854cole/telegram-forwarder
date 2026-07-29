@@ -162,25 +162,66 @@ def _is_duplicate(key):
 
 
 # ---------------------------------------------------------------------------
-# Milestone alerts
+# Target group ledger
 #
-# Every notification carries the group's running totals:
-#     ➕ Total In : 675.01$
-#     ➖ Total Out: 557.00$
-# so both figures are read straight off the message. No extra message types are
-# watched and nothing new is forwarded - the /add and /out commands stay in the
-# source group where they belong.
+# Each target group keeps its OWN running totals, controlled only by Ethan and
+# Larry. A forwarded payment adds to Total In; /add and /out adjust either side.
+# The two total lines of a forwarded notification are rewritten to show this
+# ledger, so the target group shows your books rather than the source group's.
+#
+# The bot never does arithmetic on the source group's figures - it reads them
+# once to open the ledger, and from then on the ledger is its own.
 # ---------------------------------------------------------------------------
 
 MILESTONE_IN_STEP = int(os.getenv('MILESTONE_IN_STEP', '5000'))
 MILESTONE_OUT_STEP = int(os.getenv('MILESTONE_OUT_STEP', '1000'))
 MILESTONE_MENTIONS = os.getenv('MILESTONE_MENTIONS', '@ethannxxxx @Larryyxx')
 
+# Only these accounts may move the numbers. Numeric ids, so a username change
+# can neither break nor hijack it. @ethannxxxx and @Larryyxx.
+LEDGER_ADMINS = {7418675217, 7578145913}
+
+# Every chat that receives forwards.
+TARGET_CHATS = {t for targets in FORWARD_RULES.values() for t in targets}
+
+BOT_ID = int(BOT_TOKEN.split(':')[0]) if BOT_TOKEN and ':' in BOT_TOKEN else None
+
 _TOTAL_IN_RE = re.compile(r'Total\s*In\s*:?\s*([\d,]+(?:\.\d+)?)', re.I)
 _TOTAL_OUT_RE = re.compile(r'Total\s*Out\s*:?\s*([\d,]+(?:\.\d+)?)', re.I)
 
-# rule_key -> (last_total_in, last_total_out)
-_totals_seen = {}
+# Same patterns, split so the number can be substituted in place.
+_TOTAL_IN_SUB = re.compile(r'(Total\s*In\s*:?\s*)([\d,]+(?:\.\d+)?)', re.I)
+_TOTAL_OUT_SUB = re.compile(r'(Total\s*Out\s*:?\s*)([\d,]+(?:\.\d+)?)', re.I)
+
+_RECEIVED_RE = re.compile(r'You\s+received\s+\$?\s*([\d,]+(?:\.\d+)?)', re.I)
+_CMD_AMOUNT_RE = re.compile(r'^/\w+(?:@\w+)?\s+\$?\s*([\d,]+(?:\.\d+)?)')
+_SET_RE = re.compile(r'^/set(?:@\w+)?\s+(in|out)\s+\$?\s*([\d,]+(?:\.\d+)?)', re.I)
+
+# target chat id -> {'in': float, 'out': float}
+_ledger = {}
+
+
+def _to_float(raw):
+    try:
+        return float(raw.replace(',', ''))
+    except (AttributeError, ValueError):
+        return None
+
+
+def parse_received_amount(text):
+    """The dollar figure out of 'You received $15.0 from Gabriel W.'"""
+    m = _RECEIVED_RE.search(text)
+    return _to_float(m.group(1)) if m else None
+
+
+def rewrite_totals(text, total_in, total_out):
+    """Swap the two total lines for the ledger's figures, preserving the rest of
+    the line exactly. Text without a totals block is returned untouched."""
+    if not _TOTAL_IN_SUB.search(text):
+        return text
+    text = _TOTAL_IN_SUB.sub(lambda m: f"{m.group(1)}{total_in:.2f}", text, count=1)
+    text = _TOTAL_OUT_SUB.sub(lambda m: f"{m.group(1)}{total_out:.2f}", text, count=1)
+    return text
 
 
 def parse_totals(text):
@@ -240,42 +281,53 @@ def out_milestone_text(level, total_in, total_out):
             "-ETHAN")
 
 
-async def check_milestones(rule_key, targets, text, from_bot):
-    """Post an alert to the rule's targets when a threshold is crossed.
+async def check_milestones(target, before, after):
+    """Post an alert to one target group when its ledger crosses a threshold.
 
-    Only bot-sent messages count, so a human re-pasting an old notification
-    cannot make the totals jump and fire a false alert."""
-    if not from_bot:
-        return
-
-    total_in, total_out = parse_totals(text)
-    if total_in is None and total_out is None:
-        return
-
-    previous = _totals_seen.get(rule_key)
-    _totals_seen[rule_key] = (total_in, total_out)
-    if previous is None:
-        # First notification after a restart only establishes a baseline.
-        print(f"📊 [TOTALS] Baseline for {rule_key}: "
-              f"in={total_in} out={total_out}", flush=True)
-        return
-
+    `before` and `after` are (total_in, total_out) for that group's ledger."""
     alerts = []
-    level = crossed_milestone(previous[0], total_in, MILESTONE_IN_STEP)
+    level = crossed_milestone(before[0], after[0], MILESTONE_IN_STEP)
     if level:
-        alerts.append(('IN', level, in_milestone_text(level, total_in, total_out)))
-    level = crossed_milestone(previous[1], total_out, MILESTONE_OUT_STEP)
+        alerts.append(('IN', level, in_milestone_text(level, after[0], after[1])))
+    level = crossed_milestone(before[1], after[1], MILESTONE_OUT_STEP)
     if level:
-        alerts.append(('OUT', level, out_milestone_text(level, total_in, total_out)))
+        alerts.append(('OUT', level, out_milestone_text(level, after[0], after[1])))
 
     for kind, level, body in alerts:
-        print(f"🏁 [MILESTONE {kind}] ${level:,} crossed in {rule_key}", flush=True)
-        for target in targets:
-            try:
-                await bot.send_message(target, body)
-                print(f"   🎯 {kind} milestone sent to {target}", flush=True)
-            except Exception as e:
-                print(f"   ❌ milestone send failed for {target}: {e}", flush=True)
+        print(f"🏁 [MILESTONE {kind}] ${level:,} crossed in {target}", flush=True)
+        try:
+            await bot.send_message(target, body)
+            print(f"   🎯 {kind} milestone sent to {target}", flush=True)
+        except Exception as e:
+            print(f"   ❌ milestone send failed for {target}: {e}", flush=True)
+
+
+def ledger_apply_payment(target, text):
+    """Book a forwarded payment against a target's ledger.
+
+    Returns (before, after) as (in, out) tuples, or None when there is nothing
+    to show - a message with no totals block and no ledger yet."""
+    if target not in _ledger:
+        # Opening balance is the source group's current figures. The payment in
+        # this very message is already inside that figure, so it is not added
+        # again - otherwise the first message would be counted twice.
+        src_in, src_out = parse_totals(text)
+        if src_in is None and src_out is None:
+            return None
+        _ledger[target] = {'in': src_in or 0.0, 'out': src_out or 0.0}
+        print(f"📒 [LEDGER] {target} opened at in={_ledger[target]['in']:.2f} "
+              f"out={_ledger[target]['out']:.2f}", flush=True)
+        snapshot = (_ledger[target]['in'], _ledger[target]['out'])
+        return snapshot, snapshot
+
+    led = _ledger[target]
+    before = (led['in'], led['out'])
+    amount = parse_received_amount(text)
+    if amount:
+        led['in'] += amount
+        print(f"📒 [LEDGER] {target} +{amount:.2f} in -> "
+              f"in={led['in']:.2f} out={led['out']:.2f}", flush=True)
+    return before, (led['in'], led['out'])
 
 
 async def process_incoming(chat_id, text, origin, from_bot=False, sent_at=None):
@@ -303,20 +355,32 @@ async def process_incoming(chat_id, text, origin, from_bot=False, sent_at=None):
 
     print("✅ [KEYWORD MATCH] Forwarding message...", flush=True)
     for target in FORWARD_RULES[rule_key]:
+        # Each target keeps its own books, so the totals shown are per target.
+        movement = ledger_apply_payment(target, text) if from_bot else None
+        body = fixed
+        if movement:
+            body = rewrite_totals(fixed, movement[1][0], movement[1][1])
+        elif target in _ledger:
+            # Human-pasted text. Show the ledger so the group never displays two
+            # different sets of numbers, but do not book an amount we cannot
+            # trust - only the notification bot moves the books.
+            body = rewrite_totals(fixed, _ledger[target]['in'], _ledger[target]['out'])
         try:
             # Always sent with the bot token, never from the user account.
-            await bot.send_message(target, fixed)
+            await bot.send_message(target, body)
             print(f"🚀 [FORWARD SUCCESS] Sent to {target}", flush=True)
             forwarded_count += 1
             today_count += 1
-            last_messages.append(fixed[:50])
+            last_messages.append(body[:50])
             if len(last_messages) > 10:
                 last_messages.pop(0)
         except Exception as e:
             print(f"❌ [FORWARD ERROR] Target {target}: {e}", flush=True)
+            continue
 
-    # After the payment confirmation, so the alert lands beneath it.
-    await check_milestones(rule_key, FORWARD_RULES[rule_key], text, from_bot)
+        # After the payment confirmation, so the alert lands beneath it.
+        if movement:
+            await check_milestones(target, movement[0], movement[1])
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +406,94 @@ async def status(message):
 async def ping(message):
     if message.chat.id == ADMIN_ID:
         await bot.reply_to(message, 'Pong! Bot is alive.')
+
+
+@bot.message_handler(commands=['add', 'out'])
+async def ledger_command(message):
+    """/add <amount> and /out <amount>, target groups only, Ethan and Larry only."""
+    chat_id = message.chat.id
+    user_id = getattr(message.from_user, 'id', None)
+
+    # Silent in source groups and DMs, so the source side cannot reach the books.
+    if chat_id not in TARGET_CHATS:
+        return
+
+    if user_id not in LEDGER_ADMINS:
+        print(f"⛔ [LEDGER] {user_id} denied in {chat_id}", flush=True)
+        await bot.reply_to(message, "⛔ Not permitted. Only Ethan and Larry can "
+                                    "change the totals.")
+        return
+
+    command = message.text.lstrip('/').split('@')[0].split()[0].lower()
+    match = _CMD_AMOUNT_RE.match(message.text)
+    amount = _to_float(match.group(1)) if match else None
+    if amount is None or amount <= 0:
+        await bot.reply_to(message, f"Usage: /{command} <amount>\nExample: /{command} 100")
+        return
+
+    led = _ledger.setdefault(chat_id, {'in': 0.0, 'out': 0.0})
+    before = (led['in'], led['out'])
+    if command == 'add':
+        led['in'] += amount
+        heading = f"💰 Deposit = +{amount:.2f}$"
+    else:
+        led['out'] += amount
+        heading = f"📤 Out = -{amount:.2f}$"
+
+    print(f"📒 [LEDGER] /{command} {amount:.2f} by {user_id} in {chat_id} -> "
+          f"in={led['in']:.2f} out={led['out']:.2f}", flush=True)
+
+    await bot.send_message(chat_id,
+                           f"{heading}\n\n"
+                           f"📊 Group Total:\n"
+                           f"➕ Total In : {led['in']:.2f}$\n"
+                           f"➖ Total Out: {led['out']:.2f}$")
+
+    await check_milestones(chat_id, before, (led['in'], led['out']))
+
+
+@bot.message_handler(commands=['set'])
+async def ledger_set_command(message):
+    """/set in <amount> or /set out <amount> - overwrite a column outright.
+
+    This is the correction route: /add and /out can only increase a column, so a
+    figure that has gone wrong needs to be set directly."""
+    chat_id = message.chat.id
+    user_id = getattr(message.from_user, 'id', None)
+
+    if chat_id not in TARGET_CHATS:
+        return
+
+    if user_id not in LEDGER_ADMINS:
+        print(f"⛔ [LEDGER] /set by {user_id} denied in {chat_id}", flush=True)
+        await bot.reply_to(message, "⛔ Not permitted. Only Ethan and Larry can "
+                                    "change the totals.")
+        return
+
+    match = _SET_RE.match(message.text)
+    amount = _to_float(match.group(2)) if match else None
+    if amount is None or amount < 0:
+        await bot.reply_to(message, "Usage: /set in <amount>   or   /set out <amount>\n"
+                                    "Example: /set in 800")
+        return
+
+    column = match.group(1).lower()
+    led = _ledger.setdefault(chat_id, {'in': 0.0, 'out': 0.0})
+    before = (led['in'], led['out'])
+    previous = led[column]
+    led[column] = amount
+
+    print(f"📒 [LEDGER] /set {column} {previous:.2f} -> {amount:.2f} "
+          f"by {user_id} in {chat_id}", flush=True)
+
+    await bot.send_message(chat_id,
+                           f"✏️ Corrected: Total {'In' if column == 'in' else 'Out'} "
+                           f"set to {amount:.2f}$\n\n"
+                           f"📊 Group Total:\n"
+                           f"➕ Total In : {led['in']:.2f}$\n"
+                           f"➖ Total Out: {led['out']:.2f}$")
+
+    await check_milestones(chat_id, before, (led['in'], led['out']))
 
 
 @bot.message_handler(content_types=['text'])
@@ -416,6 +568,38 @@ async def _resolve_source_chats(client, wanted):
     return resolved
 
 
+async def recover_ledgers(client):
+    """Rebuild each target's ledger from the last totals this bot published there.
+
+    Railway wipes the filesystem on every deploy, so the books cannot live on
+    disk. They live in the messages themselves: the bot's own posts carry the
+    figures, so reading the newest one back restores the running totals."""
+    for target in sorted(TARGET_CHATS):
+        try:
+            entity = await client.get_entity(target)
+        except Exception as e:
+            print(f"⚠️ [LEDGER] {target} unreachable, will open on first message: {e}",
+                  flush=True)
+            continue
+
+        found = False
+        async for message in client.iter_messages(entity, limit=200):
+            sender = await message.get_sender()
+            if BOT_ID is None or getattr(sender, 'id', None) != BOT_ID:
+                continue
+            total_in, total_out = parse_totals(message.raw_text or '')
+            if total_in is None or total_out is None:
+                continue
+            _ledger[target] = {'in': total_in, 'out': total_out}
+            print(f"📒 [LEDGER] {target} recovered: in={total_in:.2f} "
+                  f"out={total_out:.2f} (from {message.date:%m-%d %H:%M})", flush=True)
+            found = True
+            break
+        if not found:
+            print(f"📒 [LEDGER] {target} has no prior totals - opens on first message",
+                  flush=True)
+
+
 async def run_userbot():
     global userbot_status
 
@@ -455,6 +639,8 @@ async def run_userbot():
 
             # Warms the entity cache so numeric chat ids resolve reliably.
             await client.get_dialogs()
+
+            await recover_ledgers(client)
 
             chats = await _resolve_source_chats(client, _configured_source_chats())
             if not chats:
