@@ -3,8 +3,9 @@ import telebot
 import time
 from datetime import datetime
 
-# Reads token safely from Railway Environment Variables
+# Read token directly from Railway variables
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+
 ADMIN_ID = 7578145913
 KEYWORDS = ['You received']
 
@@ -31,7 +32,7 @@ def get_uptime():
     uptime = datetime.now() - start_time
     hours = int(uptime.total_seconds() // 3600)
     minutes = int((uptime.total_seconds() % 3600) // 60)
-    return str(hours) + 'h ' + str(minutes) + 'm'
+    return f"{hours}h {minutes}m"
 
 @bot.message_handler(commands=['start'])
 def start(message):
@@ -41,7 +42,7 @@ def start(message):
 @bot.message_handler(commands=['status'])
 def status(message):
     if message.chat.id == ADMIN_ID:
-        txt = 'Bot Online\nGroups: ' + str(len(FORWARD_RULES)) + '\nForwarded: ' + str(forwarded_count) + '\nUptime: ' + get_uptime()
+        txt = f"Bot Online\nGroups: {len(FORWARD_RULES)}\nForwarded: {forwarded_count}\nUptime: {get_uptime()}"
         bot.reply_to(message, txt)
 
 @bot.message_handler(commands=['ping'])
@@ -57,7 +58,7 @@ def forward_text(message):
     if message.chat.id in FORWARD_RULES:
         text = message.text.lower()
         if any(kw.lower() in text for kw in KEYWORDS):
-            print(f"✅ [KEYWORD MATCH] Forwarding message...", flush=True)
+            print("✅ [KEYWORD MATCH] Forwarding message...", flush=True)
             for target in FORWARD_RULES[message.chat.id]:
                 try:
                     bot.send_message(target, message.text)
@@ -70,7 +71,7 @@ def forward_text(message):
                 except Exception as e:
                     print(f"❌ [FORWARD ERROR] Target {target}: {e}", flush=True)
         else:
-            print(f"⚠️ [SKIP] Message does not contain keyword 'You received'.", flush=True)
+            print("⚠️ [SKIP] Message does not contain keyword 'You received'.", flush=True)
     else:
         print(f"⚠️ [SKIP] Chat ID {message.chat.id} is not in FORWARD_RULES.", flush=True)
 
