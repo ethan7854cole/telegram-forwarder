@@ -403,15 +403,10 @@ def note_payment(target):
 
 
 def idle_alert_text(target, quiet_minutes, index):
+    """Just the elapsed time and the question - no figures. The ledger belongs
+    in payment messages, not in a prompt asking whether something is wrong."""
     header, question = _IDLE_BODIES[index % len(_IDLE_BODIES)]
-    last = _idle_slot(target)['last']
-    last_line = (f"Last payment : {last.astimezone(LOCAL_TZ):%I:%M %p}\n"
-                 if last else "")
-    total_in, total_out = ledger_snapshot(target)
     return (f"{header.format(duration=_humanise(quiet_minutes))}\n\n"
-            f"{last_line}"
-            f"➕ Total In : {total_in:,.2f}$\n"
-            f"➖ Total Out: {total_out:,.2f}$\n\n"
             f"{question}\n\n"
             "-ETHAN")
 
