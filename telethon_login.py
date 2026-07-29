@@ -4,6 +4,14 @@ Run this on your Mac once:
 
     python3 telethon_login.py
 
+For the Railway deployment, run it with --deploy instead:
+
+    python3 telethon_login.py --deploy
+
+That creates a SECOND, independent session. Railway and this Mac must never
+share one: Telegram revokes an auth key that connects from two places at once,
+which silently stops forwarding.
+
 It logs in with your Telegram account and does two things:
 
   1. Saves a local <TELETHON_SESSION_NAME>.session file, so you can run
@@ -40,9 +48,14 @@ async def main():
     api_id = _prompt('TELEGRAM_API_ID', os.getenv('TELEGRAM_API_ID'))
     api_hash = _prompt('TELEGRAM_API_HASH', os.getenv('TELEGRAM_API_HASH'))
 
-    # Log in to a local file session so forwarder.py can be run on this machine
-    # immediately. The string printed at the end is for deployment.
-    session_name = os.getenv('TELETHON_SESSION_NAME', 'user_session')
+    # Two INDEPENDENT sessions are required. Telegram invalidates an auth key
+    # that connects from two places at once, so the deployed bot and this Mac
+    # must never share one. --deploy logs in again as a separate device.
+    deploy = '--deploy' in sys.argv
+    session_name = ('railway_session' if deploy
+                    else os.getenv('TELETHON_SESSION_NAME', 'user_session'))
+    if deploy:
+        print("Creating a SEPARATE session for Railway (independent of the local one).\n")
 
     async with TelegramClient(session_name, int(api_id), api_hash) as client:
         me = await client.get_me()
@@ -58,11 +71,18 @@ async def main():
                 print(f"{dialog.id:>16}  {kind:<10}  {dialog.name}")
             print("\nUse these exact ids in FORWARD_RULES.")
 
-        print(f"\n💾 Local session saved to ./{session_name}.session")
-        print("   You can now run: python3 forwarder.py")
+        print(f"\n💾 Session saved to ./{session_name}.session")
+        if deploy:
+            print("   This one is for Railway only. Do not run local scripts with it.")
+        else:
+            print("   You can now run: python3 forwarder.py and python3 backfill.py")
 
         print("\n" + "=" * 70)
-        print("TELETHON_SESSION for Railway (secret - full access to your account):")
+        if deploy:
+            print("TELETHON_SESSION for Railway (secret - full access to your account):")
+        else:
+            print("Local session string (secret). For Railway use --deploy instead,")
+            print("so the deployment gets its own key and the two cannot clash:")
         print("=" * 70)
         print(StringSession.save(client.session))
         print("=" * 70)

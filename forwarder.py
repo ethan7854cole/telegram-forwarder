@@ -276,6 +276,7 @@ async def run_userbot():
 
     bot_ids, bot_usernames = _parse_source_bots()
     session = StringSession(TELETHON_SESSION) if TELETHON_SESSION else TELETHON_SESSION_NAME
+    warned_unauthorised = False
 
     while True:
         client = TelegramClient(session, int(API_ID), API_HASH)
@@ -285,9 +286,18 @@ async def run_userbot():
             await client.connect()
             if not await client.is_user_authorized():
                 userbot_status = 'not authorised'
-                print("❌ [TELETHON] Session is not authorised. Run: python3 telethon_login.py",
-                      flush=True)
-                return
+                print("❌ [TELETHON] Session is not authorised. Regenerate it with: "
+                      "python3 telethon_login.py --deploy", flush=True)
+                if not warned_unauthorised:
+                    warned_unauthorised = True
+                    await notify_admin(
+                        "⚠️ Telethon session is NOT authorised - messages from bots are "
+                        "not being forwarded. Regenerate TELETHON_SESSION with:\n"
+                        "python3 telethon_login.py --deploy\n\n"
+                        "Note: the deployment needs its own session. Sharing one auth key "
+                        "between Railway and your Mac makes Telegram revoke it.")
+                await asyncio.sleep(300)
+                continue
 
             me = await client.get_me()
             print(f"🔐 [TELETHON] Logged in as {me.first_name} (@{me.username})", flush=True)
