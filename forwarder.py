@@ -161,6 +161,123 @@ def _is_duplicate(key):
     return False
 
 
+# ---------------------------------------------------------------------------
+# Milestone alerts
+#
+# Every notification carries the group's running totals:
+#     ➕ Total In : 675.01$
+#     ➖ Total Out: 557.00$
+# so both figures are read straight off the message. No extra message types are
+# watched and nothing new is forwarded - the /add and /out commands stay in the
+# source group where they belong.
+# ---------------------------------------------------------------------------
+
+MILESTONE_IN_STEP = int(os.getenv('MILESTONE_IN_STEP', '5000'))
+MILESTONE_OUT_STEP = int(os.getenv('MILESTONE_OUT_STEP', '1000'))
+MILESTONE_MENTIONS = os.getenv('MILESTONE_MENTIONS', '@ethannxxxx @Larryyxx')
+
+_TOTAL_IN_RE = re.compile(r'Total\s*In\s*:?\s*([\d,]+(?:\.\d+)?)', re.I)
+_TOTAL_OUT_RE = re.compile(r'Total\s*Out\s*:?\s*([\d,]+(?:\.\d+)?)', re.I)
+
+# rule_key -> (last_total_in, last_total_out)
+_totals_seen = {}
+
+
+def parse_totals(text):
+    """Pull (total_in, total_out) out of a notification. Either may be None."""
+    def num(pattern):
+        m = pattern.search(text)
+        if not m:
+            return None
+        try:
+            return float(m.group(1).replace(',', ''))
+        except ValueError:
+            return None
+    return num(_TOTAL_IN_RE), num(_TOTAL_OUT_RE)
+
+
+def crossed_milestone(previous, current, step):
+    """Highest step boundary newly crossed, or None.
+
+    A decrease returns None: the bot's totals reset at the start of a new cycle,
+    and a reset must not replay alerts for ground already covered."""
+    if step <= 0 or previous is None or current is None or current <= previous:
+        return None
+    if int(current // step) > int(previous // step):
+        return int(current // step) * step
+    return None
+
+
+def _money(value):
+    return f"{value:,.2f}$" if value is not None else "n/a"
+
+
+def _step_label(step):
+    return f"{step // 1000}K" if step >= 1000 and step % 1000 == 0 else f"{step:,}"
+
+
+def in_milestone_text(level, total_in, total_out):
+    return (f"🎉 MILESTONE HIT — ${level:,} IN! 🎉\n\n"
+            f"➕ Total In : {_money(total_in)}\n"
+            f"➖ Total Out: {_money(total_out)}\n\n"
+            "Outstanding work, team! 🔥\n\n"
+            "Every single deposit stacked up to this — that is\n"
+            "consistency, not luck. The engine is running and\n"
+            "the numbers speak for themselves.\n\n"
+            f"Onward to the next {_step_label(MILESTONE_IN_STEP)}! 💪\n\n"
+            f"{MILESTONE_MENTIONS}\n\n"
+            "-ETHAN")
+
+
+def out_milestone_text(level, total_in, total_out):
+    return (f"⚠️ OUT ALERT — ${level:,} CROSSED ⚠️\n\n"
+            f"➕ Total In : {_money(total_in)}\n"
+            f"➖ Total Out: {_money(total_out)}\n\n"
+            "The out is climbing and needs a look before it\n"
+            "runs further ahead. Worth a quick review of what\n"
+            "is going out and why.\n\n"
+            f"Please check in: {MILESTONE_MENTIONS}\n\n"
+            "-ETHAN")
+
+
+async def check_milestones(rule_key, targets, text, from_bot):
+    """Post an alert to the rule's targets when a threshold is crossed.
+
+    Only bot-sent messages count, so a human re-pasting an old notification
+    cannot make the totals jump and fire a false alert."""
+    if not from_bot:
+        return
+
+    total_in, total_out = parse_totals(text)
+    if total_in is None and total_out is None:
+        return
+
+    previous = _totals_seen.get(rule_key)
+    _totals_seen[rule_key] = (total_in, total_out)
+    if previous is None:
+        # First notification after a restart only establishes a baseline.
+        print(f"📊 [TOTALS] Baseline for {rule_key}: "
+              f"in={total_in} out={total_out}", flush=True)
+        return
+
+    alerts = []
+    level = crossed_milestone(previous[0], total_in, MILESTONE_IN_STEP)
+    if level:
+        alerts.append(('IN', level, in_milestone_text(level, total_in, total_out)))
+    level = crossed_milestone(previous[1], total_out, MILESTONE_OUT_STEP)
+    if level:
+        alerts.append(('OUT', level, out_milestone_text(level, total_in, total_out)))
+
+    for kind, level, body in alerts:
+        print(f"🏁 [MILESTONE {kind}] ${level:,} crossed in {rule_key}", flush=True)
+        for target in targets:
+            try:
+                await bot.send_message(target, body)
+                print(f"   🎯 {kind} milestone sent to {target}", flush=True)
+            except Exception as e:
+                print(f"   ❌ milestone send failed for {target}: {e}", flush=True)
+
+
 async def process_incoming(chat_id, text, origin, from_bot=False, sent_at=None):
     global forwarded_count, today_count
 
@@ -197,6 +314,9 @@ async def process_incoming(chat_id, text, origin, from_bot=False, sent_at=None):
                 last_messages.pop(0)
         except Exception as e:
             print(f"❌ [FORWARD ERROR] Target {target}: {e}", flush=True)
+
+    # After the payment confirmation, so the alert lands beneath it.
+    await check_milestones(rule_key, FORWARD_RULES[rule_key], text, from_bot)
 
 
 # ---------------------------------------------------------------------------
