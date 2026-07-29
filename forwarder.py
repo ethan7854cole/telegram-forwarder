@@ -340,6 +340,110 @@ def ledger_commit(target, after, note=''):
           f"in={after[0]:,.2f} out={after[1]:,.2f}{note}", flush=True)
 
 
+# ---------------------------------------------------------------------------
+# Idle payment watchdog
+#
+# When a target group stops receiving payments, ask the group whether there is a
+# problem. Repeats every interval while it stays quiet, with different wording
+# each time, and resets the moment a payment arrives.
+# ---------------------------------------------------------------------------
+
+IDLE_ALERT_MINUTES = int(os.getenv('IDLE_ALERT_MINUTES', '90'))
+IDLE_ALERT_CHATS = {-5580596463, -5350880041}      # CHIME GAFFER, CHIME PICCASO
+
+# Rotated so a repeat never reads identically. The duration line differs every
+# time in any case, so even a full cycle cannot produce a duplicate message.
+_IDLE_BODIES = [
+    ("⏳ No payments here for {duration}.",
+     "Is everything okay on the payment side, or are you\n"
+     "facing any issues? Let us know if there is any!"),
+    ("⏳ Still quiet — {duration} without a payment.",
+     "Checking in again. Is everything running fine on\n"
+     "your side, or is something holding payments up?\n"
+     "Let us know if there is any issue!"),
+    ("⏳ {duration} with no payments.",
+     "Any update on the payments? If something is stuck\n"
+     "or not working, tell us and we will sort it out.\n"
+     "Let us know if there is any issue!"),
+    ("⏳ {duration} quiet now.",
+     "Nothing has come through in a while. Is there a\n"
+     "problem at your end? A quick word either way would\n"
+     "help — let us know if there is any issue!"),
+]
+
+# target -> {'last': datetime|None, 'since': datetime, 'sent': int}
+_idle_state = {}
+
+
+def _idle_slot(target):
+    return _idle_state.setdefault(target, {'last': None,
+                                           'since': datetime.now(timezone.utc),
+                                           'sent': 0})
+
+
+def _humanise(minutes):
+    hours, mins = divmod(int(minutes), 60)
+    parts = []
+    if hours:
+        parts.append(f"{hours} hour" + ("s" if hours != 1 else ""))
+    if mins:
+        parts.append(f"{mins} minute" + ("s" if mins != 1 else ""))
+    return " ".join(parts) or "0 minutes"
+
+
+def note_payment(target):
+    """A payment landed: restart the clock and the wording rotation."""
+    if target not in IDLE_ALERT_CHATS:
+        return
+    slot = _idle_slot(target)
+    now = datetime.now(timezone.utc)
+    slot['last'] = now
+    slot['since'] = now
+    slot['sent'] = 0
+
+
+def idle_alert_text(target, quiet_minutes, index):
+    header, question = _IDLE_BODIES[index % len(_IDLE_BODIES)]
+    last = _idle_slot(target)['last']
+    last_line = (f"Last payment : {last.astimezone(LOCAL_TZ):%I:%M %p}\n"
+                 if last else "")
+    total_in, total_out = ledger_snapshot(target)
+    return (f"{header.format(duration=_humanise(quiet_minutes))}\n\n"
+            f"{last_line}"
+            f"➕ Total In : {total_in:,.2f}$\n"
+            f"➖ Total Out: {total_out:,.2f}$\n\n"
+            f"{question}\n\n"
+            "-ETHAN")
+
+
+async def idle_watchdog():
+    if IDLE_ALERT_MINUTES <= 0:
+        print("ℹ️ [IDLE] watchdog disabled (IDLE_ALERT_MINUTES=0)", flush=True)
+        return
+
+    for target in IDLE_ALERT_CHATS:
+        _idle_slot(target)          # clock starts now, not at epoch
+    print(f"⏳ [IDLE] watching {len(IDLE_ALERT_CHATS)} groups, "
+          f"prompt every {_humanise(IDLE_ALERT_MINUTES)} of silence", flush=True)
+
+    while True:
+        await asyncio.sleep(60)
+        now = datetime.now(timezone.utc)
+        for target in sorted(IDLE_ALERT_CHATS):
+            slot = _idle_slot(target)
+            quiet = (now - slot['since']).total_seconds() / 60.0
+            due = IDLE_ALERT_MINUTES * (slot['sent'] + 1)
+            if quiet < due:
+                continue
+            try:
+                await bot.send_message(target, idle_alert_text(target, due, slot['sent']))
+                slot['sent'] += 1
+                print(f"⏳ [IDLE] {target} quiet {_humanise(due)}, "
+                      f"prompt #{slot['sent']} sent", flush=True)
+            except Exception as e:
+                print(f"❌ [IDLE] prompt failed for {target}: {e}", flush=True)
+
+
 async def process_incoming(chat_id, text, origin, from_bot=False, sent_at=None):
     global forwarded_count, today_count
 
@@ -386,6 +490,7 @@ async def process_incoming(chat_id, text, origin, from_bot=False, sent_at=None):
 
         if movement:
             ledger_commit(target, movement[1])
+            note_payment(target)        # a real payment landed: reset the clock
         print(f"🚀 [FORWARD SUCCESS] Sent to {target}", flush=True)
         forwarded_count += 1
         today_count += 1
@@ -714,7 +819,8 @@ async def run_bot():
 async def main():
     print('Bot running...', flush=True)
     await notify_admin('Bot is ONLINE. Use /help to see all commands.')
-    await asyncio.gather(run_bot(), run_userbot(), return_exceptions=True)
+    await asyncio.gather(run_bot(), run_userbot(), idle_watchdog(),
+                         return_exceptions=True)
 
 
 if __name__ == '__main__':
