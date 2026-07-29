@@ -117,6 +117,10 @@ def help(message):
         txt = 'Commands:' + chr(10) + '/status' + chr(10) + '/ping' + chr(10) + '/keyword' + chr(10) + '/addkeyword word' + chr(10) + '/removekeyword word' + chr(10) + '/count' + chr(10) + '/history' + chr(10) + '/report' + chr(10) + '/test' + chr(10) + '/help'
         bot.reply_to(message, txt)
 
+@bot.edited_message_handler(content_types=['text'])
+def forward_edited_text(message):
+    forward_text(message)
+
 @bot.message_handler(content_types=['text'])
 def forward_text(message):
     global forwarded_count, today_count
@@ -138,7 +142,7 @@ print('Bot running...')
 notify_admin('Bot is ONLINE. Use /help to see all commands.')
 while True:
     try:
-        bot.polling(none_stop=True, allowed_updates=['message'])
+        bot.polling(none_stop=True, allowed_updates=['message', 'edited_message'])
     except Exception as e:
         notify_admin('Bot DOWN. Restarting. Error: ' + str(e))
         time.sleep(5)
