@@ -351,6 +351,10 @@ def ledger_commit(target, after, note=''):
 IDLE_ALERT_MINUTES = int(os.getenv('IDLE_ALERT_MINUTES', '90'))
 IDLE_ALERT_CHATS = {-5580596463, -5350880041}      # CHIME GAFFER, CHIME PICCASO
 
+IDLE_NAMES = {-5580596463: 'CHIME GAFFER', -5350880041: 'CHIME PICCASO'}
+# Short names so the groups can be targeted from a private chat.
+IDLE_ALIASES = {'gaffer': -5580596463, 'piccaso': -5350880041}
+
 # Rotated so a repeat never reads identically. The duration line differs every
 # time in any case, so even a full cycle cannot produce a duplicate message.
 _IDLE_BODIES = [
@@ -378,7 +382,8 @@ _idle_state = {}
 def _idle_slot(target):
     return _idle_state.setdefault(target, {'last': None,
                                            'since': datetime.now(timezone.utc),
-                                           'sent': 0})
+                                           'sent': 0,
+                                           'paused': False})
 
 
 def _humanise(minutes):
@@ -391,8 +396,11 @@ def _humanise(minutes):
     return " ".join(parts) or "0 minutes"
 
 
-def note_payment(target):
-    """A payment landed: restart the clock and the wording rotation."""
+async def note_payment(target):
+    """A payment landed: restart the clock and the wording rotation.
+
+    A payment also lifts a pause - if money is moving again, whatever was wrong
+    has cleared, and a pause nobody remembers would silently kill the watchdog."""
     if target not in IDLE_ALERT_CHATS:
         return
     slot = _idle_slot(target)
@@ -400,6 +408,21 @@ def note_payment(target):
     slot['last'] = now
     slot['since'] = now
     slot['sent'] = 0
+
+    if slot['paused']:
+        # Silently re-armed. Nothing is posted: the group never sees chatter
+        # about the watchdog's own state.
+        slot['paused'] = False
+        print(f"🔔 [IDLE] {target} auto-resumed on payment", flush=True)
+
+
+def set_idle_paused(target, paused):
+    slot = _idle_slot(target)
+    slot['paused'] = paused
+    if not paused:
+        # Fresh clock, so resuming after a long pause cannot fire instantly.
+        slot['since'] = datetime.now(timezone.utc)
+        slot['sent'] = 0
 
 
 def idle_alert_text(target, quiet_minutes, index):
@@ -426,6 +449,8 @@ async def idle_watchdog():
         now = datetime.now(timezone.utc)
         for target in sorted(IDLE_ALERT_CHATS):
             slot = _idle_slot(target)
+            if slot['paused']:
+                continue
             quiet = (now - slot['since']).total_seconds() / 60.0
             due = IDLE_ALERT_MINUTES * (slot['sent'] + 1)
             if quiet < due:
@@ -485,7 +510,7 @@ async def process_incoming(chat_id, text, origin, from_bot=False, sent_at=None):
 
         if movement:
             ledger_commit(target, movement[1])
-            note_payment(target)        # a real payment landed: reset the clock
+            await note_payment(target)  # a real payment landed: reset the clock
         print(f"🚀 [FORWARD SUCCESS] Sent to {target}", flush=True)
         forwarded_count += 1
         today_count += 1
@@ -504,22 +529,69 @@ async def process_incoming(chat_id, text, origin, from_bot=False, sent_at=None):
 
 @bot.message_handler(commands=['start'])
 async def start(message):
-    if message.chat.id == ADMIN_ID:
+    if message.chat.id in LEDGER_ADMINS:
         await bot.reply_to(message, 'Bot is running. Use /help to see all commands.')
 
 
 @bot.message_handler(commands=['status'])
 async def status(message):
-    if message.chat.id == ADMIN_ID:
+    if message.chat.id in LEDGER_ADMINS:
+        paused = sorted(t for t in IDLE_ALERT_CHATS if _idle_slot(t)['paused'])
+        prompts = ('off in ' + ', '.join(str(t) for t in paused)) if paused else 'on'
         txt = (f"Bot Online\nGroups: {len(FORWARD_RULES)}\n"
                f"Forwarded: {forwarded_count}\nUptime: {get_uptime()}\n"
-               f"Userbot: {userbot_status}")
+               f"Userbot: {userbot_status}\n"
+               f"Payment prompts: {prompts}")
         await bot.reply_to(message, txt)
+
+
+@bot.message_handler(commands=['help'])
+async def help_command(message):
+    """Private-chat command reference. Values come from the live config so this
+    cannot drift out of date when an env var changes."""
+    if message.chat.id not in LEDGER_ADMINS:
+        return
+
+    groups = ' or '.join(IDLE_NAMES[t] for t in sorted(IDLE_ALERT_CHATS))
+    await bot.send_message(message.chat.id,
+        "📖 COMMANDS\n"
+        "\n"
+        f"LEDGER — type these inside {groups}\n"
+        "\n"
+        "/add 500 — adds 500.00$ to Total In\n"
+        "/out 100 — adds 100.00$ to Total Out\n"
+        "/set in 800 — sets Total In to 800.00$\n"
+        "/set out 300 — sets Total Out to 300.00$\n"
+        "\n"
+        "PAYMENT PROMPTS — here in private, or silently in a group\n"
+        "\n"
+        "/pause — stops prompts in both groups\n"
+        "/pause gaffer — stops them in CHIME GAFFER only\n"
+        "/pause piccaso — stops them in CHIME PICCASO only\n"
+        "/resume — starts them again, same three forms\n"
+        "\n"
+        "INFO\n"
+        "\n"
+        "/status — bot state, userbot, which groups are paused\n"
+        "/ping — quick alive check\n"
+        "/help — this list\n"
+        "\n"
+        "GOOD TO KNOW\n"
+        "\n"
+        "Only Ethan and Larry can use any of these.\n"
+        "Payments add to Total In on their own.\n"
+        "A payment also lifts a pause by itself.\n"
+        f"Milestones fire every {MILESTONE_IN_STEP:,}$ in "
+        f"and every {MILESTONE_OUT_STEP:,}$ out.\n"
+        f"Prompts ask the group after {_humanise(IDLE_ALERT_MINUTES)} "
+        "without a payment.\n"
+        "\n"
+        "In a group, /pause and /resume post nothing at all — check /status.")
 
 
 @bot.message_handler(commands=['ping'])
 async def ping(message):
-    if message.chat.id == ADMIN_ID:
+    if message.chat.id in LEDGER_ADMINS:
         await bot.reply_to(message, 'Pong! Bot is alive.')
 
 
@@ -566,6 +638,69 @@ async def ledger_command(message):
 
     ledger_commit(chat_id, after, f" (/{command} {amount:,.2f} by {user_id})")
     await check_milestones(chat_id, before, after)
+
+
+@bot.message_handler(commands=['pause', 'resume'])
+async def idle_pause_command(message):
+    """/pause and /resume the payment prompts, per group.
+
+    For when the hold-up is on your side and asking the group whether they have
+    a problem would be the wrong message."""
+    chat_id = message.chat.id
+    user_id = getattr(message.from_user, 'id', None)
+    command = message.text.lstrip('/').split('@')[0].split()[0].lower()
+    pausing = command == 'pause'
+
+    # ---- private chat: name a group or hit both, and get a reply ----
+    if chat_id in LEDGER_ADMINS:
+        if user_id not in LEDGER_ADMINS:
+            return
+        parts = message.text.split()
+        argument = parts[1].lower() if len(parts) > 1 else ''
+        if not argument:
+            targets = sorted(IDLE_ALERT_CHATS)
+        elif argument in IDLE_ALIASES:
+            targets = [IDLE_ALIASES[argument]]
+        else:
+            await bot.reply_to(message,
+                               f"Usage: /{command}          (both groups)\n"
+                               f"       /{command} gaffer   (CHIME GAFFER only)\n"
+                               f"       /{command} piccaso  (CHIME PICCASO only)")
+            return
+
+        for target in targets:
+            set_idle_paused(target, pausing)
+        names = ', '.join(IDLE_NAMES.get(t, str(t)) for t in targets)
+        print(f"{'🔇' if pausing else '🔔'} [IDLE] {names} "
+              f"{'paused' if pausing else 'resumed'} by {user_id} via DM", flush=True)
+
+        if pausing:
+            await bot.reply_to(message,
+                               f"🔇 Paused: {names}\n\n"
+                               "Nothing will be posted in those groups.\n"
+                               "Send /resume when you want them back.")
+        else:
+            await bot.reply_to(message,
+                               f"🔔 Resumed: {names}\n\n"
+                               f"Next prompt after {_humanise(IDLE_ALERT_MINUTES)} "
+                               "of silence.")
+        return
+
+    # ---- inside a target group: deliberately SILENT ----
+    # Pausing usually means the hold-up is on our side, and announcing it would
+    # be exactly the wrong message. Check the state with /status.
+    if chat_id not in IDLE_ALERT_CHATS:
+        return
+
+    if user_id not in LEDGER_ADMINS:
+        print(f"⛔ [IDLE] pause/resume by {user_id} denied in {chat_id}", flush=True)
+        await bot.reply_to(message, "⛔ Not permitted. Only Ethan and Larry can "
+                                    "change this.")
+        return
+
+    set_idle_paused(chat_id, pausing)
+    print(f"{'🔇' if pausing else '🔔'} [IDLE] {chat_id} "
+          f"{'paused' if pausing else 'resumed'} by {user_id}", flush=True)
 
 
 @bot.message_handler(commands=['set'])
