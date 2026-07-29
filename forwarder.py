@@ -219,8 +219,8 @@ def rewrite_totals(text, total_in, total_out):
     the line exactly. Text without a totals block is returned untouched."""
     if not _TOTAL_IN_SUB.search(text):
         return text
-    text = _TOTAL_IN_SUB.sub(lambda m: f"{m.group(1)}{total_in:.2f}", text, count=1)
-    text = _TOTAL_OUT_SUB.sub(lambda m: f"{m.group(1)}{total_out:.2f}", text, count=1)
+    text = _TOTAL_IN_SUB.sub(lambda m: f"{m.group(1)}{total_in:,.2f}", text, count=1)
+    text = _TOTAL_OUT_SUB.sub(lambda m: f"{m.group(1)}{total_out:,.2f}", text, count=1)
     return text
 
 
@@ -337,7 +337,7 @@ def ledger_commit(target, after, note=''):
     opening = target not in _ledger
     _ledger[target] = {'in': after[0], 'out': after[1]}
     print(f"📒 [LEDGER] {target} {'opened at' if opening else 'now'} "
-          f"in={after[0]:.2f} out={after[1]:.2f}{note}", flush=True)
+          f"in={after[0]:,.2f} out={after[1]:,.2f}{note}", flush=True)
 
 
 async def process_incoming(chat_id, text, origin, from_bot=False, sent_at=None):
@@ -449,22 +449,22 @@ async def ledger_command(message):
     before = ledger_snapshot(chat_id)
     if command == 'add':
         after = (before[0] + amount, before[1])
-        heading = f"💰 Deposit = +{amount:.2f}$"
+        heading = f"💰 Deposit = +{amount:,.2f}$"
     else:
         after = (before[0], before[1] + amount)
-        heading = f"📤 Out = -{amount:.2f}$"
+        heading = f"📤 Out = -{amount:,.2f}$"
 
     try:
         await bot.send_message(chat_id,
                                f"{heading}\n\n"
                                f"📊 Group Total:\n"
-                               f"➕ Total In : {after[0]:.2f}$\n"
-                               f"➖ Total Out: {after[1]:.2f}$")
+                               f"➕ Total In : {after[0]:,.2f}$\n"
+                               f"➖ Total Out: {after[1]:,.2f}$")
     except Exception as e:
         print(f"❌ [LEDGER] /{command} NOT applied, send failed: {e}", flush=True)
         return
 
-    ledger_commit(chat_id, after, f" (/{command} {amount:.2f} by {user_id})")
+    ledger_commit(chat_id, after, f" (/{command} {amount:,.2f} by {user_id})")
     await check_milestones(chat_id, before, after)
 
 
@@ -500,15 +500,15 @@ async def ledger_set_command(message):
     try:
         await bot.send_message(chat_id,
                                f"✏️ Corrected: Total {'In' if column == 'in' else 'Out'} "
-                               f"set to {amount:.2f}$\n\n"
+                               f"set to {amount:,.2f}$\n\n"
                                f"📊 Group Total:\n"
-                               f"➕ Total In : {after[0]:.2f}$\n"
-                               f"➖ Total Out: {after[1]:.2f}$")
+                               f"➕ Total In : {after[0]:,.2f}$\n"
+                               f"➖ Total Out: {after[1]:,.2f}$")
     except Exception as e:
         print(f"❌ [LEDGER] /set NOT applied, send failed: {e}", flush=True)
         return
 
-    ledger_commit(chat_id, after, f" (/set {column} {amount:.2f} by {user_id})")
+    ledger_commit(chat_id, after, f" (/set {column} {amount:,.2f} by {user_id})")
     await check_milestones(chat_id, before, after)
 
 
@@ -607,8 +607,8 @@ async def recover_ledgers(client):
             if total_in is None or total_out is None:
                 continue
             _ledger[target] = {'in': total_in, 'out': total_out}
-            print(f"📒 [LEDGER] {target} recovered: in={total_in:.2f} "
-                  f"out={total_out:.2f} (from {message.date:%m-%d %H:%M})", flush=True)
+            print(f"📒 [LEDGER] {target} recovered: in={total_in:,.2f} "
+                  f"out={total_out:,.2f} (from {message.date:%m-%d %H:%M})", flush=True)
             found = True
             break
         if not found:
