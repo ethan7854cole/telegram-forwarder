@@ -1,8 +1,10 @@
+import os
 import telebot
 import time
 from datetime import datetime
 
-BOT_TOKEN = '8614082158:AAE9A4JOanHFNYvGkgRT9r3ja_KnCYn3fts'
+# Reads token safely from Railway Environment Variables
+BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 ADMIN_ID = 7578145913
 KEYWORDS = ['You received']
 
@@ -16,6 +18,7 @@ forwarded_count = 0
 today_count = 0
 start_time = datetime.now()
 last_messages = []
+
 bot = telebot.TeleBot(BOT_TOKEN)
 
 def notify_admin(msg):
