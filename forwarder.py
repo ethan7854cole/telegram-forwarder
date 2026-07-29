@@ -1,6 +1,9 @@
 import telebot
+import time
+import threading
 
 BOT_TOKEN = "8614082158:AAHIPZpqVvy4EzSKBJmFYBaVst-xtj4m-l0"
+ADMIN_ID = 7578145913
 
 KEYWORDS = ["You received"]
 
@@ -11,6 +14,12 @@ FORWARD_RULES = {
 }
 
 bot = telebot.TeleBot(BOT_TOKEN)
+
+def notify_admin(msg):
+    try:
+        bot.send_message(ADMIN_ID, msg)
+    except Exception as e:
+        print('Could not notify admin: ' + str(e))
 
 @bot.message_handler(content_types=['text'])
 def forward_text(message):
@@ -26,5 +35,15 @@ def forward_text(message):
         else:
             print('Skipped - no keyword match')
 
-print('Bot is running with 3 groups...')
-bot.polling(none_stop=True, allowed_updates=['message'])
+print('Bot is running...')
+notify_admin('✅ Bot is now ONLINE and running!')
+
+while True:
+    try:
+        bot.polling(none_stop=True, allowed_updates=['message'])
+    except Exception as e:
+        print('Bot crashed: ' + str(e))
+        notify_admin('❌ Bot went DOWN! Restarting...
+Error: ' + str(e))
+        time.sleep(5)
+        notify_admin('✅ Bot is back ONLINE!')
