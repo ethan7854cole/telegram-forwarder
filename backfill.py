@@ -26,8 +26,9 @@ Examples:
 import argparse
 import asyncio
 import os
+import re
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from telebot.async_telebot import AsyncTeleBot
 from telebot.asyncio_helper import ApiTelegramException
@@ -39,6 +40,20 @@ from telethon.tl.types import MessageMediaWebPage
 DEFAULT_SOURCE = '-1002335630148'       # chime rev and out no-7
 DEFAULT_TARGET = '-5580596463'          # Chime gaffer
 DEFAULT_KEYWORDS = ['You received']     # matched case insensitively
+
+
+LOCAL_TZ = timezone(timedelta(hours=5, minutes=45))     # Nepal, no DST
+_STAMP_RE = re.compile(
+    r'\b\d{1,2}:\d{2}\s*[AaPp][Mm]\s*-\s*\d{1,2}\s+[A-Za-z]{3}\s+\d{4}')
+
+
+def correct_timestamp(text, sent_at, enabled=True):
+    """Same rewrite as forwarder.correct_timestamp: the notification bot's clock
+    runs ~14 min fast, so swap its embedded timestamp for the real send time."""
+    if not enabled or sent_at is None:
+        return text
+    return _STAMP_RE.sub(sent_at.astimezone(LOCAL_TZ).strftime('%I:%M %p - %d %b %Y'),
+                         text, count=1)
 
 
 def is_plain_text(msg):
@@ -71,6 +86,8 @@ def parse_args():
                    help='seconds between sends, to stay under flood limits')
     p.add_argument('--send', action='store_true',
                    help='actually send. Without this it is a dry run')
+    p.add_argument('--keep-original-time', action='store_true',
+                   help="forward the bot's own timestamp instead of correcting it")
     args = p.parse_args()
     if args.no_keyword:
         args.keyword = []
@@ -162,6 +179,7 @@ async def main():
     print(f"Keyword : {args.keyword or 'none - every message'}")
     print(f"Senders : {'bots only' if args.from_bot_only else 'everyone'}")
     print(f"Content : text only")
+    print(f"Time    : {'kept as the bot wrote it' if args.keep_original_time else 'corrected to real send time (Nepal)'}")
     print(f"Mode    : {'SEND' if args.send else 'DRY RUN - nothing will be sent'}\n")
 
     client = TelegramClient(session, int(api_id), api_hash)
@@ -195,7 +213,8 @@ async def main():
         if args.from_bot_only and not bool(getattr(sender, 'bot', False)):
             continue
         who = getattr(sender, 'username', None) or getattr(sender, 'first_name', '?')
-        picked.append((msg, who))
+        out = correct_timestamp(text, msg.date, not args.keep_original_time)
+        picked.append((msg, who, out))
 
     picked.reverse()        # oldest first, so the target reads chronologically
     print(f"   Scanned {scanned}, selected {len(picked)}\n")
@@ -205,10 +224,9 @@ async def main():
         await client.disconnect()
         return
 
-    for i, (msg, who) in enumerate(picked, 1):
+    for i, (msg, who, out) in enumerate(picked, 1):
         stamp = msg.date.astimezone(cutoff.tzinfo).strftime('%H:%M:%S')
-        preview = msg.raw_text.replace('\n', ' ⏎ ')
-        print(f"{i:>3}. [{stamp}] @{who}: {preview[:90]}")
+        print(f"{i:>3}. [{stamp}] @{who}: {out.replace(chr(10), ' ⏎ ')[:90]}")
 
     if not args.send:
         print(f"\nDRY RUN. {len(picked)} message(s) would go to "
@@ -220,9 +238,9 @@ async def main():
     print(f"\nSending {len(picked)} message(s) via bot token...")
     bot = AsyncTeleBot(bot_token)
     ok = 0
-    for i, (msg, _) in enumerate(picked, 1):
+    for i, (_, _, out) in enumerate(picked, 1):
         print(f"   {i}/{len(picked)}")
-        if await send_with_retry(bot, dst_id, msg.raw_text):
+        if await send_with_retry(bot, dst_id, out):
             ok += 1
         await asyncio.sleep(args.delay)
 

@@ -1,7 +1,8 @@
 import asyncio
 import os
+import re
 from collections import OrderedDict
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from telebot.async_telebot import AsyncTeleBot
 
@@ -123,6 +124,29 @@ def resolve_rule_key(chat_id):
     return None
 
 
+# Nepal time. A fixed offset rather than a zoneinfo lookup: Nepal has no DST,
+# and Railway's container has no tzdata installed.
+LOCAL_TZ = timezone(timedelta(hours=5, minutes=45))
+
+# Matches the timestamp the notification bot embeds, e.g. "03:35 AM - 30 Jul 2026"
+_STAMP_RE = re.compile(
+    r'\b\d{1,2}:\d{2}\s*[AaPp][Mm]\s*-\s*\d{1,2}\s+[A-Za-z]{3}\s+\d{4}')
+
+# The notification bot's own clock runs roughly 14 minutes fast, so the time it
+# writes into the message is wrong. Rewrite it to when the message was actually
+# sent, in Nepal time. Set FIX_TIMESTAMPS=0 to forward the text untouched.
+FIX_TIMESTAMPS = os.getenv('FIX_TIMESTAMPS', '1') != '0'
+
+
+def correct_timestamp(text, sent_at):
+    """Replace the bot's embedded timestamp with the real send time. Text with
+    no recognisable timestamp is returned unchanged."""
+    if not FIX_TIMESTAMPS or sent_at is None:
+        return text
+    stamp = sent_at.astimezone(LOCAL_TZ).strftime('%I:%M %p - %d %b %Y')
+    return _STAMP_RE.sub(stamp, text, count=1)
+
+
 _seen_messages = OrderedDict()
 
 
@@ -137,10 +161,14 @@ def _is_duplicate(key):
     return False
 
 
-async def process_incoming(chat_id, text, origin, from_bot=False):
+async def process_incoming(chat_id, text, origin, from_bot=False, sent_at=None):
     global forwarded_count, today_count
 
     print(f"📩 [MSG RECEIVED] ({origin}) Chat ID: {chat_id} | Text: '{text}'", flush=True)
+
+    fixed = correct_timestamp(text, sent_at)
+    if fixed != text:
+        print(f"🕒 [TIME FIXED] -> {_STAMP_RE.search(fixed).group(0)}", flush=True)
 
     rule_key = resolve_rule_key(chat_id)
     if rule_key is None:
@@ -160,11 +188,11 @@ async def process_incoming(chat_id, text, origin, from_bot=False):
     for target in FORWARD_RULES[rule_key]:
         try:
             # Always sent with the bot token, never from the user account.
-            await bot.send_message(target, text)
+            await bot.send_message(target, fixed)
             print(f"🚀 [FORWARD SUCCESS] Sent to {target}", flush=True)
             forwarded_count += 1
             today_count += 1
-            last_messages.append(text[:50])
+            last_messages.append(fixed[:50])
             if len(last_messages) > 10:
                 last_messages.pop(0)
         except Exception as e:
@@ -199,7 +227,10 @@ async def ping(message):
 @bot.message_handler(content_types=['text'])
 async def forward_text(message):
     sender_is_bot = bool(getattr(message.from_user, 'is_bot', False))
-    await process_incoming(message.chat.id, message.text, 'bot-api', from_bot=sender_is_bot)
+    sent_at = (datetime.fromtimestamp(message.date, tz=timezone.utc)
+               if getattr(message, 'date', None) else None)
+    await process_incoming(message.chat.id, message.text, 'bot-api',
+                           from_bot=sender_is_bot, sent_at=sent_at)
 
 
 # ---------------------------------------------------------------------------
@@ -324,7 +355,8 @@ async def run_userbot():
                 if _is_duplicate((event.chat_id, event.id)):
                     return
                 # _is_target_sender above already guaranteed a bot sender.
-                await process_incoming(event.chat_id, text, 'telethon', from_bot=True)
+                await process_incoming(event.chat_id, text, 'telethon',
+                                       from_bot=True, sent_at=event.message.date)
 
             target = SOURCE_BOTS if SOURCE_BOTS.strip() else 'any bot'
             userbot_status = f'listening ({len(chats)} chats, from: {target})'
