@@ -302,8 +302,14 @@ async def check_milestones(target, before, after):
             print(f"   ❌ milestone send failed for {target}: {e}", flush=True)
 
 
-def ledger_apply_payment(target, text):
-    """Book a forwarded payment against a target's ledger.
+def ledger_snapshot(target):
+    """Current figures for a target, or zeroes if it has no ledger yet."""
+    led = _ledger.get(target)
+    return (led['in'], led['out']) if led else (0.0, 0.0)
+
+
+def ledger_preview_payment(target, text):
+    """What a forwarded payment WOULD do, without committing anything.
 
     Returns (before, after) as (in, out) tuples, or None when there is nothing
     to show - a message with no totals block and no ledger yet."""
@@ -314,20 +320,24 @@ def ledger_apply_payment(target, text):
         src_in, src_out = parse_totals(text)
         if src_in is None and src_out is None:
             return None
-        _ledger[target] = {'in': src_in or 0.0, 'out': src_out or 0.0}
-        print(f"📒 [LEDGER] {target} opened at in={_ledger[target]['in']:.2f} "
-              f"out={_ledger[target]['out']:.2f}", flush=True)
-        snapshot = (_ledger[target]['in'], _ledger[target]['out'])
-        return snapshot, snapshot
+        opening = (src_in or 0.0, src_out or 0.0)
+        return opening, opening
 
-    led = _ledger[target]
-    before = (led['in'], led['out'])
-    amount = parse_received_amount(text)
-    if amount:
-        led['in'] += amount
-        print(f"📒 [LEDGER] {target} +{amount:.2f} in -> "
-              f"in={led['in']:.2f} out={led['out']:.2f}", flush=True)
-    return before, (led['in'], led['out'])
+    before = ledger_snapshot(target)
+    amount = parse_received_amount(text) or 0.0
+    return before, (before[0] + amount, before[1])
+
+
+def ledger_commit(target, after, note=''):
+    """Store new figures.
+
+    Called ONLY once the message carrying them is on the wire. The ledger is
+    always exactly what the newest message in the group shows, so a failed send
+    can never leave the books ahead of what anyone can see."""
+    opening = target not in _ledger
+    _ledger[target] = {'in': after[0], 'out': after[1]}
+    print(f"📒 [LEDGER] {target} {'opened at' if opening else 'now'} "
+          f"in={after[0]:.2f} out={after[1]:.2f}{note}", flush=True)
 
 
 async def process_incoming(chat_id, text, origin, from_bot=False, sent_at=None):
@@ -356,7 +366,7 @@ async def process_incoming(chat_id, text, origin, from_bot=False, sent_at=None):
     print("✅ [KEYWORD MATCH] Forwarding message...", flush=True)
     for target in FORWARD_RULES[rule_key]:
         # Each target keeps its own books, so the totals shown are per target.
-        movement = ledger_apply_payment(target, text) if from_bot else None
+        movement = ledger_preview_payment(target, text) if from_bot else None
         body = fixed
         if movement:
             body = rewrite_totals(fixed, movement[1][0], movement[1][1])
@@ -364,19 +374,24 @@ async def process_incoming(chat_id, text, origin, from_bot=False, sent_at=None):
             # Human-pasted text. Show the ledger so the group never displays two
             # different sets of numbers, but do not book an amount we cannot
             # trust - only the notification bot moves the books.
-            body = rewrite_totals(fixed, _ledger[target]['in'], _ledger[target]['out'])
+            body = rewrite_totals(fixed, *ledger_snapshot(target))
         try:
             # Always sent with the bot token, never from the user account.
             await bot.send_message(target, body)
-            print(f"🚀 [FORWARD SUCCESS] Sent to {target}", flush=True)
-            forwarded_count += 1
-            today_count += 1
-            last_messages.append(body[:50])
-            if len(last_messages) > 10:
-                last_messages.pop(0)
         except Exception as e:
+            # Nothing committed: the ledger stays level with the last message
+            # the group can actually see.
             print(f"❌ [FORWARD ERROR] Target {target}: {e}", flush=True)
             continue
+
+        if movement:
+            ledger_commit(target, movement[1])
+        print(f"🚀 [FORWARD SUCCESS] Sent to {target}", flush=True)
+        forwarded_count += 1
+        today_count += 1
+        last_messages.append(body[:50])
+        if len(last_messages) > 10:
+            last_messages.pop(0)
 
         # After the payment confirmation, so the alert lands beneath it.
         if movement:
@@ -431,25 +446,26 @@ async def ledger_command(message):
         await bot.reply_to(message, f"Usage: /{command} <amount>\nExample: /{command} 100")
         return
 
-    led = _ledger.setdefault(chat_id, {'in': 0.0, 'out': 0.0})
-    before = (led['in'], led['out'])
+    before = ledger_snapshot(chat_id)
     if command == 'add':
-        led['in'] += amount
+        after = (before[0] + amount, before[1])
         heading = f"💰 Deposit = +{amount:.2f}$"
     else:
-        led['out'] += amount
+        after = (before[0], before[1] + amount)
         heading = f"📤 Out = -{amount:.2f}$"
 
-    print(f"📒 [LEDGER] /{command} {amount:.2f} by {user_id} in {chat_id} -> "
-          f"in={led['in']:.2f} out={led['out']:.2f}", flush=True)
+    try:
+        await bot.send_message(chat_id,
+                               f"{heading}\n\n"
+                               f"📊 Group Total:\n"
+                               f"➕ Total In : {after[0]:.2f}$\n"
+                               f"➖ Total Out: {after[1]:.2f}$")
+    except Exception as e:
+        print(f"❌ [LEDGER] /{command} NOT applied, send failed: {e}", flush=True)
+        return
 
-    await bot.send_message(chat_id,
-                           f"{heading}\n\n"
-                           f"📊 Group Total:\n"
-                           f"➕ Total In : {led['in']:.2f}$\n"
-                           f"➖ Total Out: {led['out']:.2f}$")
-
-    await check_milestones(chat_id, before, (led['in'], led['out']))
+    ledger_commit(chat_id, after, f" (/{command} {amount:.2f} by {user_id})")
+    await check_milestones(chat_id, before, after)
 
 
 @bot.message_handler(commands=['set'])
@@ -478,22 +494,22 @@ async def ledger_set_command(message):
         return
 
     column = match.group(1).lower()
-    led = _ledger.setdefault(chat_id, {'in': 0.0, 'out': 0.0})
-    before = (led['in'], led['out'])
-    previous = led[column]
-    led[column] = amount
+    before = ledger_snapshot(chat_id)
+    after = (amount, before[1]) if column == 'in' else (before[0], amount)
 
-    print(f"📒 [LEDGER] /set {column} {previous:.2f} -> {amount:.2f} "
-          f"by {user_id} in {chat_id}", flush=True)
+    try:
+        await bot.send_message(chat_id,
+                               f"✏️ Corrected: Total {'In' if column == 'in' else 'Out'} "
+                               f"set to {amount:.2f}$\n\n"
+                               f"📊 Group Total:\n"
+                               f"➕ Total In : {after[0]:.2f}$\n"
+                               f"➖ Total Out: {after[1]:.2f}$")
+    except Exception as e:
+        print(f"❌ [LEDGER] /set NOT applied, send failed: {e}", flush=True)
+        return
 
-    await bot.send_message(chat_id,
-                           f"✏️ Corrected: Total {'In' if column == 'in' else 'Out'} "
-                           f"set to {amount:.2f}$\n\n"
-                           f"📊 Group Total:\n"
-                           f"➕ Total In : {led['in']:.2f}$\n"
-                           f"➖ Total Out: {led['out']:.2f}$")
-
-    await check_milestones(chat_id, before, (led['in'], led['out']))
+    ledger_commit(chat_id, after, f" (/set {column} {amount:.2f} by {user_id})")
+    await check_milestones(chat_id, before, after)
 
 
 @bot.message_handler(content_types=['text'])
