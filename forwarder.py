@@ -7,6 +7,7 @@ KEYWORDS = ["You received"]
 FORWARD_RULES = {
     -1004330276394: [-5580596463],
     5353420212: [5350880041],
+    -5339749243: [-5100231154, -5306739731],
 }
 
 bot = telebot.TeleBot(BOT_TOKEN)
@@ -25,5 +26,5 @@ def forward_text(message):
         else:
             print('Skipped - no keyword match')
 
-print('Bot is running with 2 groups...')
+print('Bot is running with 3 groups...')
 bot.polling(none_stop=True, allowed_updates=['message'])
