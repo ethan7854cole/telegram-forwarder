@@ -5,11 +5,14 @@ from datetime import datetime
 BOT_TOKEN = '8614082158:AAFDYIednxJfb1IDKj4clVEwJZHY-m67BAk'
 ADMIN_ID = 7578145913
 KEYWORDS = ['You received']
+
+# Updated FORWARD_RULES with your exact supergroup ID: -1003894781195
 FORWARD_RULES = {
-    -1002335630148: [-5580596463],
+    -1003894781195: [-5580596463],
     -5353420212: [-5350880041],
     -5339749243: [-5100231154, -5306739731],
 }
+
 forwarded_count = 0
 today_count = 0
 start_time = datetime.now()
