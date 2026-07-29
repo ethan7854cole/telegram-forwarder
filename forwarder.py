@@ -27,9 +27,7 @@ def notify_admin(msg):
 @bot.message_handler(commands=['start'])
 def start(message):
     if message.chat.id == ADMIN_ID:
-        bot.reply_to(message, '✅ Bot is running!
-
-Use /status to check details.')
+        bot.reply_to(message, 'Bot is running! Use /status to check details.')
 
 @bot.message_handler(commands=['status'])
 def status(message):
@@ -37,22 +35,21 @@ def status(message):
         uptime = datetime.now() - start_time
         hours = int(uptime.total_seconds() // 3600)
         minutes = int((uptime.total_seconds() % 3600) // 60)
-        bot.reply_to(message, f'✅ Bot is Online!
-📊 Groups monitored: {len(FORWARD_RULES)}
-🔑 Keyword: You received
-📨 Messages forwarded: {forwarded_count}
-⏱ Uptime: {hours}h {minutes}m')
+        bot.reply_to(message, 'Bot is Online!
+Groups monitored: ' + str(len(FORWARD_RULES)) + '
+Keyword: You received
+Messages forwarded: ' + str(forwarded_count) + '
+Uptime: ' + str(hours) + 'h ' + str(minutes) + 'm')
 
 @bot.message_handler(commands=['stop'])
 def stop(message):
     if message.chat.id == ADMIN_ID:
-        bot.reply_to(message, '⛔ Stopping bot...')
-        notify_admin('⛔ Bot has been stopped by admin!')
+        bot.reply_to(message, 'Stopping bot...')
 
 @bot.message_handler(commands=['help'])
 def help(message):
     if message.chat.id == ADMIN_ID:
-        bot.reply_to(message, '📋 Available Commands:
+        bot.reply_to(message, 'Available Commands:
 
 /status - Check bot status
 /start - Start the bot
@@ -76,16 +73,14 @@ def forward_text(message):
             print('Skipped - no keyword match')
 
 print('Bot is running...')
-notify_admin('✅ Bot is now ONLINE and running!
-
-Use /status to check details.')
+notify_admin('Bot is now ONLINE and running! Use /status to check details.')
 
 while True:
     try:
         bot.polling(none_stop=True, allowed_updates=['message'])
     except Exception as e:
         print('Bot crashed: ' + str(e))
-        notify_admin('❌ Bot went DOWN! Restarting...
+        notify_admin('Bot went DOWN! Restarting...
 Error: ' + str(e))
         time.sleep(5)
-        notify_admin('✅ Bot is back ONLINE!')
+        notify_admin('Bot is back ONLINE!')
