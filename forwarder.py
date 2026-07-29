@@ -2,7 +2,7 @@ import telebot
 import time
 from datetime import datetime
 
-BOT_TOKEN = '8614082158:AAHIPZpqVvy4EzSKBJmFYBaVst-xtj4m-l0'
+BOT_TOKEN = '8614082158:AAFDYIednxJfb1IDKj4clVEwJZHY-m67BAk'
 ADMIN_ID = 7578145913
 KEYWORDS = ['You received']
 FORWARD_RULES = {
