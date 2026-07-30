@@ -1,6 +1,7 @@
 import asyncio
 import os
 import re
+import signal
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 
@@ -67,6 +68,16 @@ TELETHON_SOURCE_CHATS = os.getenv('TELETHON_SOURCE_CHATS', '')
 
 TELETHON_ENABLED = bool(API_ID and API_HASH)
 
+# Railway overlaps deploys: the replacement container boots while the outgoing
+# one is still alive. For the Bot API that is a harmless getUpdates 409, but for
+# Telethon it is fatal - two IPs on one auth key and Telegram destroys the key
+# permanently, which silently stops every forward until someone logs in again.
+# Holding the new container back past the changeover keeps the two from ever
+# being connected at the same moment. Costs one quiet minute after a deploy.
+ON_RAILWAY = bool(os.getenv('RAILWAY_ENVIRONMENT') or os.getenv('RAILWAY_SERVICE_ID')
+                  or os.getenv('RAILWAY_PROJECT_ID'))
+TELETHON_START_DELAY = int(os.getenv('TELETHON_START_DELAY', '45' if ON_RAILWAY else '0'))
+
 # ---------------------------------------------------------------------------
 # Runtime state (unchanged)
 # ---------------------------------------------------------------------------
@@ -78,6 +89,9 @@ last_messages = []
 
 userbot_status = 'disabled'
 
+# Set once run_userbot() has a client, so the shutdown handler can release it.
+_active_client = None
+
 bot = AsyncTeleBot(BOT_TOKEN)
 
 
@@ -86,6 +100,50 @@ async def notify_admin(msg):
         await bot.send_message(ADMIN_ID, msg)
     except Exception as e:
         print(f"Notify Admin Error: {e}", flush=True)
+
+
+class _ConflictWatcher:
+    """Notices when a second process is polling this same bot token.
+
+    It has to hook telebot's exception_handler rather than wrap bot.polling():
+    with none_stop=True, polling() catches the 409 internally, logs it and
+    carries on, so nothing ever propagates out for a try/except to see.
+
+    A 409 is worth shouting about because it is never only a polling problem.
+    Every process polling this token is also running run_userbot() with the
+    same TELETHON_SESSION from a different IP, and that is what makes Telegram
+    destroy the auth key and stop all forwarding."""
+
+    def __init__(self):
+        self.conflicts = 0
+        self.warned = False
+
+    async def handle(self, exception):
+        text = str(exception)
+        if '409' not in text and 'terminated by other getUpdates' not in text:
+            return False        # not ours: let telebot log it as usual
+
+        self.conflicts += 1
+        print(f"⚠️ [CONFLICT x{self.conflicts}] Another process is polling this "
+              f"token.", flush=True)
+
+        # A Railway deploy changeover overlaps the old and new container for a
+        # few seconds, which is normal and self-clears. Sustained conflict is a
+        # genuine second instance.
+        if self.conflicts >= 15 and not self.warned:
+            self.warned = True
+            await notify_admin(
+                "🚨 TWO BOT INSTANCES ARE RUNNING on the same token.\n\n"
+                "Telegram keeps cutting one of them off (getUpdates 409). Both are "
+                "also using the same TELETHON_SESSION from different IPs, which "
+                "destroys the session key and stops ALL forwarding.\n\n"
+                "Check for a duplicate Railway service on this repo. Replacing "
+                "TELETHON_SESSION while this is true will just burn the new one too.")
+        return True             # handled: suppress the repeated stack-trace log
+
+
+_conflict_watcher = _ConflictWatcher()
+bot.exception_handler = _conflict_watcher
 
 
 def get_uptime():
@@ -866,8 +924,21 @@ async def run_userbot():
     session = StringSession(TELETHON_SESSION) if TELETHON_SESSION else TELETHON_SESSION_NAME
     warned_unauthorised = False
 
+    if TELETHON_START_DELAY:
+        # Only before the first connect. Reconnects inside the loop below are
+        # replacing a dropped connection of our own, not racing another
+        # container, so they must not be delayed.
+        userbot_status = f'waiting {TELETHON_START_DELAY}s for the previous deploy to exit'
+        print(f"⏸️ [TELETHON] Holding {TELETHON_START_DELAY}s so the outgoing container "
+              "releases the session first (set TELETHON_START_DELAY=0 to disable).",
+              flush=True)
+        await asyncio.sleep(TELETHON_START_DELAY)
+
+    global _active_client
+
     while True:
         client = TelegramClient(session, int(API_ID), API_HASH)
+        _active_client = client
         try:
             # connect() instead of start() so a missing session fails loudly
             # rather than blocking on an interactive login prompt in production.
@@ -967,45 +1038,38 @@ async def run_userbot():
 # ---------------------------------------------------------------------------
 
 async def run_bot():
-    # A 409 from getUpdates means a second process is polling the same token.
-    # That is not just a polling nuisance: every one of those processes also
-    # runs run_userbot() with the same TELETHON_SESSION from a different IP,
-    # which is exactly what makes Telegram destroy the auth key and stop all
-    # forwarding. Treat sustained conflicts as the outage warning they are.
-    conflicts = 0
-    warned_conflict = False
-
     while True:
         try:
             await bot.polling(none_stop=True, allowed_updates=['message'])
         except Exception as e:
-            if '409' in str(e) or 'terminated by other getUpdates' in str(e):
-                conflicts += 1
-                print(f"⚠️ [CONFLICT x{conflicts}] Another instance is polling this "
-                      f"token: {e}", flush=True)
-                # ~30s of continuous conflict: a deploy changeover is over by
-                # then, so this is a second instance that is here to stay.
-                if conflicts >= 6 and not warned_conflict:
-                    warned_conflict = True
-                    await notify_admin(
-                        "🚨 TWO BOT INSTANCES ARE RUNNING on the same token.\n\n"
-                        "Telegram keeps cutting one of them off (getUpdates 409), and "
-                        "both are using the same TELETHON_SESSION from different IPs - "
-                        "which destroys the session key and stops ALL forwarding.\n\n"
-                        "Fix in Railway before replacing the session:\n"
-                        "1. Settings -> Deploy -> Replicas = 1\n"
-                        "2. Check the project for a duplicate service on the same repo\n\n"
-                        "Replacing TELETHON_SESSION while this is true will just burn "
-                        "the new session too.")
-            else:
-                conflicts = 0
-                warned_conflict = False
-                print(f"Polling Error: {e}", flush=True)
+            print(f"Polling Error: {e}", flush=True)
             await asyncio.sleep(5)
+
+
+def _install_shutdown_handler(loop):
+    """Drop the Telethon connection the moment Railway says we are going away.
+
+    The default SIGTERM death leaves the socket to time out server-side, so the
+    outgoing container can still look connected while its replacement dials in
+    on the same key - the exact overlap that destroys the session. Disconnecting
+    first shortens that window to nothing."""
+    def _on_term():
+        print("🛑 [SHUTDOWN] SIGTERM - releasing the Telethon session before exit.",
+              flush=True)
+        if _active_client is not None:
+            loop.create_task(_active_client.disconnect())
+        loop.call_later(2, loop.stop)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _on_term)
+        except (NotImplementedError, RuntimeError):
+            pass        # not supported on this platform; default behaviour applies
 
 
 async def main():
     print('Bot running...', flush=True)
+    _install_shutdown_handler(asyncio.get_running_loop())
     await notify_admin('Bot is ONLINE. Use /help to see all commands.')
     await asyncio.gather(run_bot(), run_userbot(), idle_watchdog(),
                          return_exceptions=True)
