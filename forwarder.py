@@ -967,11 +967,40 @@ async def run_userbot():
 # ---------------------------------------------------------------------------
 
 async def run_bot():
+    # A 409 from getUpdates means a second process is polling the same token.
+    # That is not just a polling nuisance: every one of those processes also
+    # runs run_userbot() with the same TELETHON_SESSION from a different IP,
+    # which is exactly what makes Telegram destroy the auth key and stop all
+    # forwarding. Treat sustained conflicts as the outage warning they are.
+    conflicts = 0
+    warned_conflict = False
+
     while True:
         try:
             await bot.polling(none_stop=True, allowed_updates=['message'])
         except Exception as e:
-            print(f"Polling Error: {e}", flush=True)
+            if '409' in str(e) or 'terminated by other getUpdates' in str(e):
+                conflicts += 1
+                print(f"⚠️ [CONFLICT x{conflicts}] Another instance is polling this "
+                      f"token: {e}", flush=True)
+                # ~30s of continuous conflict: a deploy changeover is over by
+                # then, so this is a second instance that is here to stay.
+                if conflicts >= 6 and not warned_conflict:
+                    warned_conflict = True
+                    await notify_admin(
+                        "🚨 TWO BOT INSTANCES ARE RUNNING on the same token.\n\n"
+                        "Telegram keeps cutting one of them off (getUpdates 409), and "
+                        "both are using the same TELETHON_SESSION from different IPs - "
+                        "which destroys the session key and stops ALL forwarding.\n\n"
+                        "Fix in Railway before replacing the session:\n"
+                        "1. Settings -> Deploy -> Replicas = 1\n"
+                        "2. Check the project for a duplicate service on the same repo\n\n"
+                        "Replacing TELETHON_SESSION while this is true will just burn "
+                        "the new session too.")
+            else:
+                conflicts = 0
+                warned_conflict = False
+                print(f"Polling Error: {e}", flush=True)
             await asyncio.sleep(5)
 
 
