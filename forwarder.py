@@ -1047,18 +1047,25 @@ async def run_bot():
 
 
 def _install_shutdown_handler(loop):
-    """Drop the Telethon connection the moment Railway says we are going away.
+    """Leave promptly and quietly when Railway says we are going away.
 
-    The default SIGTERM death leaves the socket to time out server-side, so the
-    outgoing container can still look connected while its replacement dials in
-    on the same key - the exact overlap that destroys the session. Disconnecting
-    first shortens that window to nothing."""
+    This matters more than it looks. In a container this process is PID 1, and
+    PID 1 does not get the kernel's default signal dispositions: an unhandled
+    SIGTERM is simply IGNORED. So the outgoing container sat there holding the
+    Telethon connection until Railway lost patience and sent SIGKILL, which is
+    the overlap that destroyed the session. Handling SIGTERM explicitly is what
+    makes the old container actually leave.
+
+    Exit via os._exit rather than loop.stop(): stopping the loop out from under
+    asyncio.run() raises RuntimeError and exits non-zero, which Railway reads as
+    a crash and restarts - turning a clean shutdown into another instance."""
     def _on_term():
         print("🛑 [SHUTDOWN] SIGTERM - releasing the Telethon session before exit.",
               flush=True)
         if _active_client is not None:
             loop.create_task(_active_client.disconnect())
-        loop.call_later(2, loop.stop)
+        # Enough for the disconnect to reach Telegram, then go without fuss.
+        loop.call_later(2, lambda: os._exit(0))
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
