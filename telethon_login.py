@@ -33,8 +33,11 @@ list.
 import asyncio
 import os
 import sys
+from datetime import datetime
 
 from telethon import TelegramClient
+from telethon.errors import (AuthKeyDuplicatedError, AuthKeyUnregisteredError,
+                             SessionRevokedError)
 from telethon.sessions import StringSession
 
 
@@ -42,6 +45,31 @@ def _prompt(name, current):
     if current:
         return current
     return input(f"{name}: ").strip()
+
+
+async def _open(session_name, api_id, api_hash):
+    """Log in, retiring a destroyed session file if one is in the way.
+
+    Re-running this script is the fix for a destroyed key, so it must not be
+    blocked BY that destroyed key. Telethon loads <name>.session if it exists
+    and dies on connect long before it can offer a login prompt, which leaves
+    the one recovery path unusable exactly when it is needed."""
+    path = f'{session_name}.session'
+    try:
+        client = TelegramClient(session_name, int(api_id), api_hash)
+        await client.start()
+        return client
+    except (AuthKeyDuplicatedError, AuthKeyUnregisteredError, SessionRevokedError) as e:
+        if not os.path.exists(path):
+            raise
+        # Keep the .session suffix so .gitignore still covers the retired file.
+        retired = f'{session_name}.dead-{datetime.now():%Y%m%d-%H%M%S}.session'
+        os.rename(path, retired)
+        print(f"\n⚠️  {path} held a key Telegram has destroyed ({type(e).__name__}).")
+        print(f"   Retired it to {retired}. Starting a fresh login.\n")
+        client = TelegramClient(session_name, int(api_id), api_hash)
+        await client.start()
+        return client
 
 
 async def main():
@@ -57,7 +85,8 @@ async def main():
     if deploy:
         print("Creating a SEPARATE session for Railway (independent of the local one).\n")
 
-    async with TelegramClient(session_name, int(api_id), api_hash) as client:
+    client = await _open(session_name, api_id, api_hash)
+    try:
         me = await client.get_me()
         print(f"\n✅ Logged in as {me.first_name} (@{me.username}) id={me.id}")
 
@@ -86,6 +115,8 @@ async def main():
         print("=" * 70)
         print(StringSession.save(client.session))
         print("=" * 70)
+    finally:
+        await client.disconnect()
 
 
 if __name__ == '__main__':
