@@ -2,12 +2,12 @@ import asyncio
 import os
 import re
 import signal
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from datetime import datetime, timedelta, timezone
 
 from telebot.async_telebot import AsyncTeleBot
 
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, utils
 from telethon.errors import (AuthKeyDuplicatedError, AuthKeyUnregisteredError,
                              SessionRevokedError, UserDeactivatedBanError)
 from telethon.sessions import StringSession
@@ -77,6 +77,13 @@ TELETHON_ENABLED = bool(API_ID and API_HASH)
 ON_RAILWAY = bool(os.getenv('RAILWAY_ENVIRONMENT') or os.getenv('RAILWAY_SERVICE_ID')
                   or os.getenv('RAILWAY_PROJECT_ID'))
 TELETHON_START_DELAY = int(os.getenv('TELETHON_START_DELAY', '45' if ON_RAILWAY else '0'))
+
+# On connect, look back over this window and forward anything that was missed
+# while the listener was down. 0 disables the sweep. The cap is a guard against
+# a misconfiguration dumping hours of history into a group.
+CATCHUP_LOOKBACK_MINUTES = int(os.getenv('CATCHUP_LOOKBACK_MINUTES', '180'))
+CATCHUP_MAX = int(os.getenv('CATCHUP_MAX', '25'))
+CATCHUP_SCAN_LIMIT = int(os.getenv('CATCHUP_SCAN_LIMIT', '300'))
 
 # ---------------------------------------------------------------------------
 # Runtime state (unchanged)
@@ -549,38 +556,50 @@ async def process_incoming(chat_id, text, origin, from_bot=False, sent_at=None):
 
     print("✅ [KEYWORD MATCH] Forwarding message...", flush=True)
     for target in FORWARD_RULES[rule_key]:
-        # Each target keeps its own books, so the totals shown are per target.
-        movement = ledger_preview_payment(target, text) if from_bot else None
-        body = fixed
-        if movement:
-            body = rewrite_totals(fixed, movement[1][0], movement[1][1])
-        elif target in _ledger:
-            # Human-pasted text. Show the ledger so the group never displays two
-            # different sets of numbers, but do not book an amount we cannot
-            # trust - only the notification bot moves the books.
-            body = rewrite_totals(fixed, *ledger_snapshot(target))
-        try:
-            # Always sent with the bot token, never from the user account.
-            await bot.send_message(target, body)
-        except Exception as e:
-            # Nothing committed: the ledger stays level with the last message
-            # the group can actually see.
-            print(f"❌ [FORWARD ERROR] Target {target}: {e}", flush=True)
-            continue
+        await deliver_to_target(target, fixed, text, from_bot)
 
-        if movement:
-            ledger_commit(target, movement[1])
-            await note_payment(target)  # a real payment landed: reset the clock
-        print(f"🚀 [FORWARD SUCCESS] Sent to {target}", flush=True)
-        forwarded_count += 1
-        today_count += 1
-        last_messages.append(body[:50])
-        if len(last_messages) > 10:
-            last_messages.pop(0)
 
-        # After the payment confirmation, so the alert lands beneath it.
-        if movement:
-            await check_milestones(target, movement[0], movement[1])
+async def deliver_to_target(target, fixed, text, from_bot):
+    """Send one notification to one group and move that group's books.
+
+    Split out of process_incoming so the start-up catch-up can deliver to a
+    single target: a message can be missing from one group while another
+    already has it, and re-sending to the group that has it would duplicate."""
+    global forwarded_count, today_count
+
+    # Each target keeps its own books, so the totals shown are per target.
+    movement = ledger_preview_payment(target, text) if from_bot else None
+    body = fixed
+    if movement:
+        body = rewrite_totals(fixed, movement[1][0], movement[1][1])
+    elif target in _ledger:
+        # Human-pasted text. Show the ledger so the group never displays two
+        # different sets of numbers, but do not book an amount we cannot
+        # trust - only the notification bot moves the books.
+        body = rewrite_totals(fixed, *ledger_snapshot(target))
+    try:
+        # Always sent with the bot token, never from the user account.
+        await bot.send_message(target, body)
+    except Exception as e:
+        # Nothing committed: the ledger stays level with the last message
+        # the group can actually see.
+        print(f"❌ [FORWARD ERROR] Target {target}: {e}", flush=True)
+        return False
+
+    if movement:
+        ledger_commit(target, movement[1])
+        await note_payment(target)  # a real payment landed: reset the clock
+    print(f"🚀 [FORWARD SUCCESS] Sent to {target}", flush=True)
+    forwarded_count += 1
+    today_count += 1
+    last_messages.append(body[:50])
+    if len(last_messages) > 10:
+        last_messages.pop(0)
+
+    # After the payment confirmation, so the alert lands beneath it.
+    if movement:
+        await check_milestones(target, movement[0], movement[1])
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -858,18 +877,22 @@ def _is_target_sender(sender, bot_ids, bot_usernames):
     return bool(getattr(sender, 'bot', False))
 
 
+async def _resolve_one(client, chat_id):
+    """Try both spellings of a chat id and return whichever resolves."""
+    for candidate in [chat_id] + _id_variants(chat_id):
+        try:
+            return await client.get_entity(candidate)
+        except Exception:
+            continue
+    return None
+
+
 async def _resolve_source_chats(client, wanted):
     """Resolve each configured chat separately so one bad id cannot stop the
     listener from starting on the good ones."""
     resolved = []
     for chat_id in wanted:
-        entity = None
-        for candidate in [chat_id] + _id_variants(chat_id):
-            try:
-                entity = await client.get_entity(candidate)
-                break
-            except Exception:
-                continue
+        entity = await _resolve_one(client, chat_id)
         if entity is None:
             print(f"⚠️ [TELETHON] Could not resolve source chat {chat_id} - skipping it.", flush=True)
             continue
@@ -877,6 +900,127 @@ async def _resolve_source_chats(client, wanted):
         print(f"👁️ [TELETHON] Watching {chat_id} ({title})", flush=True)
         resolved.append(entity)
     return resolved
+
+
+def _catchup_signature(text):
+    """Content key for one notification that survives forwarding.
+
+    The embedded timestamp is rewritten on the way out, so it is stripped here;
+    what remains (the name, the amount, the totals) is identical in the source
+    and in the copy sitting in the target group."""
+    return ' '.join(_STAMP_RE.sub('', text or '').split())
+
+
+async def _delivered_signatures(client, target):
+    """Signatures of what this bot has already posted into a target group."""
+    counts = Counter()
+    entity = await _resolve_one(client, target)
+    if entity is None:
+        return None                     # unreadable: caller must not guess
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=CATCHUP_LOOKBACK_MINUTES)
+    async for msg in client.iter_messages(entity, limit=CATCHUP_SCAN_LIMIT):
+        if msg.date < cutoff:
+            break
+        sender = await msg.get_sender()
+        if BOT_ID is None or getattr(sender, 'id', None) != BOT_ID:
+            continue
+        if msg.raw_text:
+            counts[_catchup_signature(msg.raw_text)] += 1
+    return counts
+
+
+async def catch_up(client):
+    """Forward notifications that arrived while this listener was not running.
+
+    There is a deaf window on every deploy - the start-up hold alone is ~45s -
+    and after an outage it can be hours. A payment landing in it would
+    otherwise be lost in silence, which is the failure mode that started all
+    this.
+
+    Railway wipes the disk on deploy, so there is no local record of what was
+    forwarded. The target group's own history is the record: a notification
+    whose text is not already sitting in the target was never delivered.
+
+    Copies are counted rather than tested for membership. Timestamps are
+    stripped before comparing, so two identical payments minutes apart look
+    alike - counting means it forwards the difference instead of deciding one
+    of each was enough."""
+    if not CATCHUP_LOOKBACK_MINUTES:
+        return
+
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=CATCHUP_LOOKBACK_MINUTES)
+    total = 0
+
+    for rule_key, targets in FORWARD_RULES.items():
+        source = await _resolve_one(client, rule_key)
+        if source is None:
+            continue
+        # The live handler keys dedup off event.chat_id, so use the same
+        # canonical form here or the two would not recognise each other.
+        source_id = utils.get_peer_id(source)
+
+        pending = []
+        async for msg in client.iter_messages(source, limit=CATCHUP_SCAN_LIMIT):
+            if msg.date < cutoff:
+                break
+            if not _is_plain_text(msg) or not msg.raw_text:
+                continue
+            if not any(k.lower() in msg.raw_text.lower() for k in KEYWORDS):
+                continue
+            sender = await msg.get_sender()
+            if not bool(getattr(sender, 'bot', False)):
+                continue        # the live path forwards bot notifications only
+            pending.append(msg)
+        if not pending:
+            continue
+        pending.reverse()                       # oldest first, so groups read in order
+
+        for target in targets:
+            delivered = await _delivered_signatures(client, target)
+            if delivered is None:
+                print(f"⚠️ [CATCHUP] {target} unreadable - skipping, will not guess.",
+                      flush=True)
+                continue
+
+            missing = []
+            for msg in pending:
+                sig = _catchup_signature(msg.raw_text)
+                if delivered[sig] > 0:
+                    delivered[sig] -= 1         # this copy is already in the group
+                else:
+                    missing.append(msg)
+            if not missing:
+                continue
+
+            if len(missing) > CATCHUP_MAX:
+                # Something is off - a wrong id, a cleared group. Deliver the
+                # newest and say so rather than flooding the group with hours
+                # of history.
+                print(f"⚠️ [CATCHUP] {target} looks {len(missing)} behind; sending the "
+                      f"newest {CATCHUP_MAX}.", flush=True)
+                await notify_admin(
+                    f"⚠️ Catch-up found {len(missing)} unforwarded notifications for "
+                    f"{target}, more than the {CATCHUP_MAX} cap. Sent the newest "
+                    f"{CATCHUP_MAX}. Use backfill.py if the rest are wanted.")
+                missing = missing[-CATCHUP_MAX:]
+
+            print(f"⏪ [CATCHUP] {target}: {len(missing)} missed notification(s).",
+                  flush=True)
+            for msg in missing:
+                # Mark before sending: the live handler is already queued behind
+                # this and must not send the same message a second time.
+                _is_duplicate((source_id, msg.id))
+                fixed = correct_timestamp(msg.raw_text, msg.date)
+                if await deliver_to_target(target, fixed, msg.raw_text, True):
+                    total += 1
+                await asyncio.sleep(1.5)        # stay under the send rate limit
+
+    if total:
+        print(f"⏪ [CATCHUP] delivered {total} missed notification(s).", flush=True)
+        await notify_admin(f"⏪ Caught up {total} notification(s) that arrived while "
+                           f"the forwarder was not listening.")
+    else:
+        print("⏪ [CATCHUP] nothing missed.", flush=True)
 
 
 async def recover_ledgers(client):
@@ -964,8 +1108,6 @@ async def run_userbot():
             # Warms the entity cache so numeric chat ids resolve reliably.
             await client.get_dialogs()
 
-            await recover_ledgers(client)
-
             chats = await _resolve_source_chats(client, _configured_source_chats())
             if not chats:
                 # Retry rather than return: a transient resolve failure must not
@@ -975,8 +1117,16 @@ async def run_userbot():
                 await asyncio.sleep(60)
                 continue
 
+            # Register the handler BEFORE the ledger rebuild and the catch-up
+            # sweep, so a payment arriving during them is queued rather than
+            # missed. Each event waits on this gate, which opens once the books
+            # are straight and the sweep has run - that ordering keeps the
+            # groups reading chronologically and lets dedup do its job.
+            ready = asyncio.Event()
+
             @client.on(events.NewMessage(chats=chats))
             async def on_source_message(event):
+                await ready.wait()
                 sender = await event.get_sender()
                 if not _is_target_sender(sender, bot_ids, bot_usernames):
                     return
@@ -990,6 +1140,16 @@ async def run_userbot():
                 # _is_target_sender above already guaranteed a bot sender.
                 await process_incoming(event.chat_id, text, 'telethon',
                                        from_bot=True, sent_at=event.message.date)
+
+            await recover_ledgers(client)
+            try:
+                await catch_up(client)
+            except Exception as e:
+                # A failed sweep must not cost us the live listener - being late
+                # on a few messages beats being deaf to all of them.
+                print(f"⚠️ [CATCHUP] sweep failed: {e} - continuing to listen.",
+                      flush=True)
+            ready.set()
 
             target = SOURCE_BOTS if SOURCE_BOTS.strip() else 'any bot'
             userbot_status = f'listening ({len(chats)} chats, from: {target})'
