@@ -7,6 +7,8 @@ from datetime import datetime, timedelta, timezone
 from telebot.async_telebot import AsyncTeleBot
 
 from telethon import TelegramClient, events
+from telethon.errors import (AuthKeyDuplicatedError, AuthKeyUnregisteredError,
+                             SessionRevokedError, UserDeactivatedBanError)
 from telethon.sessions import StringSession
 from telethon.tl.types import MessageMediaWebPage
 
@@ -895,9 +897,12 @@ async def run_userbot():
 
             chats = await _resolve_source_chats(client, _configured_source_chats())
             if not chats:
+                # Retry rather than return: a transient resolve failure must not
+                # silently retire the listener for the life of the process.
                 userbot_status = 'no source chats resolved'
-                print("❌ [TELETHON] No source chats could be resolved - listener idle.", flush=True)
-                return
+                print("❌ [TELETHON] No source chats could be resolved - retrying in 60s.", flush=True)
+                await asyncio.sleep(60)
+                continue
 
             @client.on(events.NewMessage(chats=chats))
             async def on_source_message(event):
@@ -921,6 +926,30 @@ async def run_userbot():
 
             await client.run_until_disconnected()
             print("⚠️ [TELETHON] Disconnected - reconnecting in 15s.", flush=True)
+        except (AuthKeyDuplicatedError, AuthKeyUnregisteredError,
+                SessionRevokedError, UserDeactivatedBanError) as e:
+            # Telegram has destroyed the auth key - almost always because the
+            # same session ran from two IPs at once (deployment + laptop, or two
+            # overlapping Railway containers). Reconnecting can NEVER fix this:
+            # only a fresh login can. Retrying silently every 15s is how this
+            # went unnoticed for hours, so shout once and stop.
+            userbot_status = f'session dead: {type(e).__name__}'
+            print(f"💀 [TELETHON DEAD] {type(e).__name__}: {e}\n"
+                  "   Forwarding of bot messages is STOPPED until TELETHON_SESSION "
+                  "is replaced. Run: python3 telethon_login.py --deploy", flush=True)
+            await notify_admin(
+                f"🚨 FORWARDING IS DOWN - Telethon session destroyed "
+                f"({type(e).__name__}).\n\n"
+                "Messages posted by the notification bot are NOT being forwarded "
+                "to any group, and this cannot self-heal.\n\n"
+                "Fix:\n"
+                "1. python3 telethon_login.py --deploy\n"
+                "2. Paste the new string into Railway's TELETHON_SESSION\n"
+                "3. Redeploy\n\n"
+                "Cause: that session key was used from two IPs at once. Never run "
+                "local scripts with the deployment's session, and keep Railway at "
+                "a single replica.")
+            return
         except Exception as e:
             userbot_status = f'error: {e}'
             print(f"❌ [TELETHON ERROR] {e} - retrying in 15s.", flush=True)

@@ -88,6 +88,9 @@ def parse_args():
                    help='actually send. Without this it is a dry run')
     p.add_argument('--keep-original-time', action='store_true',
                    help="forward the bot's own timestamp instead of correcting it")
+    p.add_argument('--use-deploy-session', action='store_true',
+                   help='allow TELETHON_SESSION from the environment. Unsafe: it '
+                        'can revoke the deployment key and stop forwarding')
     args = p.parse_args()
     if args.no_keyword:
         args.keyword = []
@@ -172,8 +175,20 @@ async def main():
     if args.send and not bot_token:
         raise SystemExit("❌ Set TELEGRAM_BOT_TOKEN to send.")
 
-    session = StringSession(os.getenv('TELETHON_SESSION')) if os.getenv('TELETHON_SESSION') \
-        else os.getenv('TELETHON_SESSION_NAME', 'user_session')
+    # This script runs on your machine, so it must use YOUR session. If
+    # TELETHON_SESSION is exported here it is almost certainly the deployment's
+    # string, and connecting with it from a second IP makes Telegram destroy
+    # that key - which silently kills forwarding until someone logs in again.
+    if os.getenv('TELETHON_SESSION') and not args.use_deploy_session:
+        raise SystemExit(
+            "❌ TELETHON_SESSION is set in this shell.\n"
+            "   That is the DEPLOYMENT's session. Using it from this machine "
+            "makes Telegram\n   revoke the key and stops all forwarding.\n\n"
+            "   Run this instead:  unset TELETHON_SESSION && python3 backfill.py ...\n"
+            "   (or pass --use-deploy-session if you really mean it)")
+
+    session = StringSession(os.getenv('TELETHON_SESSION')) if args.use_deploy_session \
+        and os.getenv('TELETHON_SESSION') else os.getenv('TELETHON_SESSION_NAME', 'user_session')
 
     print(f"Cutoff  : {cutoff.isoformat()}")
     print(f"Keyword : {args.keyword or 'none - every message'}")
