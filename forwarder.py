@@ -728,39 +728,42 @@ async def dm_crew(text):
             "them directly. Until then only the group mention reaches them.")
 
 
-async def heart_request(handling, message_id):
-    """❤ the forwarded request, marking it done.
+async def heart_request(chat_id, message_id):
+    """❤ a cashout request, marking it actioned.
 
-    Falls back to the user account because a broadcast channel refuses
-    reactions from a bot that is not an admin there, and the account already
-    has the rights."""
+    Falls back to the user account because the bot may not be able to react on
+    someone else's message in that chat, and the account already can."""
     try:
-        await bot.set_message_reaction(handling, message_id,
+        await bot.set_message_reaction(chat_id, message_id,
                                        [ReactionTypeEmoji(CASHOUT_HEART)])
-        print(f"❤️ [CASHOUT] hearted {message_id} in {chat_name(handling)}", flush=True)
+        print(f"❤️ [CASHOUT] hearted {message_id} in {chat_name(chat_id)}", flush=True)
         return True
     except Exception as e:
-        print(f"⚠️ [CASHOUT] bot could not react in {chat_name(handling)}: {e}",
+        print(f"⚠️ [CASHOUT] bot could not react in {chat_name(chat_id)}: {e}",
               flush=True)
 
     if USERBOT_SEND and _active_client is not None:
         try:
-            entity = await _resolve_one(_active_client, handling)
+            entity = await _resolve_one(_active_client, chat_id)
             if entity is not None:
                 await _active_client(SendReactionRequest(
                     peer=entity, msg_id=message_id,
                     reaction=[ReactionEmoji(emoticon=CASHOUT_HEART)]))
-                print(f"❤️ [CASHOUT] hearted {message_id} in {chat_name(handling)} "
+                print(f"❤️ [CASHOUT] hearted {message_id} in {chat_name(chat_id)} "
                       "via user account", flush=True)
                 return True
         except Exception as e:
             print(f"❌ [CASHOUT] user-account reaction failed in "
-                  f"{chat_name(handling)}: {e}", flush=True)
+                  f"{chat_name(chat_id)}: {e}", flush=True)
     return False
 
 
-async def open_cashout_request(source, text, sent_at):
-    """Post a cashout request into its handling group and start the clock."""
+async def open_cashout_request(source, text, sent_at, origin_msg_id):
+    """Post a cashout request into its handling group and start the clock.
+
+    `origin_msg_id` is the request as it sits in the chime group. That is the
+    message that gets the ❤ once the cashout is actioned, so the group that
+    asked can see at a glance which of its requests have been dealt with."""
     handling = CASHOUT_ROUTES[source]
     body = f"{correct_timestamp(text, sent_at)}\n\n{CASHOUT_MENTIONS}"
     try:
@@ -779,7 +782,8 @@ async def open_cashout_request(source, text, sent_at):
     _pending_cashouts.setdefault(handling, []).append({
         'origin': source,
         'text': text,
-        'message_id': sent.message_id,     # what gets hearted
+        'origin_msg_id': origin_msg_id,    # in the chime group - gets the ❤
+        'message_id': sent.message_id,     # in the handling group - reminders reply to it
         'opened': now,
         'last_seen': now,                  # reset by any reply from the crew
         'nudges': 0,
@@ -883,7 +887,10 @@ async def handle_cashout_reply(handling, text, user_id, username, reply_to):
     waited = (datetime.now(timezone.utc) - request['opened']).total_seconds() / 60.0
     print(f"✅ [CASHOUT] /out returned to {chat_name(origin)} after "
           f"{_humanise(waited)} ({request['nudges']} reminder(s))", flush=True)
-    await heart_request(handling, request['message_id'])
+    # The ❤ goes on the original request in the chime group, not on the copy in
+    # the handling group: it is the group that asked which needs to see, at a
+    # glance, which of its requests have been dealt with.
+    await heart_request(origin, request['origin_msg_id'])
 
 
 async def observe_cashout(chat_id, text, message_id, sent_at,
@@ -903,7 +910,7 @@ async def observe_cashout(chat_id, text, message_id, sent_at,
             return
         if _is_duplicate(('cashout', source, message_id)):
             return
-        await open_cashout_request(source, text, sent_at)
+        await open_cashout_request(source, text, sent_at, message_id)
         return
 
     handling = _canonical(chat_id, _CASHOUT_HANDLERS)
@@ -1110,7 +1117,7 @@ async def help_command(message):
         "everyone gets a private warning.\n"
         "Their /out reply goes back to the chime group, its\n"
         "amount is added to that group's Total Out, and the\n"
-        "request gets a ❤.\n"
+        "original request there gets a ❤.\n"
         "A /out with nothing pending is ignored.\n"
         "\n"
         "INFO\n"
