@@ -676,10 +676,12 @@ CASHOUT_CREW_HANDLES = _handle_list(
 
 CASHOUT_TIMEOUT_MINUTES = int(os.getenv('CASHOUT_TIMEOUT_MINUTES', '5'))
 
-# Stop reminding after this many rounds, so a request that was settled off-chat
-# cannot nag the group forever. The request stays open either way - a late /out
-# is still forwarded and still hearted.
-CASHOUT_MAX_NUDGES = int(os.getenv('CASHOUT_MAX_NUDGES', '6'))
+# Reminders repeat until the /out actually lands. 0 means no limit, which is the
+# default: a cashout that nobody actions is not something to quietly give up on.
+# Deleting the request is what stops it - see close_deleted_cashouts - and a
+# reaction from the crew buys another CASHOUT_TIMEOUT_MINUTES each time. Set a
+# number here to cap the rounds instead.
+CASHOUT_MAX_NUDGES = int(os.getenv('CASHOUT_MAX_NUDGES', '0'))
 
 CASHOUT_HEART = os.getenv('CASHOUT_HEART', '❤')
 
@@ -867,7 +869,8 @@ async def open_cashout_request(source, text, sent_at, origin_msg_id):
         'origin_msg_id': origin_msg_id,    # in the chime group - gets the ❤
         'message_id': sent.message_id,     # in the handling group - reminders reply to it
         'opened': now,
-        'last_seen': now,                  # reset by any reply from the crew
+        'last_seen': now,                  # reset by a reply OR a reaction
+        'seen': False,                     # somebody has acknowledged it
         'nudges': 0,
         'exhausted': False,
     })
@@ -916,6 +919,29 @@ async def book_cashout_out(origin, text):
     await check_milestones(origin, before, after)
 
 
+def note_cashout_seen(chat_id, message_id, user_id, username):
+    """A tagged responder reacted to the forwarded request.
+
+    A reaction is an acknowledgement, so it carries exactly the standing a reply
+    does: the clock goes back to zero and they get another full timeout to send
+    the /out. It does NOT close the request - only a real /out does that - so if
+    the reaction is followed by silence, the chasing simply starts again."""
+    handling = _canonical(chat_id, _CASHOUT_HANDLERS)
+    if handling is None:
+        return False
+    if not _is_responder(user_id, username):
+        return False               # a reaction from anyone else means nothing
+    for request in _pending_cashouts.get(handling, []):
+        if request['message_id'] != message_id:
+            continue
+        request['last_seen'] = datetime.now(timezone.utc)
+        request['seen'] = True
+        print(f"👀 [CASHOUT] @{username or user_id} reacted in {chat_name(handling)} "
+              f"- {_humanise(CASHOUT_TIMEOUT_MINUTES)} more for the /out", flush=True)
+        return True
+    return False
+
+
 def _match_request(queue, reply_to):
     """Which open request a /out is answering.
 
@@ -943,6 +969,7 @@ async def handle_cashout_reply(handling, text, user_id, username, reply_to):
         now = datetime.now(timezone.utc)
         for request in queue:
             request['last_seen'] = now
+            request['seen'] = True
         print(f"💬 [CASHOUT] @{username or user_id} replied in "
               f"{chat_name(handling)} - reminder clock reset", flush=True)
 
@@ -1069,14 +1096,16 @@ async def close_deleted_cashouts(client, chat_id, deleted_ids):
             _pending_cashouts.pop(handling, None)
 
 
-def cashout_nudge_text(waited_minutes):
+def cashout_nudge_text(waited_minutes, seen=False):
     """Deliberately unsigned.
 
     This is the one message the bot posts into a handling group, and nothing of
     Ethan's belongs there. The milestone and idle messages ARE signed, because
     those only ever go to the chime groups."""
+    body = ("Seen, but there is still no /out on it."
+            if seen else "This cashout request is still waiting on a /out.")
     return (f"⏰ OUT REQUEST HAS CROSSED {_humanise(waited_minutes)} TIMEFRAME\n\n"
-            "This cashout request is still waiting on a /out.\n\n"
+            f"{body}\n\n"
             f"{CASHOUT_MENTIONS}")
 
 
@@ -1090,8 +1119,9 @@ def cashout_admin_dm_text(request, handling, waited_minutes):
             f"From: {chat_name(request['origin'])}\n"
             f"Waiting in: {chat_name(handling)}\n\n"
             f"{_cashout_preview(request)}\n\n"
-            "Nobody has sent a /out for it yet.\n"
-            f"Tagged in the group: {CASHOUT_MENTIONS}")
+            + ("Acknowledged in the group, but still no /out.\n"
+               if request.get('seen') else "Nobody has sent a /out for it yet.\n")
+            + f"Tagged in the group: {CASHOUT_MENTIONS}")
 
 
 def cashout_crew_dm_text(request, waited_minutes):
@@ -1130,7 +1160,7 @@ async def cashout_watchdog():
                 if quiet < CASHOUT_TIMEOUT_MINUTES:
                     continue
 
-                if request['nudges'] >= CASHOUT_MAX_NUDGES:
+                if CASHOUT_MAX_NUDGES and request['nudges'] >= CASHOUT_MAX_NUDGES:
                     request['exhausted'] = True
                     total = (now - request['opened']).total_seconds() / 60.0
                     print(f"🔕 [CASHOUT] giving up reminders in "
@@ -1149,8 +1179,10 @@ async def cashout_watchdog():
                 waited = (now - request['opened']).total_seconds() / 60.0
 
                 try:
-                    await bot.send_message(handling, cashout_nudge_text(waited),
-                                           reply_to_message_id=request['message_id'])
+                    await bot.send_message(
+                        handling,
+                        cashout_nudge_text(waited, request.get('seen', False)),
+                        reply_to_message_id=request['message_id'])
                     print(f"⏰ [CASHOUT] reminder #{request['nudges']} in "
                           f"{chat_name(handling)} after {_humanise(waited)}", flush=True)
                 except Exception as e:
@@ -1533,6 +1565,25 @@ async def cashout_from_bot_api(message):
                           getattr(message.from_user, 'id', None),
                           getattr(message.from_user, 'username', None),
                           getattr(reply, 'message_id', None))
+
+
+@bot.message_reaction_handler(func=lambda r: True)
+async def on_request_reaction(reaction):
+    """A reaction on a forwarded cashout request buys another timeout.
+
+    Telegram only delivers these to a bot that is an ADMINISTRATOR in the chat,
+    which is why run_bot() has to ask for message_reaction explicitly and why
+    the bot needs admin rights in the handling groups. A reaction being removed
+    is not an answer, and an anonymous admin cannot be attributed to anyone, so
+    both are ignored."""
+    if not getattr(reaction, 'new_reaction', None):
+        return
+    user = getattr(reaction, 'user', None)
+    if user is None:
+        return
+    remember_user(user)
+    note_cashout_seen(reaction.chat.id, reaction.message_id,
+                      getattr(user, 'id', None), getattr(user, 'username', None))
 
 
 @bot.message_handler(content_types=['text'])
@@ -1988,7 +2039,10 @@ async def run_userbot():
 async def run_bot():
     while True:
         try:
-            await bot.polling(none_stop=True, allowed_updates=['message'])
+            # message_reaction is NOT included by default and has to be asked
+            # for by name, or a crew reaction never reaches on_request_reaction.
+            await bot.polling(none_stop=True,
+                              allowed_updates=['message', 'message_reaction'])
         except Exception as e:
             print(f"Polling Error: {e}", flush=True)
             await asyncio.sleep(5)
