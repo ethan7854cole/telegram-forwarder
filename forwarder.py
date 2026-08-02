@@ -2244,6 +2244,33 @@ async def run_bot():
             await asyncio.sleep(5)
 
 
+def _schedule_disconnect(client):
+    """Start releasing the Telethon session, whatever disconnect() hands back.
+
+    Telethon returns a Future here rather than a coroutine, and
+    `loop.create_task()` accepts ONLY a coroutine - so the old call raised
+    TypeError, took the whole SIGTERM callback down with it, and the session was
+    never released. `ensure_future()` takes either. Some versions return None
+    when already disconnected, which is not an error.
+
+    Everything is caught: this runs on the way out, and nothing it can fail at
+    is worth staying alive for."""
+    if client is None:
+        return None
+    try:
+        pending = client.disconnect()
+    except Exception as e:
+        print(f"⚠️ [SHUTDOWN] disconnect() failed: {e}", flush=True)
+        return None
+    if pending is None:
+        return None                     # already down; nothing to wait on
+    try:
+        return asyncio.ensure_future(pending)
+    except Exception as e:
+        print(f"⚠️ [SHUTDOWN] could not await the disconnect: {e}", flush=True)
+        return None
+
+
 def _install_shutdown_handler(loop):
     """Leave promptly and quietly when Railway says we are going away.
 
@@ -2260,9 +2287,12 @@ def _install_shutdown_handler(loop):
     def _on_term():
         print("🛑 [SHUTDOWN] SIGTERM - releasing the Telethon session before exit.",
               flush=True)
-        if _active_client is not None:
-            loop.create_task(_active_client.disconnect())
-        # Enough for the disconnect to reach Telegram, then go without fuss.
+        _schedule_disconnect(_active_client)
+        # Scheduled LAST, and deliberately outside everything that can raise. If
+        # releasing the session fails we still have to leave: a SIGTERM callback
+        # that dies before reaching this line leaves the container running until
+        # Railway loses patience and SIGKILLs it, which IS the overlap this
+        # handler exists to prevent. That is exactly what happened on 2026-08-03.
         loop.call_later(2, lambda: os._exit(0))
 
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -2270,6 +2300,8 @@ def _install_shutdown_handler(loop):
             loop.add_signal_handler(sig, _on_term)
         except (NotImplementedError, RuntimeError):
             pass        # not supported on this platform; default behaviour applies
+
+    return _on_term         # returned so the shutdown path can be tested
 
 
 async def main():

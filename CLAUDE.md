@@ -17,7 +17,7 @@ python3 tests/run.py            # all suites
 python3 tests/run.py cashout    # only matching suites
 ```
 
-410 checks across 12 suites, all stubbed — nothing touches Telegram, the
+438 checks across 13 suites, all stubbed — nothing touches Telegram, the
 network, or the live groups. They cover the pre-existing behaviour as well as
 the new, so they are the guard against a change quietly altering something that
 already worked.
@@ -135,6 +135,13 @@ deleting either copy still settles it.
   filtering history on the bot's own id can match nothing.
 - Railway wipes the disk on deploy: no state can live on it. The messages in the
   groups are the durable record.
+- **The SIGTERM callback must reach `os._exit` no matter what.** This process is
+  PID 1, so an unhandled SIGTERM is ignored and the container lingers until
+  SIGKILL — which is the deploy overlap. On 2026-08-03 the callback itself
+  raised (`create_task()` on the Future that Telethon's `disconnect()` returns)
+  and never scheduled the exit, so the handler caused the exact failure it was
+  written to prevent. Schedule the exit last and outside anything that can
+  raise. See `_schedule_disconnect()`.
 
 ## Known gaps
 
@@ -147,9 +154,15 @@ deleting either copy still settles it.
   *requests* are guarded (`CASHOUT_DEDUP_SECONDS`); payments are not.
 - **Nothing in-process can stop two containers double-posting.** The duplicate
   guard is per-request state held in memory, so two overlapping Railway
-  containers each see a clean slate and each post once. If duplicates survive
-  the guard, suspect the deploy overlap rather than the code — that is what
-  `TELETHON_START_DELAY` exists for.
+  containers each see a clean slate and each post once. **Confirmed as the real
+  cause** of the 2026-08-03 duplicate: the logs show `[CONFLICT] Another process
+  is polling this token` and two independent `reminder #1` rounds for one
+  request. The broken SIGTERM handler above made the overlap far longer than it
+  should have been; that is fixed, but `TELETHON_START_DELAY` only holds back
+  the *userbot*. The new container starts polling the Bot API immediately, and
+  the cashout flow runs off both paths — so a deploy can still overlap. The
+  structural fix is on Railway's side (stop the old container before starting
+  the new one), not in this file.
 - **A near-miss keyword is silent.** `CASH OUT REQUEST` matches nothing,
   forwards nowhere, and tells nobody — indistinguishable from a quiet day.
 - **The idle watchdog covers only the two CHIME groups**, not the VENMO targets.
@@ -163,6 +176,7 @@ deleting either copy still settles it.
 | `tests/test_regress*.py` | Guard the pre-existing behaviour |
 | `tests/test_parity.py` | Both cashout routes must behave identically |
 | `tests/test_caption.py` | A `/out` captioning a screenshot, through both real dispatchers |
+| `tests/test_shutdown.py` | SIGTERM always reaches the exit, however the disconnect goes |
 | `backfill.py` | Manual one-off backfill, separate from the boot sweep |
 | `telethon_login.py` | Generates a `TELETHON_SESSION`; `--deploy` for Railway |
 
