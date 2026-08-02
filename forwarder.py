@@ -670,8 +670,6 @@ async def dm_crew(text):
     unreachable = []
     for handle in CASHOUT_DM_HANDLES:
         key = handle.lower()
-        if key == _userbot_username:
-            continue                       # that is our own account
         sent = False
 
         user_id = _user_ids.get(key)
@@ -688,7 +686,14 @@ async def dm_crew(text):
             try:
                 await _active_client.send_message(handle, text)
                 sent = True
-                print(f"✉️ [CASHOUT] DM sent to @{handle} via user account", flush=True)
+                # Messaging the logged-in account itself is allowed on purpose.
+                # Telegram files it under Saved Messages, which that person does
+                # see - and if the session belongs to someone ON this list, the
+                # alternative is the person most likely to act on it being the
+                # only one who never hears about it.
+                where = ' (Saved Messages)' if key == _userbot_username else ''
+                print(f"✉️ [CASHOUT] DM sent to @{handle} via user account{where}",
+                      flush=True)
             except Exception as e:
                 print(f"⚠️ [CASHOUT] user-account DM to @{handle} failed: {e}", flush=True)
 
