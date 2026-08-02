@@ -655,16 +655,24 @@ CASHOUT_RESPONDERS = {h.strip().lower().lstrip('@') for h in
                                 'Maynuddin23,MHSUPPORTZONE,maynuddin233').split(',')
                       if h.strip()}
 
-# Warned privately once a request goes unanswered. Ethan and Larry first: they
-# are the ones who chase it, and they need to know a cashout is being missed
-# whether or not the crew ever answer. Both of their ids are seeded in
-# _user_ids below, so the warning reaches them from the bot itself rather than
-# from the user account.
-CASHOUT_DM_HANDLES = [h.strip().lstrip('@') for h in
-                      os.getenv('CASHOUT_DM_HANDLES',
-                                'ethannxxxx,larryyxx,'
-                                'Maynuddin23,MHSUPPORTZONE,maynuddin233').split(',')
-                      if h.strip()]
+def _handle_list(raw):
+    return [h.strip().lstrip('@') for h in raw.split(',') if h.strip()]
+
+
+# Two audiences, two different messages.
+#
+# Ethan and Larry are told WHERE a request came from and where it is stuck,
+# because chasing it is their job and that means knowing which groups are
+# involved. Their ids are seeded in _user_ids below, so it reaches them from the
+# bot itself rather than from the user account.
+CASHOUT_ADMIN_HANDLES = _handle_list(
+    os.getenv('CASHOUT_ADMIN_DM_HANDLES', 'ethannxxxx,larryyxx'))
+
+# The crew get the same alert with none of the routing. Which groups a request
+# travelled between is not theirs to see - they need the request itself and
+# what to do about it, nothing more.
+CASHOUT_CREW_HANDLES = _handle_list(
+    os.getenv('CASHOUT_CREW_DM_HANDLES', 'Maynuddin23,MHSUPPORTZONE,maynuddin233'))
 
 CASHOUT_TIMEOUT_MINUTES = int(os.getenv('CASHOUT_TIMEOUT_MINUTES', '5'))
 
@@ -728,14 +736,14 @@ def _is_responder(user_id, username):
     return user_id in LEDGER_ADMINS        # Ethan and Larry always count
 
 
-async def dm_crew(text):
-    """Private warning to each configured handle.
+async def dm_handles(handles, text):
+    """Private warning to each of these handles. Returns those it could not reach.
 
     Bot first, because a message from the bot is the one that fits the rest of
     the system. The user account is the fallback for anyone the bot cannot reach
-    - see USERBOT_SEND. Reports who could not be reached at all."""
+    - see USERBOT_SEND."""
     unreachable = []
-    for handle in CASHOUT_DM_HANDLES:
+    for handle in handles:
         key = handle.lower()
         sent = False
 
@@ -767,13 +775,19 @@ async def dm_crew(text):
         if not sent:
             unreachable.append(handle)
 
-    if unreachable:
-        names = ', '.join('@' + h for h in unreachable)
-        print(f"❌ [CASHOUT] nobody could be DMed at: {names}", flush=True)
-        await notify_admin(
-            f"⚠️ Could not privately warn {names} about an overdue cashout.\n\n"
-            "Ask them to open the bot and press Start, which lets the bot DM "
-            "them directly. Until then only the group mention reaches them.")
+    return unreachable
+
+
+async def warn_unreachable(unreachable):
+    """One alert covering everyone who heard nothing, however many rounds it took."""
+    if not unreachable:
+        return
+    names = ', '.join('@' + h for h in unreachable)
+    print(f"❌ [CASHOUT] nobody could be DMed at: {names}", flush=True)
+    await notify_admin(
+        f"⚠️ Could not privately warn {names} about an overdue cashout.\n\n"
+        "Ask them to open the bot and press Start, which lets the bot DM "
+        "them directly. Until then only the group mention reaches them.")
 
 
 # Telegram's various ways of saying "that message is not there any more".
@@ -1066,14 +1080,29 @@ def cashout_nudge_text(waited_minutes):
             f"{CASHOUT_MENTIONS}")
 
 
-def cashout_dm_text(request, handling, waited_minutes):
-    preview = ' '.join((request['text'] or '').split())[:200]
+def _cashout_preview(request):
+    return ' '.join((request['text'] or '').split())[:200]
+
+
+def cashout_admin_dm_text(request, handling, waited_minutes):
+    """For Ethan and Larry: the full picture, routing included."""
     return (f"⏰ OUT REQUEST HAS CROSSED {_humanise(waited_minutes)} TIMEFRAME\n\n"
             f"From: {chat_name(request['origin'])}\n"
             f"Waiting in: {chat_name(handling)}\n\n"
-            f"{preview}\n\n"
+            f"{_cashout_preview(request)}\n\n"
             "Nobody has sent a /out for it yet.\n"
             f"Tagged in the group: {CASHOUT_MENTIONS}")
+
+
+def cashout_crew_dm_text(request, waited_minutes):
+    """For the crew: the request and what to do about it.
+
+    No group names and no 'waiting in' line - which groups a request moved
+    between is not something they need, and the handling group is where they are
+    already being tagged anyway."""
+    return (f"⏰ OUT REQUEST HAS CROSSED {_humanise(waited_minutes)} TIMEFRAME\n\n"
+            f"{_cashout_preview(request)}\n\n"
+            "This is still waiting on a /out. Please action it.")
 
 
 async def cashout_watchdog():
@@ -1128,7 +1157,13 @@ async def cashout_watchdog():
                     print(f"❌ [CASHOUT] reminder failed in {chat_name(handling)}: {e}",
                           flush=True)
 
-                await dm_crew(cashout_dm_text(request, handling, waited))
+                missed = await dm_handles(
+                    CASHOUT_ADMIN_HANDLES,
+                    cashout_admin_dm_text(request, handling, waited))
+                missed += await dm_handles(
+                    CASHOUT_CREW_HANDLES,
+                    cashout_crew_dm_text(request, waited))
+                await warn_unreachable(missed)
 
 
 async def process_incoming(chat_id, text, origin, from_bot=False, sent_at=None):
