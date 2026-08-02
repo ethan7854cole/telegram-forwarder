@@ -391,6 +391,40 @@ async def main():
           str(reactions))
     check('the GAFFER request is closed', CHIMEREV not in f._pending_cashouts)
 
+    # -- 11. the relayed /out must never book a SECOND time ------------------
+    # The bot posts "/out 120" into the chime group, and that group is a
+    # TARGET_CHAT where /out is a real ledger command. If that copy were ever
+    # acted on, every cashout would come off the books twice.
+    reset()
+    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $120', 917, now, user_id=42)
+    copy_id = f._pending_cashouts[MHLARRY][0]['message_id']
+    await f.cashout_caption(BotApiMsg(MHLARRY, 'photo', caption='/out 120',
+                                      mid=918, reply_to=copy_id))
+    check('the cashout flow books it once', f.ledger_snapshot(PICCASO)[1] == 120.0,
+          str(f.ledger_snapshot(PICCASO)))
+
+    # The relay coming back round through the userbot, which DOES see the
+    # bot's own posts because the chime groups are watched chats.
+    sent.clear()
+    await handler(TeleEvent(PICCASO, '/out 120', 919,
+                            sender=User(BOTID, 'larrysbot', is_bot=True)))
+    check('the bot\'s own relayed /out is ignored, not re-booked',
+          f.ledger_snapshot(PICCASO)[1] == 120.0 and sent == [],
+          str((f.ledger_snapshot(PICCASO), sent)))
+
+    # ...and the totals message the booking itself posted, likewise.
+    await handler(TeleEvent(PICCASO, '📤 Out = -120.00$\n\n📊 Group Total:\n'
+                            '➕ Total In : 0.00$\n➖ Total Out: 120.00$', 920,
+                            sender=User(BOTID, 'larrysbot', is_bot=True)))
+    check('the booking confirmation is not re-read as a payment',
+          f.ledger_snapshot(PICCASO) == (0.0, 120.0) and sent == [],
+          str((f.ledger_snapshot(PICCASO), sent)))
+
+    # A human typing the same /out on top of it is a DIFFERENT matter - that
+    # is the manual double-count the docs warn about, and it is allowed.
+    check('a chime group is a target chat, so /out there is a real command',
+          PICCASO in f.TARGET_CHATS)
+
     task.cancel()
 
     print()
