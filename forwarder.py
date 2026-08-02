@@ -611,11 +611,15 @@ CASHOUT_RESPONDERS = {h.strip().lower().lstrip('@') for h in
                                 'Maynuddin23,MHSUPPORTZONE,maynuddin233').split(',')
                       if h.strip()}
 
-# Warned privately once a request goes unanswered. Larry leads, he is the one
-# who chases it.
+# Warned privately once a request goes unanswered. Ethan and Larry first: they
+# are the ones who chase it, and they need to know a cashout is being missed
+# whether or not the crew ever answer. Both of their ids are seeded in
+# _user_ids below, so the warning reaches them from the bot itself rather than
+# from the user account.
 CASHOUT_DM_HANDLES = [h.strip().lstrip('@') for h in
                       os.getenv('CASHOUT_DM_HANDLES',
-                                'larryyxx,Maynuddin23,MHSUPPORTZONE,maynuddin233').split(',')
+                                'ethannxxxx,larryyxx,'
+                                'Maynuddin23,MHSUPPORTZONE,maynuddin233').split(',')
                       if h.strip()]
 
 CASHOUT_TIMEOUT_MINUTES = int(os.getenv('CASHOUT_TIMEOUT_MINUTES', '5'))
@@ -933,7 +937,8 @@ def cashout_dm_text(request, handling, waited_minutes):
             f"From: {chat_name(request['origin'])}\n"
             f"Waiting in: {chat_name(handling)}\n\n"
             f"{preview}\n\n"
-            "Nobody has sent a /out for it yet. Please action it.")
+            "Nobody has sent a /out for it yet.\n"
+            f"Tagged in the group: {CASHOUT_MENTIONS}")
 
 
 async def cashout_watchdog():
@@ -1114,7 +1119,8 @@ async def help_command(message):
         f"A \"{CASHOUT_KEYWORD}\" in CHIME PICCASO or CHIME GAFFER is\n"
         "posted to its group with the crew tagged.\n"
         f"No answer in {_humanise(CASHOUT_TIMEOUT_MINUTES)} — tagged again, and\n"
-        "everyone gets a private warning.\n"
+        "Ethan, Larry and the crew each get a private\n"
+        "warning from the bot.\n"
         "Their /out reply goes back to the chime group, its\n"
         "amount is added to that group's Total Out, and the\n"
         "original request there gets a ❤.\n"
