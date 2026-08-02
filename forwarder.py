@@ -878,6 +878,7 @@ async def open_cashout_request(source, text, sent_at, origin_msg_id):
         'last_seen': now,                  # reset by a reply OR a reaction
         'seen': False,                     # somebody has acknowledged it
         'progress_told': False,            # Larry has been told it was picked up
+        'no_response_told': False,         # ...and told when nobody responded at all
         'nudges': 0,
         'exhausted': False,
     }
@@ -950,6 +951,19 @@ def cashout_submitted_text(request, handling):
             f"From: {chat_name(request['origin'])}\n"
             f"Sent to: {chat_name(handling)}, crew tagged.\n\n"
             "Waiting on a reaction, then the /out.")
+
+
+def cashout_no_response_text(request, handling):
+    """The gap in the chain: submitted, then nothing at all.
+
+    Distinct from the escalation DM, which is the recurring chase. This is the
+    one-off "this needs your attention" that tells Larry the crew have neither
+    reacted nor actioned it."""
+    return ("⚠️ Check updates in cashout as they haven't responded for cashout.\n\n"
+            f"{_cashout_preview(request)}\n\n"
+            f"From: {chat_name(request['origin'])}\n"
+            f"Waiting in: {chat_name(handling)}\n\n"
+            f"No reaction and no /out after {_humanise(CASHOUT_TIMEOUT_MINUTES)}.")
 
 
 def cashout_picked_up_text(request, who):
@@ -1261,6 +1275,15 @@ async def cashout_watchdog():
                 missed += await dm_handles(
                     CASHOUT_CREW_HANDLES,
                     cashout_crew_dm_text(request, waited))
+
+                # Nobody has even reacted. Told once, so it reads as "this one
+                # needs you" rather than joining the recurring chase.
+                if not request['seen'] and not request['no_response_told']:
+                    request['no_response_told'] = True
+                    missed += await dm_handles(
+                        CASHOUT_PROGRESS_HANDLES,
+                        cashout_no_response_text(request, handling))
+
                 await warn_unreachable(missed)
 
 
