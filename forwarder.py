@@ -866,7 +866,7 @@ async def open_cashout_request(source, text, sent_at, origin_msg_id):
         return
 
     now = datetime.now(timezone.utc)
-    _pending_cashouts.setdefault(handling, []).append({
+    request = {
         'origin': source,
         # Resolved once, at open time, so re-pointing a route in Railway cannot
         # strand a request that is already in flight.
@@ -880,10 +880,16 @@ async def open_cashout_request(source, text, sent_at, origin_msg_id):
         'progress_told': False,            # Larry has been told it was picked up
         'nudges': 0,
         'exhausted': False,
-    })
+    }
+    _pending_cashouts.setdefault(handling, []).append(request)
     print(f"📤 [CASHOUT] {chat_name(source)} -> {chat_name(handling)} "
           f"(msg {sent.message_id}), waiting {CASHOUT_TIMEOUT_MINUTES}m for /out",
           flush=True)
+
+    # Larry follows a cashout from here: submitted, picked up, completed.
+    missed = await dm_handles(CASHOUT_PROGRESS_HANDLES,
+                              cashout_submitted_text(request, handling))
+    await warn_unreachable(missed)
 
 
 async def book_cashout_out(origin, text):
@@ -927,22 +933,39 @@ async def book_cashout_out(origin, text):
     return amount
 
 
-def cashout_picked_up_text(request, handling, who):
-    return (f"👀 CASHOUT REQUEST PICKED UP\n\n"
+def describe_user(username, full_name):
+    """Both the @handle and the display name, whichever of them Telegram gave us."""
+    if username and full_name:
+        return f"@{username} ({full_name})"
+    if username:
+        return f"@{username}"
+    if full_name:
+        return full_name
+    return "someone tagged on the request"
+
+
+def cashout_submitted_text(request, handling):
+    return (f"📨 CASHOUT REQUEST HAS BEEN SUBMITTED\n\n"
             f"{_cashout_preview(request)}\n\n"
-            f"{who} reacted to it in {chat_name(handling)}, so it is in process.\n"
+            f"From: {chat_name(request['origin'])}\n"
+            f"Sent to: {chat_name(handling)}, crew tagged.\n\n"
+            "Waiting on a reaction, then the /out.")
+
+
+def cashout_picked_up_text(request, who):
+    return (f"👀 The cashout process is being handled by {who}.\n\n"
+            f"{_cashout_preview(request)}\n\n"
             "Waiting on the /out now.")
 
 
 def cashout_completed_text(request, out_to, amount):
-    booked = f"\n{amount:,.2f}$ added to Total Out.\n" if amount else "\n"
-    return (f"✅ OUT COMPLETED\n\n"
-            f"{_cashout_preview(request)}\n"
-            f"{booked}\n"
-            f"Please send the required screenshot to the group: {chat_name(out_to)}")
+    figure = f" OF {amount:,.2f}$" if amount else ""
+    return (f"✅ CASHOUT{figure} TO {chat_name(out_to)} COMPLETED SUCCESSFULLY\n\n"
+            f"{_cashout_preview(request)}\n\n"
+            f"Please send the required screenshot to {chat_name(out_to)}.")
 
 
-async def note_cashout_seen(chat_id, message_id, user_id, username):
+async def note_cashout_seen(chat_id, message_id, user_id, username, full_name=None):
     """A tagged responder reacted to the forwarded request.
 
     A reaction is an acknowledgement, so it carries exactly the standing a reply
@@ -968,10 +991,9 @@ async def note_cashout_seen(chat_id, message_id, user_id, username):
 
         if not request['progress_told']:
             request['progress_told'] = True     # once per request, not per reaction
-            who = f"@{username}" if username else "Someone tagged on it"
             missed = await dm_handles(
                 CASHOUT_PROGRESS_HANDLES,
-                cashout_picked_up_text(request, handling, who))
+                cashout_picked_up_text(request, describe_user(username, full_name)))
             await warn_unreachable(missed)
         return True
     return False
@@ -1037,15 +1059,18 @@ async def handle_cashout_reply(handling, text, user_id, username, reply_to):
     print(f"✅ [CASHOUT] /out sent to {chat_name(out_to)} after "
           f"{_humanise(waited)} ({request['nudges']} reminder(s))", flush=True)
 
-    # Larry sends the screenshot, so he is told the moment there is one to send,
-    # and told which group it goes to.
-    missed = await dm_handles(CASHOUT_PROGRESS_HANDLES,
-                              cashout_completed_text(request, out_to, booked))
-    await warn_unreachable(missed)
     # The ❤ goes on the original request in the chime group, not on the copy in
     # the handling group: it is the group that asked which needs to see, at a
     # glance, which of its requests have been dealt with.
     await heart_request(request['origin'], request['origin_msg_id'])
+
+    # Last, once the request is marked done in the chime group: Larry is told it
+    # completed and which group the screenshot goes to. Sent even if the ❤ could
+    # not be applied - the money has moved either way, and he still has to send
+    # the proof.
+    missed = await dm_handles(CASHOUT_PROGRESS_HANDLES,
+                              cashout_completed_text(request, out_to, booked))
+    await warn_unreachable(missed)
 
 
 async def observe_cashout(chat_id, text, message_id, sent_at,
@@ -1623,8 +1648,11 @@ async def on_request_reaction(reaction):
     if user is None:
         return
     remember_user(user)
+    full_name = ' '.join(part for part in (getattr(user, 'first_name', None),
+                                           getattr(user, 'last_name', None)) if part)
     await note_cashout_seen(reaction.chat.id, reaction.message_id,
-                            getattr(user, 'id', None), getattr(user, 'username', None))
+                            getattr(user, 'id', None), getattr(user, 'username', None),
+                            full_name or None)
 
 
 @bot.message_handler(content_types=['text'])
