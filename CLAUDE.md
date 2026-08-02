@@ -17,7 +17,7 @@ python3 tests/run.py            # all suites
 python3 tests/run.py cashout    # only matching suites
 ```
 
-342 checks across 11 suites, all stubbed — nothing touches Telegram, the
+406 checks across 12 suites, all stubbed — nothing touches Telegram, the
 network, or the live groups. They cover the pre-existing behaviour as well as
 the new, so they are the guard against a change quietly altering something that
 already worked.
@@ -59,6 +59,16 @@ the bot cannot deliver, because a bot cannot open a chat with someone who has
 never pressed Start and cannot address an `@username` at all. `USERBOT_SEND=0`
 disables that.
 
+Both paths take **plain text only**, with one exception. The crew answer a
+request with the Cash App screenshot proving they sent the money and write the
+`/out` as its caption, so `is_caption_out()` lets a caption through — but only
+when it carries a `/out`, and only as far as the cashout flow. The caption is
+relayed verbatim to the chime group that asked and books that group's Total
+Out, exactly as a typed `/out` does; the screenshot itself is not forwarded.
+`process_incoming()` is never reached from a caption, or a screenshot could be
+read as a payment notification and invent a deposit. A captioned
+`CASHOUT REQUEST` still opens nothing.
+
 ## Invariants — do not break these without being asked
 
 - **A `/out` is acted on only while a request the bot forwarded is still open in
@@ -80,6 +90,36 @@ disables that.
   Ethan and Larry only.
 - **Never act on the bot's own messages.** The handling groups are also payment
   sources, so without that guard a forward would loop.
+- **A private DM is a one-off, never a recurring chase.** `crew_told` and
+  `admin_told` gate each to once per request. The repeating part is the group
+  post, and only while nobody has acknowledged it.
+
+## The escalation ladder
+
+The group post is the loud, repeating part; a DM is the quiet, one-off part.
+Which ladder a request climbs depends on whether anyone has acknowledged it —
+a reaction from the crew, or any of them speaking in the handling group.
+
+**Nobody acknowledges it** — `nudge_unacknowledged()`:
+
+| Time | What happens |
+|---|---|
+| 5 min | group reminder #1, **plus** one DM to Ethan + Larry and one to the crew |
+| 10 min | group reminder #2 |
+| 15 min | group reminder #3, then reminders **stop** |
+
+**Somebody reacts** — `escalate_acknowledged()`. The reaction resets the clock
+and widens the window to `CASHOUT_SEEN_MINUTES` (7). Nothing further is posted
+in the group: they have acknowledged it there, so re-tagging them is noise.
+
+| Time | What happens |
+|---|---|
+| +7 min | one DM to the crew |
+| +14 min | one DM to Ethan + Larry, then chasing **stops** |
+
+A `/out` at any point completes it. Stopping is not giving up — the request
+stays **open**, so a late `/out` is still forwarded, booked and hearted, and
+deleting either copy still settles it.
 
 ## Gotchas
 
@@ -103,7 +143,13 @@ disables that.
   pending. Fixable with a boot sweep: re-open any `CASHOUT REQUEST` not yet
   carrying a ❤, which already works as a durable "done" marker.
 - **A duplicate payment is not detected.** When the catch-up sweep re-sent a
-  window in Aug 2026, it re-booked every amount and nothing noticed.
+  window in Aug 2026, it re-booked every amount and nothing noticed. Cashout
+  *requests* are guarded (`CASHOUT_DEDUP_SECONDS`); payments are not.
+- **Nothing in-process can stop two containers double-posting.** The duplicate
+  guard is per-request state held in memory, so two overlapping Railway
+  containers each see a clean slate and each post once. If duplicates survive
+  the guard, suspect the deploy overlap rather than the code — that is what
+  `TELETHON_START_DELAY` exists for.
 - **A near-miss keyword is silent.** `CASH OUT REQUEST` matches nothing,
   forwards nowhere, and tells nobody — indistinguishable from a quiet day.
 - **The idle watchdog covers only the two CHIME groups**, not the VENMO targets.
@@ -116,6 +162,7 @@ disables that.
 | `tests/run.py` | Test runner; exits non-zero on any failure |
 | `tests/test_regress*.py` | Guard the pre-existing behaviour |
 | `tests/test_parity.py` | Both cashout routes must behave identically |
+| `tests/test_caption.py` | A `/out` captioning a screenshot, through both real dispatchers |
 | `backfill.py` | Manual one-off backfill, separate from the boot sweep |
 | `telethon_login.py` | Generates a `TELETHON_SESSION`; `--deploy` for Railway |
 

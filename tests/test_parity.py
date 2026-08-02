@@ -75,8 +75,15 @@ async def full_flow(origin, base):
     r['nudge_is_reply'] = all('OUT REQUEST HAS CROSSED' in t for c, t in sent if c == handling)
     r['no_ethan'] = not any('ETHAN' in t for c, t in sent if c == handling)
     r['escalation_dm'] = len([1 for _, t in dms if 'OUT REQUEST HAS CROSSED' in t])
-    r['check_updates'] = len([1 for uid, t in dms
-                              if uid == LARRY and 'Check updates in cashout' in t])
+    # Larry hears about it on the FIRST round, once, with the routing.
+    r['larry_told'] = len([1 for uid, t in dms
+                           if uid == LARRY and 'OUT REQUEST HAS CROSSED' in t])
+    # ...and it never repeats on the rounds after it.
+    dms.clear()
+    for _ in range(3):
+        req['last_seen'] = datetime.now(timezone.utc) - timedelta(minutes=6)
+        await run_watchdog()
+    r['no_repeat_dm'] = len(dms)
 
     # 3. a crew reaction
     dms.clear()
@@ -117,7 +124,9 @@ async def main():
         check(f'{name}: reminder carries the headline', r['nudge_is_reply'])
         check(f'{name}: no ETHAN footprint in the handling group', r['no_ethan'])
         check(f'{name}: escalation DMs sent', r['escalation_dm'] >= 1)
-        check(f'{name}: Larry told nobody responded', r['check_updates'] == 1)
+        check(f'{name}: Larry told once on the first round', r['larry_told'] == 1)
+        check(f'{name}: no DM is repeated on later rounds', r['no_repeat_dm'] == 0,
+              str(r['no_repeat_dm']))
         check(f'{name}: a reaction marks it seen', r['seen'] is True)
         check(f'{name}: Larry told who picked it up', r['picked_up_dm'] == 1)
         check(f'{name}: /out returned to its own chime group', r['out_home'] == 1)

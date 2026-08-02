@@ -112,6 +112,53 @@ async def main():
     await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $99', 913, now, user_id=42)
     check('same message seen twice forwards once', len(sent) == 1)
 
+    # -- 7b. the SAME request arriving as two DIFFERENT messages -------------
+    # Message-id dedup cannot see this one: a double send, or two copies
+    # carrying different ids, used to land as two identical posts in the
+    # handling group, two sets of reminders and two things to answer for one
+    # cashout.
+    reset()
+    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $120 $Hawkins-Floral-Decor',
+                            930, now, user_id=42)
+    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $120 $Hawkins-Floral-Decor',
+                            931, now, user_id=42)
+    check('an identical request under a different id is posted once',
+          len(sent) == 1, str(sent))
+    check('and only one request is left open',
+          len(f._pending_cashouts.get(MHLARRY, [])) == 1,
+          str(f._pending_cashouts.get(MHLARRY, [])))
+
+    await f.observe_cashout(PICCASO, 'cashout request  $120   $Hawkins-Floral-Decor',
+                            932, now, user_id=42)
+    check('reformatting the same request does not slip past it',
+          len(sent) == 1, str(sent))
+
+    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $75 for someone else',
+                            933, now, user_id=42)
+    check('a genuinely different request is still posted', len(sent) == 2, str(sent))
+
+    # -- 7c. past the window it is taken at face value -----------------------
+    # Asking for the same amount to the same cashtag again later is ordinary,
+    # so the guard is a burst filter, not a permanent block.
+    reset()
+    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $120', 934, now, user_id=42)
+    f._pending_cashouts[MHLARRY][0]['opened'] -= timedelta(
+        seconds=f.CASHOUT_DEDUP_SECONDS + 1)
+    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $120', 935, now, user_id=42)
+    check('the same request asked for again later is a real second one',
+          len(sent) == 2, str(sent))
+
+    # -- 7d. and once the first is actioned, an identical one is welcome -----
+    reset()
+    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $120', 936, now, user_id=42)
+    await f.observe_cashout(MHLARRY, '/out 120', 937, now,
+                            user_id=77, username='Maynuddin23')
+    check('the first is closed by its /out', MHLARRY not in f._pending_cashouts)
+    sent.clear()
+    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $120', 938, now, user_id=42)
+    check('an identical request after the first is settled still posts',
+          len(sent) == 1, str(sent))
+
     # -- 8. alternate -100 id spelling still matches -------------------------
     reset()
     await f.observe_cashout(-1002335630148, '/out 5', 914, now, user_id=77, username='Maynuddin23')
@@ -175,8 +222,11 @@ async def main():
           not any(n in t for t in crew_dms
                   for n in ('CHIME PICCASO', 'MH X LARRY', 'CHIME GAFFER', 'Chime Rev')),
           str(crew_dms))
-    check('reminders are uncapped by default', f.CASHOUT_MAX_NUDGES == 0,
-          str(f.CASHOUT_MAX_NUDGES))
+    check('group reminders stop after three rounds (5/10/15 min)',
+          f.CASHOUT_MAX_NUDGES == 3, str(f.CASHOUT_MAX_NUDGES))
+    check('an acknowledged request gets a longer window than a silent one',
+          f.CASHOUT_SEEN_MINUTES == 7 and f.CASHOUT_TIMEOUT_MINUTES == 5,
+          str((f.CASHOUT_SEEN_MINUTES, f.CASHOUT_TIMEOUT_MINUTES)))
     check('at least one reminder went out', req['nudges'] >= 1, str(req['nudges']))
     check('request stays open while unanswered', MHLARRY in f._pending_cashouts)
     check('the reminder is not signed -ETHAN',
