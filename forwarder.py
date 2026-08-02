@@ -584,13 +584,46 @@ async def idle_watchdog():
 
 CASHOUT_KEYWORD = os.getenv('CASHOUT_KEYWORD', 'CASHOUT REQUEST')
 
-CASHOUT_ROUTES = {
-    -5350880041: -1003894781195,        # CHIME PICCASO -> MH X LARRY GROUP 2
-    -5580596463: -1002335630148,        # CHIME GAFFER  -> Chime Rev & out no-7
-}
+def _parse_cashout_routes(raw):
+    """asked_in:handled_in[:out_goes_to], comma separated.
+
+    The third field is optional and defaults to the group that asked, which is
+    the ordinary case: a cashout is requested in a chime group and the /out
+    answering it comes back to that same group. Give it explicitly to send the
+    /out somewhere else.
+
+    Config rather than code so a group can be changed from Railway without a
+    redeploy. A malformed entry is dropped with a warning rather than taking
+    the whole bot down - one bad route must not stop the others working."""
+    routes = {}
+    for item in raw.split(','):
+        item = item.strip()
+        if not item:
+            continue
+        parts = [p.strip() for p in item.split(':')]
+        if len(parts) not in (2, 3):
+            print(f"⚠️ [CASHOUT] ignoring route {item!r} - expected "
+                  "asked_in:handled_in or asked_in:handled_in:out_goes_to", flush=True)
+            continue
+        try:
+            source, handling = int(parts[0]), int(parts[1])
+            out_to = int(parts[2]) if len(parts) == 3 else source
+        except ValueError:
+            print(f"⚠️ [CASHOUT] ignoring route {item!r} - chat ids must be numbers",
+                  flush=True)
+            continue
+        routes[source] = {'handling': handling, 'out_to': out_to}
+    return routes
+
+
+CASHOUT_ROUTES = _parse_cashout_routes(os.getenv(
+    'CASHOUT_ROUTES',
+    '-5350880041:-1003894781195,'        # CHIME PICCASO -> MH X LARRY GROUP 2
+    '-5580596463:-1002335630148'))       # CHIME GAFFER  -> Chime Rev & out no-7
 
 # Reverse lookup, for recognising a message posted in a handling group.
-_CASHOUT_HANDLERS = {handling: source for source, handling in CASHOUT_ROUTES.items()}
+_CASHOUT_HANDLERS = {route['handling']: source
+                     for source, route in CASHOUT_ROUTES.items()}
 
 CHAT_NAMES = {
     -5350880041: 'CHIME PICCASO',
@@ -598,6 +631,17 @@ CHAT_NAMES = {
     -1003894781195: 'MH X LARRY GROUP 2',
     -1002335630148: 'Chime Rev & out no-7',
 }
+
+# Labels for any group added later, so the logs and the admin alerts stay
+# readable instead of falling back to raw ids. CHAT_NAMES=-100123=SOME GROUP,...
+for _item in os.getenv('CHAT_NAMES', '').split(','):
+    if '=' in _item:
+        _cid, _, _label = _item.partition('=')
+        try:
+            CHAT_NAMES[int(_cid.strip())] = _label.strip()
+        except ValueError:
+            print(f"⚠️ [CASHOUT] ignoring chat name {_item!r} - id must be a number",
+                  flush=True)
 
 # Tagged on the forwarded request and again on every reminder.
 CASHOUT_MENTIONS = os.getenv('CASHOUT_MENTIONS',
@@ -784,7 +828,8 @@ async def open_cashout_request(source, text, sent_at, origin_msg_id):
     `origin_msg_id` is the request as it sits in the chime group. That is the
     message that gets the ❤ once the cashout is actioned, so the group that
     asked can see at a glance which of its requests have been dealt with."""
-    handling = CASHOUT_ROUTES[source]
+    route = CASHOUT_ROUTES[source]
+    handling = route['handling']
     body = f"{correct_timestamp(text, sent_at)}\n\n{CASHOUT_MENTIONS}"
     try:
         sent = await bot.send_message(handling, body)
@@ -801,6 +846,9 @@ async def open_cashout_request(source, text, sent_at, origin_msg_id):
     now = datetime.now(timezone.utc)
     _pending_cashouts.setdefault(handling, []).append({
         'origin': source,
+        # Resolved once, at open time, so re-pointing a route in Railway cannot
+        # strand a request that is already in flight.
+        'out_to': route['out_to'],
         'text': text,
         'origin_msg_id': origin_msg_id,    # in the chime group - gets the ❤
         'message_id': sent.message_id,     # in the handling group - reminders reply to it
@@ -888,13 +936,14 @@ async def handle_cashout_reply(handling, text, user_id, username, reply_to):
         return
 
     request = _match_request(queue, reply_to)
-    origin = request['origin']
+    # Normally the group that asked, but a route may send the /out elsewhere.
+    out_to = request.get('out_to', request['origin'])
     try:
-        await bot.send_message(origin, text)
+        await bot.send_message(out_to, text)
     except Exception as e:
-        # Left open deliberately: the request is not settled until the chime
-        # group has actually seen the /out.
-        print(f"❌ [CASHOUT] /out could not be sent back to {chat_name(origin)}: {e}",
+        # Left open deliberately: the request is not settled until the /out has
+        # actually landed somewhere anyone can see it.
+        print(f"❌ [CASHOUT] /out could not be sent to {chat_name(out_to)}: {e}",
               flush=True)
         return
 
@@ -902,15 +951,19 @@ async def handle_cashout_reply(handling, text, user_id, username, reply_to):
     if not queue:
         _pending_cashouts.pop(handling, None)
 
-    await book_cashout_out(origin, text)
+    # Booked where the /out was posted, never anywhere else. recover_ledgers()
+    # rebuilds a group's books from the totals in that group's own messages, so
+    # moving one group's ledger while posting the figures into another would
+    # corrupt both.
+    await book_cashout_out(out_to, text)
 
     waited = (datetime.now(timezone.utc) - request['opened']).total_seconds() / 60.0
-    print(f"✅ [CASHOUT] /out returned to {chat_name(origin)} after "
+    print(f"✅ [CASHOUT] /out sent to {chat_name(out_to)} after "
           f"{_humanise(waited)} ({request['nudges']} reminder(s))", flush=True)
     # The ❤ goes on the original request in the chime group, not on the copy in
     # the handling group: it is the group that asked which needs to see, at a
     # glance, which of its requests have been dealt with.
-    await heart_request(origin, request['origin_msg_id'])
+    await heart_request(request['origin'], request['origin_msg_id'])
 
 
 async def observe_cashout(chat_id, text, message_id, sent_at,
@@ -1025,6 +1078,11 @@ async def cashout_watchdog():
         print("ℹ️ [CASHOUT] escalation disabled (CASHOUT_TIMEOUT_MINUTES=0)", flush=True)
         return
 
+    for source, route in CASHOUT_ROUTES.items():
+        line = f"📤 [CASHOUT] {chat_name(source)} -> {chat_name(route['handling'])}"
+        if route['out_to'] != source:
+            line += f", /out to {chat_name(route['out_to'])}"
+        print(line, flush=True)
     print(f"📤 [CASHOUT] {len(CASHOUT_ROUTES)} route(s), chasing after "
           f"{_humanise(CASHOUT_TIMEOUT_MINUTES)} of silence", flush=True)
 
@@ -1472,9 +1530,10 @@ def _configured_source_chats():
     # requests start there, and the handling groups because the /out answering
     # one is a human message the Bot API may never deliver.
     chats = list(FORWARD_RULES.keys())
-    for chat_id in list(CASHOUT_ROUTES) + list(CASHOUT_ROUTES.values()):
-        if chat_id not in chats:
-            chats.append(chat_id)
+    for source, route in CASHOUT_ROUTES.items():
+        for chat_id in (source, route['handling']):
+            if chat_id not in chats:
+                chats.append(chat_id)
     return chats
 
 
