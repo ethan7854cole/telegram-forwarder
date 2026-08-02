@@ -6,12 +6,14 @@ from collections import Counter, OrderedDict
 from datetime import datetime, timedelta, timezone
 
 from telebot.async_telebot import AsyncTeleBot
+from telebot.types import ReactionTypeEmoji
 
 from telethon import TelegramClient, events, utils
 from telethon.errors import (AuthKeyDuplicatedError, AuthKeyUnregisteredError,
                              SessionRevokedError, UserDeactivatedBanError)
 from telethon.sessions import StringSession
-from telethon.tl.types import MessageMediaWebPage
+from telethon.tl.functions.messages import SendReactionRequest
+from telethon.tl.types import MessageMediaWebPage, ReactionEmoji
 
 # ---------------------------------------------------------------------------
 # Existing configuration (unchanged)
@@ -67,6 +69,16 @@ SOURCE_BOTS = os.getenv('SOURCE_BOTS', '')
 TELETHON_SOURCE_CHATS = os.getenv('TELETHON_SOURCE_CHATS', '')
 
 TELETHON_ENABLED = bool(API_ID and API_HASH)
+
+# The one exception to "reading only" above, and it is a narrow one: the cashout
+# escalation has to reach people PRIVATELY, and a bot cannot do that. A bot may
+# only message someone who has already pressed Start on it, and it can never
+# address a person by @username at all - only by numeric id. The user account
+# has neither limit. So when the bot cannot deliver an escalation DM, the user
+# account sends it instead (and reacts, where a channel denies the bot).
+# Set USERBOT_SEND=0 to keep the account strictly read-only, accepting that only
+# people who have started the bot will get the private warning.
+USERBOT_SEND = os.getenv('USERBOT_SEND', '1') != '0'
 
 # Railway overlaps deploys: the replacement container boots while the outgoing
 # one is still alive. For the Bot API that is a harmless getUpdates 409, but for
@@ -531,6 +543,418 @@ async def idle_watchdog():
                 print(f"❌ [IDLE] prompt failed for {target}: {e}", flush=True)
 
 
+# ---------------------------------------------------------------------------
+# Cashout requests
+#
+# Payments travel outward, source -> target. Cashout requests travel the other
+# way: the chime groups ask for money to go OUT, and that request has to be seen
+# and actioned by the crew on the other side.
+#
+#   CHIME PICCASO --"CASHOUT REQUEST"--> MH X LARRY GROUP 2
+#   CHIME GAFFER  --"CASHOUT REQUEST"--> Chime Rev & out no-7
+#
+# The request is posted with the crew tagged. If nobody answers it inside the
+# timeout it is re-tagged in the group AND each of them is warned privately.
+# When somebody finally replies with /out, that reply is sent back to the chime
+# group the request came from and the forwarded request is hearted.
+#
+# This is a SEPARATE table from FORWARD_RULES on purpose. Putting these pairs in
+# there would drag the chime groups into TARGET_CHATS and make the ledger, the
+# milestones and the idle watchdog all fire on the wrong side of the flow.
+# ---------------------------------------------------------------------------
+
+CASHOUT_KEYWORD = os.getenv('CASHOUT_KEYWORD', 'CASHOUT REQUEST')
+
+CASHOUT_ROUTES = {
+    -5350880041: -1003894781195,        # CHIME PICCASO -> MH X LARRY GROUP 2
+    -5580596463: -1002335630148,        # CHIME GAFFER  -> Chime Rev & out no-7
+}
+
+# Reverse lookup, for recognising a message posted in a handling group.
+_CASHOUT_HANDLERS = {handling: source for source, handling in CASHOUT_ROUTES.items()}
+
+CHAT_NAMES = {
+    -5350880041: 'CHIME PICCASO',
+    -5580596463: 'CHIME GAFFER',
+    -1003894781195: 'MH X LARRY GROUP 2',
+    -1002335630148: 'Chime Rev & out no-7',
+}
+
+# Tagged on the forwarded request and again on every reminder.
+CASHOUT_MENTIONS = os.getenv('CASHOUT_MENTIONS',
+                             '@Maynuddin23 @MHSUPPORTZONE @maynuddin233')
+
+# Anyone here speaking in the handling group counts as "they responded" and puts
+# the reminder clock back to zero. The request itself stays OPEN until a real
+# /out lands - an acknowledgement is not a cashout.
+CASHOUT_RESPONDERS = {h.strip().lower().lstrip('@') for h in
+                      os.getenv('CASHOUT_RESPONDERS',
+                                'Maynuddin23,MHSUPPORTZONE,maynuddin233').split(',')
+                      if h.strip()}
+
+# Warned privately once a request goes unanswered. Larry leads, he is the one
+# who chases it.
+CASHOUT_DM_HANDLES = [h.strip().lstrip('@') for h in
+                      os.getenv('CASHOUT_DM_HANDLES',
+                                'larryyxx,Maynuddin23,MHSUPPORTZONE,maynuddin233').split(',')
+                      if h.strip()]
+
+CASHOUT_TIMEOUT_MINUTES = int(os.getenv('CASHOUT_TIMEOUT_MINUTES', '5'))
+
+# Stop reminding after this many rounds, so a request that was settled off-chat
+# cannot nag the group forever. The request stays open either way - a late /out
+# is still forwarded and still hearted.
+CASHOUT_MAX_NUDGES = int(os.getenv('CASHOUT_MAX_NUDGES', '6'))
+
+CASHOUT_HEART = os.getenv('CASHOUT_HEART', '❤')
+
+# @username -> numeric id. A bot can only DM an id, so the ones we know are
+# seeded here and the rest are learned the first time that person speaks in a
+# watched chat. @Larryyxx and @ethannxxxx, matching LEDGER_ADMINS.
+_user_ids = {'larryyxx': 7418675217, 'ethannxxxx': ADMIN_ID}
+
+# Set once the userbot knows who it is, so it never DMs its own account.
+_userbot_username = ''
+
+# /out anywhere in the message, as a word. "/out", "/out 500", "ok /out done".
+_OUT_CMD_RE = re.compile(r'(?:^|\s)/out\b', re.I)
+
+# The figure inside that reply, wherever it sits. The ledger's own _CMD_AMOUNT_RE
+# is anchored to the start of the message, which is right for a typed command but
+# would miss "ok /out 500" - and this text was typed by someone else, in another
+# group, with no reason to keep to that shape.
+_OUT_AMOUNT_RE = re.compile(r'/out(?:@\w+)?\s+\$?\s*([\d,]+(?:\.\d+)?)', re.I)
+
+# handling chat id -> [request, ...], oldest first
+_pending_cashouts = {}
+
+
+def chat_name(chat_id):
+    return CHAT_NAMES.get(chat_id, str(chat_id))
+
+
+def _canonical(chat_id, table):
+    """Match a chat id against a config table under either id spelling."""
+    if chat_id in table:
+        return chat_id
+    for variant in _id_variants(chat_id):
+        if variant in table:
+            return variant
+    return None
+
+
+def remember_user(sender):
+    """Learn @username -> id from anyone who speaks in a watched chat.
+
+    This is what makes the escalation DM reachable by the bot: the crew are
+    configured by username, but the Bot API can only send to an id."""
+    username = (getattr(sender, 'username', '') or '').lower()
+    user_id = getattr(sender, 'id', None)
+    if username and user_id and _user_ids.get(username) != user_id:
+        _user_ids[username] = user_id
+        print(f"👤 [CASHOUT] learned @{username} = {user_id}", flush=True)
+
+
+def _is_responder(user_id, username):
+    if (username or '').lower() in CASHOUT_RESPONDERS:
+        return True
+    return user_id in LEDGER_ADMINS        # Ethan and Larry always count
+
+
+async def dm_crew(text):
+    """Private warning to each configured handle.
+
+    Bot first, because a message from the bot is the one that fits the rest of
+    the system. The user account is the fallback for anyone the bot cannot reach
+    - see USERBOT_SEND. Reports who could not be reached at all."""
+    unreachable = []
+    for handle in CASHOUT_DM_HANDLES:
+        key = handle.lower()
+        if key == _userbot_username:
+            continue                       # that is our own account
+        sent = False
+
+        user_id = _user_ids.get(key)
+        if user_id:
+            try:
+                await bot.send_message(user_id, text)
+                sent = True
+                print(f"✉️ [CASHOUT] DM sent to @{handle} via bot", flush=True)
+            except Exception as e:
+                # Almost always "bot can't initiate conversation with a user".
+                print(f"⚠️ [CASHOUT] bot DM to @{handle} failed: {e}", flush=True)
+
+        if not sent and USERBOT_SEND and _active_client is not None:
+            try:
+                await _active_client.send_message(handle, text)
+                sent = True
+                print(f"✉️ [CASHOUT] DM sent to @{handle} via user account", flush=True)
+            except Exception as e:
+                print(f"⚠️ [CASHOUT] user-account DM to @{handle} failed: {e}", flush=True)
+
+        if not sent:
+            unreachable.append(handle)
+
+    if unreachable:
+        names = ', '.join('@' + h for h in unreachable)
+        print(f"❌ [CASHOUT] nobody could be DMed at: {names}", flush=True)
+        await notify_admin(
+            f"⚠️ Could not privately warn {names} about an overdue cashout.\n\n"
+            "Ask them to open the bot and press Start, which lets the bot DM "
+            "them directly. Until then only the group mention reaches them.")
+
+
+async def heart_request(handling, message_id):
+    """❤ the forwarded request, marking it done.
+
+    Falls back to the user account because a broadcast channel refuses
+    reactions from a bot that is not an admin there, and the account already
+    has the rights."""
+    try:
+        await bot.set_message_reaction(handling, message_id,
+                                       [ReactionTypeEmoji(CASHOUT_HEART)])
+        print(f"❤️ [CASHOUT] hearted {message_id} in {chat_name(handling)}", flush=True)
+        return True
+    except Exception as e:
+        print(f"⚠️ [CASHOUT] bot could not react in {chat_name(handling)}: {e}",
+              flush=True)
+
+    if USERBOT_SEND and _active_client is not None:
+        try:
+            entity = await _resolve_one(_active_client, handling)
+            if entity is not None:
+                await _active_client(SendReactionRequest(
+                    peer=entity, msg_id=message_id,
+                    reaction=[ReactionEmoji(emoticon=CASHOUT_HEART)]))
+                print(f"❤️ [CASHOUT] hearted {message_id} in {chat_name(handling)} "
+                      "via user account", flush=True)
+                return True
+        except Exception as e:
+            print(f"❌ [CASHOUT] user-account reaction failed in "
+                  f"{chat_name(handling)}: {e}", flush=True)
+    return False
+
+
+async def open_cashout_request(source, text, sent_at):
+    """Post a cashout request into its handling group and start the clock."""
+    handling = CASHOUT_ROUTES[source]
+    body = f"{correct_timestamp(text, sent_at)}\n\n{CASHOUT_MENTIONS}"
+    try:
+        sent = await bot.send_message(handling, body)
+    except Exception as e:
+        print(f"❌ [CASHOUT] could not post {chat_name(source)} request to "
+              f"{chat_name(handling)}: {e}", flush=True)
+        await notify_admin(
+            f"🚨 A CASHOUT REQUEST from {chat_name(source)} could not be posted to "
+            f"{chat_name(handling)}:\n{e}\n\n"
+            "Nobody has been told about it. Check the bot is still a member there "
+            "and allowed to post.")
+        return
+
+    now = datetime.now(timezone.utc)
+    _pending_cashouts.setdefault(handling, []).append({
+        'origin': source,
+        'text': text,
+        'message_id': sent.message_id,     # what gets hearted
+        'opened': now,
+        'last_seen': now,                  # reset by any reply from the crew
+        'nudges': 0,
+        'exhausted': False,
+    })
+    print(f"📤 [CASHOUT] {chat_name(source)} -> {chat_name(handling)} "
+          f"(msg {sent.message_id}), waiting {CASHOUT_TIMEOUT_MINUTES}m for /out",
+          flush=True)
+
+
+async def book_cashout_out(origin, text):
+    """Move the chime group's Total Out by the figure in the /out reply.
+
+    The forwarded /out is posted BY the bot, so the ordinary /out handler never
+    sees it - that one is reachable only by Ethan and Larry, and stays that way.
+    The money still has to leave the books, so it is booked here instead, in
+    exactly the shape /out itself posts.
+
+    That shape is not cosmetic. recover_ledgers() rebuilds the books after a
+    deploy by reading back the newest bot message carrying BOTH totals, so
+    booking silently - without posting the figures - would let the next redeploy
+    roll this cashout straight back off the books."""
+    match = _OUT_AMOUNT_RE.search(text)
+    amount = _to_float(match.group(1)) if match else None
+    if amount is None or amount <= 0:
+        # A bare "/out" with no figure. The instruction still gets forwarded and
+        # hearted; there is simply nothing to book.
+        print(f"📒 [CASHOUT] no amount in the /out - {chat_name(origin)} totals "
+              "left alone", flush=True)
+        return
+
+    before = ledger_snapshot(origin)
+    after = (before[0], before[1] + amount)
+    try:
+        await bot.send_message(origin,
+                               f"📤 Out = -{amount:,.2f}$\n\n"
+                               f"📊 Group Total:\n"
+                               f"➕ Total In : {after[0]:,.2f}$\n"
+                               f"➖ Total Out: {after[1]:,.2f}$")
+    except Exception as e:
+        # Nothing committed - the same rule the rest of the ledger keeps: the
+        # books never move ahead of what the group can actually see.
+        print(f"❌ [CASHOUT] Total Out NOT moved in {chat_name(origin)}, "
+              f"send failed: {e}", flush=True)
+        return
+
+    ledger_commit(origin, after, f" (cashout /out {amount:,.2f})")
+    await check_milestones(origin, before, after)
+
+
+def _match_request(queue, reply_to):
+    """Which open request a /out is answering.
+
+    An explicit reply is unambiguous, so it wins. Otherwise the oldest open
+    request is taken, which is the order they are worked in."""
+    if reply_to:
+        for request in queue:
+            if request['message_id'] == reply_to:
+                return request
+    return queue[0]
+
+
+async def handle_cashout_reply(handling, text, user_id, username, reply_to):
+    """A message in a handling group, while at least one request is open there.
+
+    Nothing here runs unless a request we forwarded is genuinely outstanding, so
+    ordinary traffic - including an ordinary /out - is never touched."""
+    queue = _pending_cashouts.get(handling)
+    if not queue:
+        return
+
+    if _is_responder(user_id, username):
+        # Somebody is on it. Put the reminder clock back for this group's open
+        # requests; they stay open until a /out actually arrives.
+        now = datetime.now(timezone.utc)
+        for request in queue:
+            request['last_seen'] = now
+        print(f"💬 [CASHOUT] @{username or user_id} replied in "
+              f"{chat_name(handling)} - reminder clock reset", flush=True)
+
+    if not _OUT_CMD_RE.search(text):
+        return
+
+    request = _match_request(queue, reply_to)
+    origin = request['origin']
+    try:
+        await bot.send_message(origin, text)
+    except Exception as e:
+        # Left open deliberately: the request is not settled until the chime
+        # group has actually seen the /out.
+        print(f"❌ [CASHOUT] /out could not be sent back to {chat_name(origin)}: {e}",
+              flush=True)
+        return
+
+    queue.remove(request)
+    if not queue:
+        _pending_cashouts.pop(handling, None)
+
+    await book_cashout_out(origin, text)
+
+    waited = (datetime.now(timezone.utc) - request['opened']).total_seconds() / 60.0
+    print(f"✅ [CASHOUT] /out returned to {chat_name(origin)} after "
+          f"{_humanise(waited)} ({request['nudges']} reminder(s))", flush=True)
+    await heart_request(handling, request['message_id'])
+
+
+async def observe_cashout(chat_id, text, message_id, sent_at,
+                          user_id=None, username=None, reply_to=None):
+    """Single entry point for both input paths.
+
+    Called for every text message in a watched chat. Decides whether it opens a
+    cashout request, answers one, or is none of our business."""
+    if not text:
+        return
+    if BOT_ID is not None and user_id == BOT_ID:
+        return                              # never act on our own posts
+
+    source = _canonical(chat_id, CASHOUT_ROUTES)
+    if source is not None:
+        if CASHOUT_KEYWORD.lower() not in text.lower():
+            return
+        if _is_duplicate(('cashout', source, message_id)):
+            return
+        await open_cashout_request(source, text, sent_at)
+        return
+
+    handling = _canonical(chat_id, _CASHOUT_HANDLERS)
+    if handling is not None:
+        if _is_duplicate(('cashout-reply', handling, message_id)):
+            return
+        await handle_cashout_reply(handling, text, user_id, username, reply_to)
+
+
+def cashout_nudge_text(waited_minutes):
+    return (f"⏰ OUT REQUEST HAS CROSSED {_humanise(waited_minutes)} TIMEFRAME\n\n"
+            "This cashout request is still waiting on a /out.\n\n"
+            f"{CASHOUT_MENTIONS}\n\n"
+            "-ETHAN")
+
+
+def cashout_dm_text(request, handling, waited_minutes):
+    preview = ' '.join((request['text'] or '').split())[:200]
+    return (f"⏰ OUT REQUEST HAS CROSSED {_humanise(waited_minutes)} TIMEFRAME\n\n"
+            f"From: {chat_name(request['origin'])}\n"
+            f"Waiting in: {chat_name(handling)}\n\n"
+            f"{preview}\n\n"
+            "Nobody has sent a /out for it yet. Please action it.")
+
+
+async def cashout_watchdog():
+    """Chase every request that has gone quiet past the timeout."""
+    if CASHOUT_TIMEOUT_MINUTES <= 0:
+        print("ℹ️ [CASHOUT] escalation disabled (CASHOUT_TIMEOUT_MINUTES=0)", flush=True)
+        return
+
+    print(f"📤 [CASHOUT] {len(CASHOUT_ROUTES)} route(s), chasing after "
+          f"{_humanise(CASHOUT_TIMEOUT_MINUTES)} of silence", flush=True)
+
+    while True:
+        await asyncio.sleep(20)
+        now = datetime.now(timezone.utc)
+        for handling, queue in list(_pending_cashouts.items()):
+            for request in list(queue):
+                if request['exhausted']:
+                    continue
+                quiet = (now - request['last_seen']).total_seconds() / 60.0
+                if quiet < CASHOUT_TIMEOUT_MINUTES:
+                    continue
+
+                if request['nudges'] >= CASHOUT_MAX_NUDGES:
+                    request['exhausted'] = True
+                    total = (now - request['opened']).total_seconds() / 60.0
+                    print(f"🔕 [CASHOUT] giving up reminders in "
+                          f"{chat_name(handling)} after {request['nudges']}", flush=True)
+                    await notify_admin(
+                        f"🚨 A cashout request from {chat_name(request['origin'])} has "
+                        f"gone {_humanise(total)} with no /out, after "
+                        f"{request['nudges']} reminders.\n\n"
+                        "Reminders have stopped so the group is not spammed. The "
+                        "request is still open - a late /out will still be forwarded "
+                        "and hearted.")
+                    continue
+
+                request['nudges'] += 1
+                request['last_seen'] = now
+                waited = (now - request['opened']).total_seconds() / 60.0
+
+                try:
+                    await bot.send_message(handling, cashout_nudge_text(waited),
+                                           reply_to_message_id=request['message_id'])
+                    print(f"⏰ [CASHOUT] reminder #{request['nudges']} in "
+                          f"{chat_name(handling)} after {_humanise(waited)}", flush=True)
+                except Exception as e:
+                    print(f"❌ [CASHOUT] reminder failed in {chat_name(handling)}: {e}",
+                          flush=True)
+
+                await dm_crew(cashout_dm_text(request, handling, waited))
+
+
 async def process_incoming(chat_id, text, origin, from_bot=False, sent_at=None):
     global forwarded_count, today_count
 
@@ -617,10 +1041,12 @@ async def status(message):
     if message.chat.id in LEDGER_ADMINS:
         paused = sorted(t for t in IDLE_ALERT_CHATS if _idle_slot(t)['paused'])
         prompts = ('off in ' + ', '.join(str(t) for t in paused)) if paused else 'on'
+        open_requests = sum(len(q) for q in _pending_cashouts.values())
         txt = (f"Bot Online\nGroups: {len(FORWARD_RULES)}\n"
                f"Forwarded: {forwarded_count}\nUptime: {get_uptime()}\n"
                f"Userbot: {userbot_status}\n"
-               f"Payment prompts: {prompts}")
+               f"Payment prompts: {prompts}\n"
+               f"Cashouts awaiting /out: {open_requests}")
         await bot.reply_to(message, txt)
 
 
@@ -648,6 +1074,17 @@ async def help_command(message):
         "/pause gaffer — stops them in CHIME GAFFER only\n"
         "/pause piccaso — stops them in CHIME PICCASO only\n"
         "/resume — starts them again, same three forms\n"
+        "\n"
+        "CASHOUTS — automatic, nothing to type\n"
+        "\n"
+        f"A \"{CASHOUT_KEYWORD}\" in CHIME PICCASO or CHIME GAFFER is\n"
+        "posted to its group with the crew tagged.\n"
+        f"No answer in {_humanise(CASHOUT_TIMEOUT_MINUTES)} — tagged again, and\n"
+        "everyone gets a private warning.\n"
+        "Their /out reply goes back to the chime group, its\n"
+        "amount is added to that group's Total Out, and the\n"
+        "request gets a ❤.\n"
+        "A /out with nothing pending is ignored.\n"
         "\n"
         "INFO\n"
         "\n"
@@ -679,6 +1116,12 @@ async def ledger_command(message):
     """/add <amount> and /out <amount>, target groups only, Ethan and Larry only."""
     chat_id = message.chat.id
     user_id = getattr(message.from_user, 'id', None)
+
+    # A /out typed in a handling group may be answering a cashout request, and
+    # telebot routes commands here rather than to forward_text. This has to run
+    # before the guard below, which would otherwise drop it. It does nothing
+    # unless a request we forwarded is actually open in that chat.
+    await cashout_from_bot_api(message)
 
     # Silent in source groups and DMs, so the source side cannot reach the books.
     if chat_id not in TARGET_CHATS:
@@ -826,11 +1269,26 @@ async def ledger_set_command(message):
     await check_milestones(chat_id, before, after)
 
 
+async def cashout_from_bot_api(message):
+    """Bot API side of observe_cashout.
+
+    Telethon normally sees these first and the dedup key discards this copy, but
+    it keeps the cashout flow alive if the userbot is down."""
+    reply = getattr(message, 'reply_to_message', None)
+    sent_at = (datetime.fromtimestamp(message.date, tz=timezone.utc)
+               if getattr(message, 'date', None) else None)
+    await observe_cashout(message.chat.id, message.text, message.message_id, sent_at,
+                          getattr(message.from_user, 'id', None),
+                          getattr(message.from_user, 'username', None),
+                          getattr(reply, 'message_id', None))
+
+
 @bot.message_handler(content_types=['text'])
 async def forward_text(message):
     sender_is_bot = bool(getattr(message.from_user, 'is_bot', False))
     sent_at = (datetime.fromtimestamp(message.date, tz=timezone.utc)
                if getattr(message, 'date', None) else None)
+    await cashout_from_bot_api(message)
     await process_incoming(message.chat.id, message.text, 'bot-api',
                            from_bot=sender_is_bot, sent_at=sent_at)
 
@@ -855,7 +1313,14 @@ def _parse_source_bots():
 def _configured_source_chats():
     if TELETHON_SOURCE_CHATS.strip():
         return [int(c.strip()) for c in TELETHON_SOURCE_CHATS.split(',') if c.strip()]
-    return list(FORWARD_RULES.keys())
+    # Both ends of a cashout route are watched too: the chime groups because the
+    # requests start there, and the handling groups because the /out answering
+    # one is a human message the Bot API may never deliver.
+    chats = list(FORWARD_RULES.keys())
+    for chat_id in list(CASHOUT_ROUTES) + list(CASHOUT_ROUTES.values()):
+        if chat_id not in chats:
+            chats.append(chat_id)
+    return chats
 
 
 def _is_plain_text(message):
@@ -1104,6 +1569,8 @@ async def run_userbot():
 
             me = await client.get_me()
             print(f"🔐 [TELETHON] Logged in as {me.first_name} (@{me.username})", flush=True)
+            global _userbot_username
+            _userbot_username = (me.username or '').lower()
 
             # Warms the entity cache so numeric chat ids resolve reliably.
             await client.get_dialogs()
@@ -1128,12 +1595,27 @@ async def run_userbot():
             async def on_source_message(event):
                 await ready.wait()
                 sender = await event.get_sender()
-                if not _is_target_sender(sender, bot_ids, bot_usernames):
-                    return
-                if not _is_plain_text(event.message):
-                    return
                 text = event.raw_text
-                if not text:
+                if not text or not _is_plain_text(event.message):
+                    return
+                remember_user(sender)
+
+                sender_id = getattr(sender, 'id', None)
+                if BOT_ID is not None and sender_id == BOT_ID:
+                    # Our own forwards now land in watched chats - the handling
+                    # groups are also payment sources. Acting on them would loop.
+                    return
+
+                # Cashout first, and it accepts humans as well as bots: a request
+                # or the /out answering one is as likely to be typed by a person.
+                # It never consumes the message - the two keyword filters cannot
+                # both match, so the payment path still gets its turn below.
+                await observe_cashout(event.chat_id, text, event.id,
+                                      event.message.date, sender_id,
+                                      getattr(sender, 'username', None),
+                                      getattr(event.message, 'reply_to_msg_id', None))
+
+                if not _is_target_sender(sender, bot_ids, bot_usernames):
                     return
                 if _is_duplicate((event.chat_id, event.id)):
                     return
@@ -1239,7 +1721,7 @@ async def main():
     _install_shutdown_handler(asyncio.get_running_loop())
     await notify_admin('Bot is ONLINE. Use /help to see all commands.')
     await asyncio.gather(run_bot(), run_userbot(), idle_watchdog(),
-                         return_exceptions=True)
+                         cashout_watchdog(), return_exceptions=True)
 
 
 if __name__ == '__main__':
