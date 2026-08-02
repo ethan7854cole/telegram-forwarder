@@ -1056,10 +1056,14 @@ async def close_deleted_cashouts(client, chat_id, deleted_ids):
 
 
 def cashout_nudge_text(waited_minutes):
+    """Deliberately unsigned.
+
+    This is the one message the bot posts into a handling group, and nothing of
+    Ethan's belongs there. The milestone and idle messages ARE signed, because
+    those only ever go to the chime groups."""
     return (f"⏰ OUT REQUEST HAS CROSSED {_humanise(waited_minutes)} TIMEFRAME\n\n"
             "This cashout request is still waiting on a /out.\n\n"
-            f"{CASHOUT_MENTIONS}\n\n"
-            "-ETHAN")
+            f"{CASHOUT_MENTIONS}")
 
 
 def cashout_dm_text(request, handling, waited_minutes):
