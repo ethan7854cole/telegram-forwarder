@@ -1426,10 +1426,20 @@ async def _resolve_source_chats(client, wanted):
 def _catchup_signature(text):
     """Content key for one notification that survives forwarding.
 
-    The embedded timestamp is rewritten on the way out, so it is stripped here;
-    what remains (the name, the amount, the totals) is identical in the source
-    and in the copy sitting in the target group."""
-    return ' '.join(_STAMP_RE.sub('', text or '').split())
+    TWO things are rewritten on the way out, and neither can be part of the key.
+    The timestamp becomes the real send time. The totals become this target's
+    own ledger figures, which is the whole point of the ledger - so they match
+    the source only until the books first diverge, and from then on every
+    delivered copy looks like a different message. That made the sweep re-send
+    the entire window on each connect, and it re-runs on every reconnect, not
+    just on boot.
+
+    What is left - the name and the amount - is identical in the source and in
+    the copy sitting in the target group."""
+    stripped = _STAMP_RE.sub('', text or '')
+    stripped = _TOTAL_IN_SUB.sub(r'\1', stripped)
+    stripped = _TOTAL_OUT_SUB.sub(r'\1', stripped)
+    return ' '.join(stripped.split())
 
 
 async def _delivered_signatures(client, target):
