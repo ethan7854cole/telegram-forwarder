@@ -674,6 +674,12 @@ CASHOUT_ADMIN_HANDLES = _handle_list(
 CASHOUT_CREW_HANDLES = _handle_list(
     os.getenv('CASHOUT_CREW_DM_HANDLES', 'Maynuddin23,MHSUPPORTZONE,maynuddin233'))
 
+# Told how a request is progressing rather than that it is stuck: picked up,
+# then completed. Larry sends the screenshot afterwards, so he is the one who
+# needs to know the moment there is something to send.
+CASHOUT_PROGRESS_HANDLES = _handle_list(
+    os.getenv('CASHOUT_PROGRESS_DM_HANDLES', 'larryyxx'))
+
 CASHOUT_TIMEOUT_MINUTES = int(os.getenv('CASHOUT_TIMEOUT_MINUTES', '5'))
 
 # Reminders repeat until the /out actually lands. 0 means no limit, which is the
@@ -871,6 +877,7 @@ async def open_cashout_request(source, text, sent_at, origin_msg_id):
         'opened': now,
         'last_seen': now,                  # reset by a reply OR a reaction
         'seen': False,                     # somebody has acknowledged it
+        'progress_told': False,            # Larry has been told it was picked up
         'nudges': 0,
         'exhausted': False,
     })
@@ -898,7 +905,7 @@ async def book_cashout_out(origin, text):
         # hearted; there is simply nothing to book.
         print(f"📒 [CASHOUT] no amount in the /out - {chat_name(origin)} totals "
               "left alone", flush=True)
-        return
+        return None
 
     before = ledger_snapshot(origin)
     after = (before[0], before[1] + amount)
@@ -913,19 +920,39 @@ async def book_cashout_out(origin, text):
         # books never move ahead of what the group can actually see.
         print(f"❌ [CASHOUT] Total Out NOT moved in {chat_name(origin)}, "
               f"send failed: {e}", flush=True)
-        return
+        return None
 
     ledger_commit(origin, after, f" (cashout /out {amount:,.2f})")
     await check_milestones(origin, before, after)
+    return amount
 
 
-def note_cashout_seen(chat_id, message_id, user_id, username):
+def cashout_picked_up_text(request, handling, who):
+    return (f"👀 CASHOUT REQUEST PICKED UP\n\n"
+            f"{_cashout_preview(request)}\n\n"
+            f"{who} reacted to it in {chat_name(handling)}, so it is in process.\n"
+            "Waiting on the /out now.")
+
+
+def cashout_completed_text(request, out_to, amount):
+    booked = f"\n{amount:,.2f}$ added to Total Out.\n" if amount else "\n"
+    return (f"✅ OUT COMPLETED\n\n"
+            f"{_cashout_preview(request)}\n"
+            f"{booked}\n"
+            f"Please send the required screenshot to the group: {chat_name(out_to)}")
+
+
+async def note_cashout_seen(chat_id, message_id, user_id, username):
     """A tagged responder reacted to the forwarded request.
 
     A reaction is an acknowledgement, so it carries exactly the standing a reply
     does: the clock goes back to zero and they get another full timeout to send
     the /out. It does NOT close the request - only a real /out does that - so if
-    the reaction is followed by silence, the chasing simply starts again."""
+    the reaction is followed by silence, the chasing simply starts again.
+
+    Larry is told once, the first time a request is picked up. Reacting is tied
+    to one specific message, so unlike a plain reply in the group there is no
+    doubt about WHICH request has been taken on."""
     handling = _canonical(chat_id, _CASHOUT_HANDLERS)
     if handling is None:
         return False
@@ -938,6 +965,14 @@ def note_cashout_seen(chat_id, message_id, user_id, username):
         request['seen'] = True
         print(f"👀 [CASHOUT] @{username or user_id} reacted in {chat_name(handling)} "
               f"- {_humanise(CASHOUT_TIMEOUT_MINUTES)} more for the /out", flush=True)
+
+        if not request['progress_told']:
+            request['progress_told'] = True     # once per request, not per reaction
+            who = f"@{username}" if username else "Someone tagged on it"
+            missed = await dm_handles(
+                CASHOUT_PROGRESS_HANDLES,
+                cashout_picked_up_text(request, handling, who))
+            await warn_unreachable(missed)
         return True
     return False
 
@@ -996,11 +1031,17 @@ async def handle_cashout_reply(handling, text, user_id, username, reply_to):
     # rebuilds a group's books from the totals in that group's own messages, so
     # moving one group's ledger while posting the figures into another would
     # corrupt both.
-    await book_cashout_out(out_to, text)
+    booked = await book_cashout_out(out_to, text)
 
     waited = (datetime.now(timezone.utc) - request['opened']).total_seconds() / 60.0
     print(f"✅ [CASHOUT] /out sent to {chat_name(out_to)} after "
           f"{_humanise(waited)} ({request['nudges']} reminder(s))", flush=True)
+
+    # Larry sends the screenshot, so he is told the moment there is one to send,
+    # and told which group it goes to.
+    missed = await dm_handles(CASHOUT_PROGRESS_HANDLES,
+                              cashout_completed_text(request, out_to, booked))
+    await warn_unreachable(missed)
     # The ❤ goes on the original request in the chime group, not on the copy in
     # the handling group: it is the group that asked which needs to see, at a
     # glance, which of its requests have been dealt with.
@@ -1582,8 +1623,8 @@ async def on_request_reaction(reaction):
     if user is None:
         return
     remember_user(user)
-    note_cashout_seen(reaction.chat.id, reaction.message_id,
-                      getattr(user, 'id', None), getattr(user, 'username', None))
+    await note_cashout_seen(reaction.chat.id, reaction.message_id,
+                            getattr(user, 'id', None), getattr(user, 'username', None))
 
 
 @bot.message_handler(content_types=['text'])
