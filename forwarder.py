@@ -940,47 +940,64 @@ async def observe_cashout(chat_id, text, message_id, sent_at,
         await handle_cashout_reply(handling, text, user_id, username, reply_to)
 
 
-async def close_deleted_cashouts(client, chat_id, deleted_ids):
-    """Drop any open request whose original message has been deleted.
+async def _confirm_gone(client, chat, msg_id):
+    """Has that message really been deleted?
 
-    A request that has been deleted has been dealt with - withdrawn, or handled
-    and tidied away. Chasing it would be nagging about something nobody can see
-    any more, and there is nothing left to react to. Treat it as settled: no
-    reminder, no reaction, out of the queue.
+    Only needed when Telegram did not say which chat a deletion happened in.
+    Anything other than a definite "not there" leaves the request alone."""
+    try:
+        entity = await _resolve_one(client, chat)
+        if entity is None:
+            return False
+        found = await client.get_messages(entity, ids=[msg_id])
+        return not (found and found[0] is not None)
+    except Exception as e:
+        print(f"⚠️ [CASHOUT] could not confirm deletion in {chat_name(chat)}: {e} "
+              "- leaving it open.", flush=True)
+        return False
+
+
+async def close_deleted_cashouts(client, chat_id, deleted_ids):
+    """Drop any open request that has been deleted from EITHER end.
+
+    A request lives as two messages: the original in the chime group and the
+    copy the bot posted in the handling group. Deleting either one means it has
+    been dealt with - withdrawn, or handled and tidied away. Chasing it after
+    that is nagging about something nobody can see, and if the handling-group
+    copy is the one that went, the reminders cannot even be posted: they reply
+    to it. Treat it as settled: out of the queue, no reminder, no reaction.
 
     Telegram only says WHICH chat a deletion happened in when it was a channel.
     With no chat to go on, a bare message id could belong to any watched chat,
-    and dropping the wrong request would silently strand a real cashout - so in
-    that case the message is looked up before anything is dropped. Gone means
-    gone; still there means the deletion was somebody else's."""
+    and dropping the wrong request would silently strand a real cashout - the
+    /out answering it would find nothing pending. So in that case the message
+    is looked up before anything is dropped."""
     if not deleted_ids:
         return
-    source = _canonical(chat_id, CASHOUT_ROUTES) if chat_id is not None else None
     gone = set(deleted_ids)
+
+    known = None
+    if chat_id is not None:
+        known = _canonical(chat_id, CASHOUT_ROUTES) or _canonical(chat_id, _CASHOUT_HANDLERS)
+        if known is None:
+            return                  # a deletion in some chat we do not care about
 
     for handling, queue in list(_pending_cashouts.items()):
         for request in list(queue):
-            if request['origin_msg_id'] not in gone:
-                continue
-            if source is not None and request['origin'] != source:
-                continue
-            if source is None:
-                # Unattributed deletion: confirm this particular one really went.
-                try:
-                    entity = await _resolve_one(client, request['origin'])
-                    found = await client.get_messages(
-                        entity, ids=[request['origin_msg_id']]) if entity else None
-                    if found and found[0] is not None:
-                        continue            # still there - not this request
-                except Exception as e:
-                    print(f"⚠️ [CASHOUT] could not confirm deletion in "
-                          f"{chat_name(request['origin'])}: {e} - leaving it open.",
-                          flush=True)
+            ends = ((request['origin'], request['origin_msg_id'], 'request'),
+                    (handling, request['message_id'], 'forwarded copy'))
+            for chat, msg_id, label in ends:
+                if msg_id not in gone:
                     continue
-            queue.remove(request)
-            print(f"🗑️ [CASHOUT] request in {chat_name(request['origin'])} was "
-                  f"deleted after {request['nudges']} reminder(s) - treating it as "
-                  "handled. No chasing, no reaction.", flush=True)
+                if known is not None and chat != known:
+                    continue
+                if known is None and not await _confirm_gone(client, chat, msg_id):
+                    continue
+                queue.remove(request)
+                print(f"🗑️ [CASHOUT] {label} in {chat_name(chat)} was deleted after "
+                      f"{request['nudges']} reminder(s) - treating it as handled. "
+                      "No chasing, no reaction.", flush=True)
+                break
         if not queue:
             _pending_cashouts.pop(handling, None)
 
