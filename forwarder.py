@@ -273,7 +273,18 @@ _TOTAL_IN_SUB = re.compile(r'(Total\s*In\s*:?\s*)([\d,]+(?:\.\d+)?)', re.I)
 _TOTAL_OUT_SUB = re.compile(r'(Total\s*Out\s*:?\s*)([\d,]+(?:\.\d+)?)', re.I)
 
 _RECEIVED_RE = re.compile(r'You\s+received\s+\$?\s*([\d,]+(?:\.\d+)?)', re.I)
-_CMD_AMOUNT_RE = re.compile(r'^/\w+(?:@\w+)?\s+\$?\s*([\d,]+(?:\.\d+)?)')
+# Amount for /add and /out, with an optional minus written either way round:
+# "/add -100" and "/add-100" both take 100 back off Total In. The joined form
+# needs its own handler as well - Telegram reads the command as the word after
+# the slash, so "/add-100" is the command "add-100" and never reaches a
+# commands=['add'] handler at all. This only parses it.
+_CMD_AMOUNT_RE = re.compile(r'^/\w+(?:@\w+)?\s*(-?)\s*\$?\s*([\d,]+(?:\.\d+)?)')
+
+# The command word itself, tolerating the joined form: "/add-100" -> "add".
+_CMD_NAME_RE = re.compile(r'^/(\w+)')
+
+# Which spellings need routing past telebot's command matcher.
+_JOINED_LEDGER_RE = re.compile(r'^/(?:add|out)(?:@\w+)?-', re.I)
 _SET_RE = re.compile(r'^/set(?:@\w+)?\s+(in|out)\s+\$?\s*([\d,]+(?:\.\d+)?)', re.I)
 
 # target chat id -> {'in': float, 'out': float}
@@ -1070,6 +1081,9 @@ async def help_command(message):
         "\n"
         "/add 500 — adds 500.00$ to Total In\n"
         "/out 100 — adds 100.00$ to Total Out\n"
+        "/add -100 — takes 100.00$ back off Total In\n"
+        "/out -50 — takes 50.00$ back off Total Out\n"
+        "(the space is optional: /add-100 works too)\n"
         "/set in 800 — sets Total In to 800.00$\n"
         "/set out 300 — sets Total Out to 300.00$\n"
         "\n"
@@ -1138,19 +1152,44 @@ async def ledger_command(message):
                                     "change the totals.")
         return
 
-    command = message.text.lstrip('/').split('@')[0].split()[0].lower()
+    name = _CMD_NAME_RE.match(message.text)
+    command = name.group(1).lower() if name else ''
     match = _CMD_AMOUNT_RE.match(message.text)
-    amount = _to_float(match.group(1)) if match else None
-    if amount is None or amount <= 0:
-        await bot.reply_to(message, f"Usage: /{command} <amount>\nExample: /{command} 100")
+    amount = _to_float(match.group(2)) if match else None
+    if amount is None or amount == 0:
+        await bot.reply_to(message, f"Usage: /{command} <amount>\n"
+                                    f"Example: /{command} 100\n"
+                                    f"         /{command} -100  (takes it back off)")
         return
+    if match.group(1) == '-':
+        amount = -amount
 
     before = ledger_snapshot(chat_id)
+    column = 'Total In' if command == 'add' else 'Total Out'
     if command == 'add':
         after = (before[0] + amount, before[1])
-        heading = f"💰 Deposit = +{amount:,.2f}$"
     else:
         after = (before[0], before[1] + amount)
+
+    # A correction that overshoots is a typo, not an instruction. Refuse it
+    # rather than publish a negative total, which would then be carried into
+    # every forwarded notification by rewrite_totals().
+    if after[0] < 0 or after[1] < 0:
+        print(f"⛔ [LEDGER] /{command} {amount:,.2f} by {user_id} would take "
+              f"{column} below zero in {chat_id}", flush=True)
+        await bot.reply_to(message,
+                           f"⛔ That would take {column} below zero.\n\n"
+                           f"➕ Total In : {before[0]:,.2f}$\n"
+                           f"➖ Total Out: {before[1]:,.2f}$\n\n"
+                           f"Use /set {'in' if command == 'add' else 'out'} "
+                           "<amount> to set it outright.")
+        return
+
+    if amount < 0:
+        heading = f"✏️ {column} adjusted by {amount:,.2f}$"
+    elif command == 'add':
+        heading = f"💰 Deposit = +{amount:,.2f}$"
+    else:
         heading = f"📤 Out = -{amount:,.2f}$"
 
     try:
@@ -1165,6 +1204,18 @@ async def ledger_command(message):
 
     ledger_commit(chat_id, after, f" (/{command} {amount:,.2f} by {user_id})")
     await check_milestones(chat_id, before, after)
+
+
+@bot.message_handler(func=lambda m: bool(getattr(m, 'text', None))
+                     and bool(_JOINED_LEDGER_RE.match(m.text)))
+async def ledger_joined_command(message):
+    """"/add-100" and "/out-50", written without the space.
+
+    Telegram reads the command as the word right after the slash, so these
+    arrive as the commands "add-100" and "out-50" and never reach the handler
+    above. Same code, just reached a different way. Registered ahead of the
+    catch-all text handler, which telebot would otherwise hand them to."""
+    await ledger_command(message)
 
 
 @bot.message_handler(commands=['pause', 'resume'])
