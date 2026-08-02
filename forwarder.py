@@ -97,6 +97,14 @@ CATCHUP_LOOKBACK_MINUTES = int(os.getenv('CATCHUP_LOOKBACK_MINUTES', '180'))
 CATCHUP_MAX = int(os.getenv('CATCHUP_MAX', '25'))
 CATCHUP_SCAN_LIMIT = int(os.getenv('CATCHUP_SCAN_LIMIT', '300'))
 
+# The target is read back further than the source. A target group carries more
+# traffic than its source - every forward, plus /add and /out confirmations,
+# milestones and idle prompts - so an equal limit can run out of room before it
+# has covered the same window, and anything past that point would look
+# undelivered when it is sitting right there.
+CATCHUP_TARGET_SCAN_LIMIT = int(os.getenv('CATCHUP_TARGET_SCAN_LIMIT',
+                                          str(CATCHUP_SCAN_LIMIT * 3)))
+
 # ---------------------------------------------------------------------------
 # Runtime state (unchanged)
 # ---------------------------------------------------------------------------
@@ -1443,21 +1451,50 @@ def _catchup_signature(text):
 
 
 async def _delivered_signatures(client, target):
-    """Signatures of what this bot has already posted into a target group."""
+    """What is already sitting in a target group, and how far back that is known.
+
+    Returns (counts, reached). `reached` is the oldest moment the scan actually
+    accounted for; anything older than it cannot be judged and must not be
+    guessed at.
+
+    Sender attribution is deliberately NOT used. Telegram credits a post in a
+    channel to the channel itself rather than to the bot that sent it, and a
+    post by an anonymous admin to the group - so filtering on the bot's own id
+    can match nothing at all and make a fully delivered window look entirely
+    missing. Content is the honest test: if the text is already in the group it
+    has been delivered, whoever Telegram says put it there. A human pasting the
+    same text would count too, which errs towards staying quiet - the right
+    direction, because a missed payment can still be backfilled by hand and a
+    duplicate cannot be taken back."""
     counts = Counter()
     entity = await _resolve_one(client, target)
     if entity is None:
-        return None                     # unreadable: caller must not guess
+        return None, None               # unreadable: caller must not guess
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=CATCHUP_LOOKBACK_MINUTES)
-    async for msg in client.iter_messages(entity, limit=CATCHUP_SCAN_LIMIT):
+
+    scanned = 0
+    last_date = None
+    covered_window = False
+    async for msg in client.iter_messages(entity, limit=CATCHUP_TARGET_SCAN_LIMIT):
+        scanned += 1
+        last_date = msg.date
         if msg.date < cutoff:
+            covered_window = True       # read right past the far edge
             break
-        sender = await msg.get_sender()
-        if BOT_ID is None or getattr(sender, 'id', None) != BOT_ID:
-            continue
         if msg.raw_text:
             counts[_catchup_signature(msg.raw_text)] += 1
-    return counts
+
+    if covered_window or scanned < CATCHUP_TARGET_SCAN_LIMIT:
+        # Either we read past the window, or the group simply has no more
+        # history - either way the whole window is accounted for.
+        reached = cutoff
+    else:
+        # The scan hit its limit first. Everything older than the last message
+        # we saw is unknown, not absent.
+        reached = last_date
+        print(f"⚠️ [CATCHUP] {target} history is deeper than {CATCHUP_TARGET_SCAN_LIMIT} "
+              f"messages; only judging back to {last_date:%m-%d %H:%M}.", flush=True)
+    return counts, reached
 
 
 async def catch_up(client):
@@ -1507,19 +1544,28 @@ async def catch_up(client):
         pending.reverse()                       # oldest first, so groups read in order
 
         for target in targets:
-            delivered = await _delivered_signatures(client, target)
+            delivered, reached = await _delivered_signatures(client, target)
             if delivered is None:
                 print(f"⚠️ [CATCHUP] {target} unreadable - skipping, will not guess.",
                       flush=True)
                 continue
 
             missing = []
+            unjudged = 0
             for msg in pending:
+                if reached is not None and msg.date < reached:
+                    # Older than the target scan could see. Unknown, not absent.
+                    unjudged += 1
+                    continue
                 sig = _catchup_signature(msg.raw_text)
                 if delivered[sig] > 0:
                     delivered[sig] -= 1         # this copy is already in the group
                 else:
                     missing.append(msg)
+            if unjudged:
+                print(f"⚠️ [CATCHUP] {target}: {unjudged} message(s) older than the "
+                      "readable history - left alone rather than risk a duplicate.",
+                      flush=True)
             if not missing:
                 continue
 
