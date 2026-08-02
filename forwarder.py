@@ -732,17 +732,33 @@ async def dm_crew(text):
             "them directly. Until then only the group mention reaches them.")
 
 
+# Telegram's various ways of saying "that message is not there any more".
+_GONE_MARKERS = ('message to react not found', 'message_id_invalid',
+                 'message not found', 'message to reply not found')
+
+
+def _looks_deleted(error):
+    text = str(error).lower()
+    return any(marker in text for marker in _GONE_MARKERS)
+
+
 async def heart_request(chat_id, message_id):
     """❤ a cashout request, marking it actioned.
 
     Falls back to the user account because the bot may not be able to react on
-    someone else's message in that chat, and the account already can."""
+    someone else's message in that chat, and the account already can. A message
+    that has been deleted is not an error and gets no retry - there is nothing
+    left to mark."""
     try:
         await bot.set_message_reaction(chat_id, message_id,
                                        [ReactionTypeEmoji(CASHOUT_HEART)])
         print(f"❤️ [CASHOUT] hearted {message_id} in {chat_name(chat_id)}", flush=True)
         return True
     except Exception as e:
+        if _looks_deleted(e):
+            print(f"🗑️ [CASHOUT] request {message_id} in {chat_name(chat_id)} is "
+                  "gone - nothing to heart, leaving it.", flush=True)
+            return False
         print(f"⚠️ [CASHOUT] bot could not react in {chat_name(chat_id)}: {e}",
               flush=True)
 
@@ -922,6 +938,51 @@ async def observe_cashout(chat_id, text, message_id, sent_at,
         if _is_duplicate(('cashout-reply', handling, message_id)):
             return
         await handle_cashout_reply(handling, text, user_id, username, reply_to)
+
+
+async def close_deleted_cashouts(client, chat_id, deleted_ids):
+    """Drop any open request whose original message has been deleted.
+
+    A request that has been deleted has been dealt with - withdrawn, or handled
+    and tidied away. Chasing it would be nagging about something nobody can see
+    any more, and there is nothing left to react to. Treat it as settled: no
+    reminder, no reaction, out of the queue.
+
+    Telegram only says WHICH chat a deletion happened in when it was a channel.
+    With no chat to go on, a bare message id could belong to any watched chat,
+    and dropping the wrong request would silently strand a real cashout - so in
+    that case the message is looked up before anything is dropped. Gone means
+    gone; still there means the deletion was somebody else's."""
+    if not deleted_ids:
+        return
+    source = _canonical(chat_id, CASHOUT_ROUTES) if chat_id is not None else None
+    gone = set(deleted_ids)
+
+    for handling, queue in list(_pending_cashouts.items()):
+        for request in list(queue):
+            if request['origin_msg_id'] not in gone:
+                continue
+            if source is not None and request['origin'] != source:
+                continue
+            if source is None:
+                # Unattributed deletion: confirm this particular one really went.
+                try:
+                    entity = await _resolve_one(client, request['origin'])
+                    found = await client.get_messages(
+                        entity, ids=[request['origin_msg_id']]) if entity else None
+                    if found and found[0] is not None:
+                        continue            # still there - not this request
+                except Exception as e:
+                    print(f"⚠️ [CASHOUT] could not confirm deletion in "
+                          f"{chat_name(request['origin'])}: {e} - leaving it open.",
+                          flush=True)
+                    continue
+            queue.remove(request)
+            print(f"🗑️ [CASHOUT] request in {chat_name(request['origin'])} was "
+                  f"deleted after {request['nudges']} reminder(s) - treating it as "
+                  "handled. No chasing, no reaction.", flush=True)
+        if not queue:
+            _pending_cashouts.pop(handling, None)
 
 
 def cashout_nudge_text(waited_minutes):
@@ -1747,6 +1808,11 @@ async def run_userbot():
                 # _is_target_sender above already guaranteed a bot sender.
                 await process_incoming(event.chat_id, text, 'telethon',
                                        from_bot=True, sent_at=event.message.date)
+
+            @client.on(events.MessageDeleted)
+            async def on_message_deleted(event):
+                await ready.wait()
+                await close_deleted_cashouts(client, event.chat_id, event.deleted_ids)
 
             await recover_ledgers(client)
             try:
