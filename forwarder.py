@@ -779,6 +779,41 @@ _MENTION_RE = (re.compile(
     r'(?<![\w@])@(' + '|'.join(re.escape(h) for h in MENTION_WATCH_HANDLES) + r')\b',
     re.I) if MENTION_WATCH_HANDLES else None)
 
+# ---------------------------------------------------------------------------
+# Payment retraction
+# ---------------------------------------------------------------------------
+#
+# A payment is forwarded and booked within seconds of landing, so by the time
+# anyone can see that it should not count, the money is already on the target's
+# books and the copy is already sitting in the group. Reacting to the ORIGINAL
+# in the source group undoes both: the forwarded copy is deleted, and the amount
+# comes back off that target's Total In.
+#
+# ANY reaction retracts - the user's explicit choice. There is deliberately no
+# confirmation step, so a stray tap on a payment in one of these groups really
+# does take the money off the books.
+RETRACT_SOURCES = _with_variants(
+    [int(c.strip()) for c in
+     os.getenv('RETRACT_SOURCES', '-1002335630148').split(',') if c.strip()])
+
+# (rule key, source message id) -> [(target, message id there, amount booked)]
+#
+# In memory, so a redeploy forgets it and a later reaction finds nothing. That
+# is an acceptable limit rather than a hidden one: Telegram will not let a bot
+# delete a group message more than 48 hours old either, so this was never going
+# to work retrospectively.
+_delivered = OrderedDict()
+RETRACT_MEMORY = int(os.getenv('RETRACT_MEMORY', '400'))
+
+
+def remember_delivery(source_key, target, message_id, amount):
+    """Note what a forward put where, so a reaction can undo exactly that."""
+    if source_key is None or message_id is None:
+        return
+    _delivered.setdefault(source_key, []).append((target, message_id, amount))
+    while len(_delivered) > RETRACT_MEMORY:
+        _delivered.popitem(last=False)
+
 # @username -> numeric id. A bot can only DM an id, so the ones we know are
 # seeded here and the rest are learned the first time that person speaks in a
 # watched chat. @Larryyxx and @ethannxxxx, matching LEDGER_ADMINS.
@@ -1488,7 +1523,8 @@ async def cashout_watchdog():
                     await nudge_unacknowledged(handling, request, waited)
 
 
-async def process_incoming(chat_id, text, origin, from_bot=False, sent_at=None):
+async def process_incoming(chat_id, text, origin, from_bot=False, sent_at=None,
+                           source_msg_id=None):
     global forwarded_count, today_count
 
     print(f"📩 [MSG RECEIVED] ({origin}) Chat ID: {chat_id} | Text: '{text}'", flush=True)
@@ -1512,16 +1548,20 @@ async def process_incoming(chat_id, text, origin, from_bot=False, sent_at=None):
         return
 
     print("✅ [KEYWORD MATCH] Forwarding message...", flush=True)
+    source_key = (rule_key, source_msg_id) if source_msg_id is not None else None
     for target in FORWARD_RULES[rule_key]:
-        await deliver_to_target(target, fixed, text, from_bot)
+        await deliver_to_target(target, fixed, text, from_bot, source_key)
 
 
-async def deliver_to_target(target, fixed, text, from_bot):
+async def deliver_to_target(target, fixed, text, from_bot, source_key=None):
     """Send one notification to one group and move that group's books.
 
     Split out of process_incoming so the start-up catch-up can deliver to a
     single target: a message can be missing from one group while another
-    already has it, and re-sending to the group that has it would duplicate."""
+    already has it, and re-sending to the group that has it would duplicate.
+
+    `source_key` identifies the message this came from, so a later reaction on
+    that original can find this copy again and undo it - see retract_payment."""
     global forwarded_count, today_count
 
     # Each target keeps its own books, so the totals shown are per target.
@@ -1536,7 +1576,7 @@ async def deliver_to_target(target, fixed, text, from_bot):
         body = rewrite_totals(fixed, *ledger_snapshot(target))
     try:
         # Always sent with the bot token, never from the user account.
-        await bot.send_message(target, body)
+        sent = await bot.send_message(target, body)
     except Exception as e:
         # Nothing committed: the ledger stays level with the last message
         # the group can actually see.
@@ -1546,6 +1586,8 @@ async def deliver_to_target(target, fixed, text, from_bot):
     if movement:
         ledger_commit(target, movement[1])
         await note_payment(target)  # a real payment landed: reset the clock
+    remember_delivery(source_key, target, getattr(sent, 'message_id', None),
+                      (movement[1][0] - movement[0][0]) if movement else 0.0)
     print(f"🚀 [FORWARD SUCCESS] Sent to {target}", flush=True)
     forwarded_count += 1
     today_count += 1
@@ -1556,6 +1598,89 @@ async def deliver_to_target(target, fixed, text, from_bot):
     # After the payment confirmation, so the alert lands beneath it.
     if movement:
         await check_milestones(target, movement[0], movement[1])
+    return True
+
+
+def retract_text(amount, after):
+    """Carries BOTH totals, like every other message that moves the ledger.
+
+    recover_ledgers() rebuilds the books from the newest bot message showing
+    both, and the message being deleted here was one of them - so without this
+    the next redeploy would read an older figure and quietly put the payment
+    back on."""
+    heading = (f"↩️ Retracted = -{amount:,.2f}$" if amount > 0
+               else "↩️ Forwarded payment retracted")
+    return (f"{heading}\n\n"
+            f"📊 Group Total:\n"
+            f"➕ Total In : {after[0]:,.2f}$\n"
+            f"➖ Total Out: {after[1]:,.2f}$")
+
+
+async def retract_payment(chat_id, message_id, user_id):
+    """Undo a forwarded payment, because its original was reacted to.
+
+    A payment is forwarded and booked within seconds, so undoing it means
+    reaching into the target group after the fact: delete the copy, take the
+    amount back off Total In.
+
+    The order is deliberate and matches the rest of the ledger. The correction
+    is POSTED first, then the books are committed, then the copy is deleted -
+    so the figures can never run ahead of what the group can see, and a delete
+    that fails still leaves the corrected totals as the newest ones for
+    recover_ledgers() to find.
+
+    Returns True if anything was retracted."""
+    if chat_id not in RETRACT_SOURCES:
+        return False
+    rule_key = resolve_rule_key(chat_id)
+    if rule_key is None:
+        return False
+    if user_id not in LEDGER_ADMINS:
+        print(f"⛔ [RETRACT] {user_id} may not retract in {chat_name(chat_id)}",
+              flush=True)
+        return False
+
+    # Popped, not read: a second reaction on the same message must do nothing.
+    entries = _delivered.pop((rule_key, message_id), None)
+    if not entries:
+        print(f"↩️ [RETRACT] nothing known about message {message_id} in "
+              f"{chat_name(chat_id)} - forwarded before the last restart, or "
+              "never forwarded at all.", flush=True)
+        return False
+
+    for target, target_msg_id, amount in entries:
+        before = ledger_snapshot(target)
+        after = (max(0.0, before[0] - amount), before[1])
+        if amount > before[0]:
+            print(f"⚠️ [RETRACT] {amount:,.2f} is more than {chat_name(target)} has "
+                  f"in Total In ({before[0]:,.2f}) - clamped at zero rather than "
+                  "publishing a negative.", flush=True)
+
+        try:
+            await bot.send_message(target, retract_text(amount, after))
+        except Exception as e:
+            # Nothing committed and nothing deleted: the copy stays, and so do
+            # the books that match it.
+            print(f"❌ [RETRACT] correction NOT posted to {chat_name(target)}: {e} "
+                  "- leaving the payment as it was.", flush=True)
+            continue
+
+        ledger_commit(target, after, f" (retracted {amount:,.2f} by {user_id})")
+
+        try:
+            await bot.delete_message(target, target_msg_id)
+            print(f"🗑️ [RETRACT] {amount:,.2f} taken back off {chat_name(target)} "
+                  "and the forwarded copy deleted", flush=True)
+        except Exception as e:
+            # Telegram refuses to let a bot delete a group message older than
+            # 48 hours. The books are already right; only the copy is stranded.
+            print(f"⚠️ [RETRACT] could not delete the copy in {chat_name(target)}: "
+                  f"{e}", flush=True)
+            await notify_admin(
+                f"⚠️ Retracted {amount:,.2f}$ from {chat_name(target)}, but the "
+                f"forwarded message could not be deleted:\n{e}\n\n"
+                "The totals are correct - the old message is still sitting there "
+                "showing the figures from before. Delete it by hand.")
     return True
 
 
@@ -1957,6 +2082,11 @@ async def on_request_reaction(reaction):
                             getattr(user, 'id', None), getattr(user, 'username', None),
                             full_name or None)
 
+    # The two cannot collide: note_cashout_seen only looks at handling groups,
+    # retract_payment only at RETRACT_SOURCES, and no chat is both.
+    await retract_payment(reaction.chat.id, reaction.message_id,
+                          getattr(user, 'id', None))
+
 
 # Everything the Bot API can hang a caption on. Kept explicit rather than
 # "not text": a caption is only ever read for a /out, so widening this list is a
@@ -1994,7 +2124,8 @@ async def forward_text(message):
                if getattr(message, 'date', None) else None)
     await cashout_from_bot_api(message)
     await process_incoming(message.chat.id, message.text, 'bot-api',
-                           from_bot=sender_is_bot, sent_at=sent_at)
+                           from_bot=sender_is_bot, sent_at=sent_at,
+                           source_msg_id=message.message_id)
 
 
 # ---------------------------------------------------------------------------
@@ -2229,7 +2360,8 @@ async def catch_up(client):
                 # this and must not send the same message a second time.
                 _is_duplicate((source_id, msg.id))
                 fixed = correct_timestamp(msg.raw_text, msg.date)
-                if await deliver_to_target(target, fixed, msg.raw_text, True):
+                if await deliver_to_target(target, fixed, msg.raw_text, True,
+                                           (source_id, msg.id)):
                     total += 1
                 await asyncio.sleep(1.5)        # stay under the send rate limit
 
@@ -2395,7 +2527,8 @@ async def run_userbot():
                     return
                 # _is_target_sender above already guaranteed a bot sender.
                 await process_incoming(event.chat_id, text, 'telethon',
-                                       from_bot=True, sent_at=event.message.date)
+                                       from_bot=True, sent_at=event.message.date,
+                                       source_msg_id=event.id)
 
             @client.on(events.MessageDeleted)
             async def on_message_deleted(event):

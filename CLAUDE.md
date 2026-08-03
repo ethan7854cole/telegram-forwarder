@@ -17,7 +17,7 @@ python3 tests/run.py            # all suites
 python3 tests/run.py cashout    # only matching suites
 ```
 
-504 checks across 15 suites, all stubbed — nothing touches Telegram, the
+534 checks across 16 suites, all stubbed — nothing touches Telegram, the
 network, or the live groups. They cover the pre-existing behaviour as well as
 the new, so they are the guard against a change quietly altering something that
 already worked.
@@ -145,6 +145,29 @@ A `/out` at any point completes it. Stopping is not giving up — the request
 stays **open**, so a late `/out` is still forwarded, booked and hearted, and
 deleting either copy still settles it.
 
+## Retracting a payment
+
+A payment is forwarded and booked within seconds of landing, so by the time
+anyone can see it should not count, the money is on the target's books and the
+copy is in the group. **Reacting to the original** in `Chime Rev & out no-7`
+undoes both: `retract_payment()` deletes the forwarded copy in `CHIME GAFFER`
+and takes the amount back off that group's Total In.
+
+- **ANY reaction retracts** — the user's explicit choice, with no confirmation
+  step. A stray tap on a payment in that group really does move the books.
+- **Only Ethan and Larry**, like every other ledger movement.
+- **Only the Gaffer route** (`RETRACT_SOURCES`). A reaction on a payment in
+  `MH X LARRY GROUP 2` does nothing.
+- **Post, commit, delete — in that order.** The message being deleted is itself
+  one of the messages `recover_ledgers()` reads back, so the correction has to
+  publish both totals *first*. A delete that fails then still leaves the
+  corrected figures as the newest ones, and Ethan is told to remove the stray
+  copy by hand.
+- **Once.** The delivery record is popped, so a second reaction does nothing.
+- **In memory**, so a redeploy forgets what was forwarded and a later reaction
+  finds nothing. Not worth fixing: Telegram refuses to let a bot delete a group
+  message more than 48 hours old anyway.
+
 ## Mention watch
 
 The four cashout groups are **muted**, so an `@Larryyxx` or `@ethannxxxx` in one
@@ -242,6 +265,7 @@ cashout requests.
 | `tests/test_shutdown.py` | SIGTERM always reaches the exit, however the disconnect goes |
 | `tests/test_startup.py` | Polling waits out the changeover; the conflict watcher |
 | `tests/test_mentions.py` | An `@` in a muted group arrives as a DM |
+| `tests/test_retract.py` | Reacting to a payment undoes it in the target |
 | `backfill.py` | Manual one-off backfill, separate from the boot sweep |
 | `telethon_login.py` | Generates a `TELETHON_SESSION`; `--deploy` for Railway |
 
