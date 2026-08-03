@@ -49,7 +49,11 @@ class FakeBot:
         sent.append((chat_id, caption))
         return FakeMsg(9500)
 
+    react_error = None
+
     async def set_message_reaction(self, *a, **k):
+        if self.react_error:
+            raise RuntimeError(self.react_error)
         return True
 
 
@@ -74,6 +78,7 @@ def reset():
     f._cashout_claims.clear()
     f._ledger.clear()
     f._cashout_stopped = False
+    f.bot.react_error = None
 
 
 CREW_WORDS = ('maynuddin23', 'maynuddin233', 'mhsupportzone')
@@ -168,6 +173,56 @@ async def main():
     admin = [t for c, t in dms if c in (ETHAN, LARRY)]
     check('Ethan and Larry are told who is stuck',
           admin and not clean(admin[0]), str(admin))
+
+    # -- 8. no bot ERROR ever reaches the crew -----------------------------
+    # The crew are told one thing and one thing only: that a request is still
+    # waiting on a /out. Everything that has gone wrong with the bot is Ethan's
+    # and Larry's - the crew cannot act on it, and telling them turns a working
+    # chase into noise they learn to ignore.
+    def crew_got():
+        return [t for c, t in dms if c == CREW]
+
+    # a) the heart cannot be placed
+    reset()
+    f.bot.react_error = 'Bad Request: not enough rights to manage reactions'
+    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $25 $jenny-buhr', 930, now,
+                            user_id=42)
+    await f.observe_cashout(MHLARRY, '/out 25', 931, now,
+                            user_id=CREW, username='Maynuddin23')
+    check('a failed heart tells Ethan', any(c == ETHAN for c, _ in dms), str(dms))
+    check('and tells the crew nothing', crew_got() == [], str(crew_got()))
+
+    # b) something arrives while the flow is stopped
+    reset()
+    await f.set_cashout_stopped(True, '@ethannxxxx')
+    dms.clear()
+    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $25 $jenny-buhr', 932, now,
+                            user_id=42)
+    check('an ignored request tells Ethan and Larry',
+          sorted({c for c, _ in dms}) == sorted([ETHAN, LARRY]), str(dms))
+    check('and tells the crew nothing', crew_got() == [], str(crew_got()))
+    f._cashout_stopped = False
+
+    # c) a crew member is engaged but stuck
+    reset()
+    await f.observe_cashout(GAFFER, 'CASHOUT REQUEST $40 for Dana', 940, now,
+                            user_id=42)
+    await f.observe_cashout(CHIMEREV, 'on it', 941, now,
+                            user_id=CREW, username='Maynuddin23')
+    dms.clear()
+    await f.observe_cashout(CHIMEREV, 'stuck, cash app is down', 942, now,
+                            user_id=CREW, username='Maynuddin23')
+    check('a stuck crew member is reported to Ethan and Larry',
+          any(c in (ETHAN, LARRY) for c, _ in dms), str(dms))
+    check('and never to the crew themselves', crew_got() == [], str(crew_got()))
+
+    # d) the switch being thrown is not their business either
+    reset()
+    await f.set_cashout_stopped(True, '@larryyxx')
+    check('stopping the flow tells only Ethan and Larry',
+          sorted({c for c, _ in dms}) == sorted([ETHAN, LARRY]), str(dms))
+    check('the crew are not told the bot was stopped', crew_got() == [], str(crew_got()))
+    f._cashout_stopped = False
 
     print()
     if failures:

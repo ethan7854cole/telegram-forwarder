@@ -17,7 +17,7 @@ python3 tests/run.py            # all suites
 python3 tests/run.py cashout    # only matching suites
 ```
 
-710 checks across 21 suites, all stubbed — nothing touches Telegram, the
+746 checks across 22 suites, all stubbed — nothing touches Telegram, the
 network, or the live groups. They cover the pre-existing behaviour as well as
 the new, so they are the guard against a change quietly altering something that
 already worked.
@@ -99,6 +99,12 @@ nothing.
   Ethan and Larry only.
 - **Never act on the bot's own messages.** The handling groups are also payment
   sources, so without that guard a forward would loop.
+- **The crew are never told about anything that has gone wrong with the bot.**
+  They get exactly one message — the chase, "this is still waiting on a /out" —
+  and nothing else. A failed ❤, a failed send, a request ignored because the
+  flow is stopped, an unreachable DM: all of it goes to Ethan, or Ethan and
+  Larry. The crew cannot act on any of it, and telling them turns a chase they
+  respond to into noise they learn to ignore. Pinned by `test_redaction.py`.
 - **A private DM is a one-off, never a recurring chase.** `crew_told` and
   `admin_told` gate each to once per request. The repeating part is the group
   post, and only while nobody has acknowledged it.
@@ -276,8 +282,29 @@ The ❤ on the original request is the **only durable record** that a cashout wa
 actioned: the open requests live in memory and a redeploy wipes them. A request
 that was paid but never marked reads as still outstanding to anyone scrolling.
 
+**A `/out` settles the request it PAID, not the oldest one.** With two
+requests open in a handling group, taking `queue[0]` blindly hearted the wrong
+one: the person who asked was left with an unmarked request still being chased,
+and somebody else's — for a different figure — was marked done without being
+paid. Seen live in `Chime Rev & out no-7` on 2026-08-04. `_match_request()` now
+reads the figure out of the `/out` and matches it against what each open request
+asked for. An explicit reply still wins outright; the oldest is still the
+fallback for a `/out` with no figure, or one matching nothing, because settling
+the wrong request can be undone and dropping a real `/out` strands a cashout.
+
+**Nothing in the code looks at who sent the request.** `open_cashout_request()`
+takes any sender, both dispatchers explicitly accept humans and bots, and
+`heart_request()` is called unconditionally. A ❤ that lands for some requests
+and not others is Telegram refusing the reaction at runtime, never routing.
+
 `heart_request()` tries the bot token first and falls back to the user account,
-which can react where the bot often cannot. **When both fail, Ethan is DMed with
+which can react where the bot often cannot. **That fallback has its own switch,
+`USERBOT_REACT` (default on), deliberately separate from `USERBOT_SEND`.**
+Reacting is not sending: `USERBOT_SEND=0` exists to stop the account posting
+messages on your behalf, and while the two shared a switch, turning off userbot
+messaging silently turned off the ❤ as well — leaving it dependent on the bot
+token alone, which frequently cannot react on somebody else's message. A paid
+cashout then reads as still outstanding. **When both fail, Ethan is DMed with
 the error** — it is not a cosmetic miss, and the alert says plainly that the
 money side is already done so nobody pays twice. A request that has simply been
 deleted is not a failure and raises nothing.
@@ -436,6 +463,7 @@ cashout requests.
 | `tests/test_heart.py` | A cashout that cannot be marked done is not silent |
 | `tests/test_switch.py` | `/cashout off` stops everything, and survives a redeploy |
 | `tests/test_redaction.py` | No crew name reaches a target group; every other route keeps them |
+| `tests/test_matching.py` | A `/out` settles the request it paid, not the oldest |
 | `backfill.py` | Manual one-off backfill, separate from the boot sweep |
 | `telethon_login.py` | Generates a `TELETHON_SESSION`; `--deploy` for Railway |
 

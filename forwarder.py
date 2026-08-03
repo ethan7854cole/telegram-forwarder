@@ -80,6 +80,18 @@ TELETHON_ENABLED = bool(API_ID and API_HASH)
 # people who have started the bot will get the private warning.
 USERBOT_SEND = os.getenv('USERBOT_SEND', '1') != '0'
 
+# Reacting is not sending, and lumping the two together costs the one thing that
+# must not be lost. USERBOT_SEND exists to stop the account posting MESSAGES on
+# your behalf. The ❤ is a single mark on a message that is already there, and it
+# is the ONLY durable record that a cashout was actioned - the open requests
+# live in memory and a redeploy wipes them.
+#
+# The bot token frequently cannot react on somebody else's message in a group,
+# so the user account is not a nicety here, it is the route that usually works.
+# Tying it to USERBOT_SEND meant turning off userbot messaging silently turned
+# off the ❤ as well, and a paid cashout then reads as still outstanding.
+USERBOT_REACT = os.getenv('USERBOT_REACT', '1') != '0'
+
 # Railway overlaps deploys: the replacement container boots while the outgoing
 # one is still alive. For Telethon that is fatal - two IPs on one auth key and
 # Telegram destroys the key permanently, which silently stops every forward
@@ -1264,7 +1276,7 @@ async def heart_request(chat_id, message_id):
         print(f"⚠️ [CASHOUT] bot could not react in {chat_name(chat_id)}: {e}",
               flush=True)
 
-    if USERBOT_SEND and _active_client is not None:
+    if USERBOT_REACT and _active_client is not None:
         try:
             entity = await _resolve_one(_active_client, chat_id)
             if entity is not None:
@@ -1280,7 +1292,9 @@ async def heart_request(chat_id, message_id):
             print(f"❌ [CASHOUT] user-account reaction failed in "
                   f"{chat_name(chat_id)}: {e}", flush=True)
     else:
-        user_error = 'no user account available (USERBOT_SEND off, or not connected)'
+        user_error = ('no user account available - USERBOT_REACT is off'
+                      if not USERBOT_REACT else
+                      'the user account is not connected yet')
 
     await notify_admin(
         f"⚠️ A cashout in {chat_name(chat_id)} was completed but could NOT be "
@@ -1526,15 +1540,48 @@ async def note_cashout_seen(chat_id, message_id, user_id, username, full_name=No
     return False
 
 
-def _match_request(queue, reply_to):
+# The figure a cashout request is ASKING for. "Amount : 25" is the shape the
+# notification bot uses; the loose "$25" is the fallback for one typed by hand.
+# Neither can match a cashtag, because a digit must follow the $.
+_REQUEST_AMOUNT_RE = re.compile(r'amount\s*[:\-]?\s*\$?\s*([\d,]+(?:\.\d+)?)', re.I)
+_LOOSE_AMOUNT_RE = re.compile(r'\$\s*([\d,]+(?:\.\d+)?)')
+
+
+def request_amount(text):
+    """What a cashout request is asking for, or None if it cannot be read."""
+    match = _REQUEST_AMOUNT_RE.search(text or '') or _LOOSE_AMOUNT_RE.search(text or '')
+    return _to_float(match.group(1)) if match else None
+
+
+def _match_request(queue, reply_to, text=None):
     """Which open request a /out is answering.
 
-    An explicit reply is unambiguous, so it wins. Otherwise the oldest open
-    request is taken, which is the order they are worked in."""
+    An explicit reply is unambiguous, so it wins.
+
+    Otherwise the AMOUNT decides. Taking the oldest request blindly was wrong in
+    the one case that matters: with two requests open, a /out paying the second
+    settled and hearted the FIRST. The person who asked was left with an
+    unmarked request still being chased, and somebody else's - for a different
+    figure entirely - was marked done without being paid. Seen live in
+    Chime Rev & out no-7 on 2026-08-04.
+
+    The oldest is still the fallback, for a /out with no figure or a figure
+    matching nothing, because settling the wrong request is recoverable and
+    dropping a real /out strands a cashout. Among several asking for the same
+    amount the oldest wins, which is the order they are worked in."""
     if reply_to:
         for request in queue:
             if request['message_id'] == reply_to:
                 return request
+
+    paid = _OUT_AMOUNT_RE.search(text or '')
+    if paid:
+        wanted = _to_float(paid.group(1))
+        if wanted is not None:
+            for request in queue:
+                if request_amount(request.get('text')) == wanted:
+                    return request
+
     return queue[0]
 
 
@@ -1553,7 +1600,7 @@ async def handle_cashout_reply(handling, text, user_id, username, reply_to,
 
     text = text or ''
     responder = _is_responder(user_id, username)
-    target = _match_request(queue, reply_to)
+    target = _match_request(queue, reply_to, text)
 
     # Read BEFORE the loop below sets it. The first thing a crew member says is
     # an acknowledgement; a later one, with still no /out, is not.

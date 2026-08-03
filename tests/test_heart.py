@@ -70,6 +70,7 @@ class FakeUserClient:
 
 f.bot = FakeBot()
 f.USERBOT_SEND = False
+f.USERBOT_REACT = False
 f._active_client = None
 
 failures = []
@@ -91,10 +92,10 @@ def reset(react_error=None, userbot=False, userbot_fails=False):
     if userbot:
         client = FakeUserClient()
         client.fail = userbot_fails
-        f.USERBOT_SEND = True
+        f.USERBOT_REACT = True
         f._active_client = client
     else:
-        f.USERBOT_SEND = False
+        f.USERBOT_REACT = False
         f._active_client = None
 
 
@@ -182,6 +183,26 @@ async def main():
     check('Total Out is still booked', f.ledger_snapshot(PICCASO)[1] == 25.0,
           str(f.ledger_snapshot(PICCASO)))
     check('and Ethan is told the mark is missing', len(admin_alerts()) == 1, str(dms))
+
+    # -- 7. the heart does not depend on userbot MESSAGING ------------------
+    # Reacting is not sending. USERBOT_SEND=0 keeps the account from posting
+    # messages on your behalf; it must not also cost the mark that says a
+    # cashout was actioned, since that is the only durable record there is.
+    reset(react_error='Bad Request: not enough rights to manage reactions',
+          userbot=True)
+    f.USERBOT_SEND = False              # messaging off...
+    ok = await f.heart_request(PICCASO, 906)
+    check('the heart still lands with userbot messaging off', ok is True)
+    check('placed through the account', len(user_reactions) == 1)
+    check('and Ethan is not troubled about it', admin_alerts() == [], str(dms))
+    f.USERBOT_SEND = False
+
+    # ...and USERBOT_REACT=0 is the way to genuinely turn it off.
+    reset(react_error='Bad Request: not enough rights to manage reactions')
+    ok = await f.heart_request(PICCASO, 907)
+    check('USERBOT_REACT=0 does disable the fallback', ok is False)
+    check('and the alert names that as the reason',
+          any('USERBOT_REACT is off' in t for t in admin_alerts()), str(dms))
 
     print()
     if failures:
