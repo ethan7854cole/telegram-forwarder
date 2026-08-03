@@ -17,7 +17,7 @@ python3 tests/run.py            # all suites
 python3 tests/run.py cashout    # only matching suites
 ```
 
-559 checks across 16 suites, all stubbed — nothing touches Telegram, the
+676 checks across 20 suites, all stubbed — nothing touches Telegram, the
 network, or the live groups. They cover the pre-existing behaviour as well as
 the new, so they are the guard against a change quietly altering something that
 already worked.
@@ -68,8 +68,8 @@ Media reaches the **cashout flow** in two cases, and no others:
 - **A `/out` written as a caption**, anywhere — `is_caption_out()`. The crew
   answer with the Cash App screenshot proving they sent the money and put the
   `/out` on it. The caption is relayed verbatim to the chime group that asked
-  and books that group's Total Out, exactly as a typed `/out` does; the
-  screenshot itself is not forwarded.
+  and books that group's Total Out, exactly as a typed `/out` does. **The
+  screenshot travels with it** — see "Relaying the screenshot" below.
 - **Anything at all posted in a handling group** — `media_concerns_cashout()`
   on the Bot API side, the `in_handling` gate on the Telethon side. A
   screenshot sent *instead* of the `/out` is the crew signalling they are
@@ -144,6 +144,119 @@ acknowledgement, not a problem, so the alert needs a prior acknowledgement.
 A `/out` at any point completes it. Stopping is not giving up — the request
 stays **open**, so a late `/out` is still forwarded, booked and hearted, and
 deleting either copy still settles it.
+
+## The emergency stop
+
+`/cashout off` takes the whole cashout flow out of service; `/cashout on` puts
+it back; bare `/cashout` says which it is. Ethan and Larry only, from a DM or
+from any of the four cashout groups — when this is needed it is needed from
+whatever chat is already open.
+
+Stopped means **stopped**: no request forwarded, nothing chased, no ledger
+moved, no `/out` booked. One check at the top of `observe_cashout()` covers
+every branch, and `cashout_watchdog()` skips its whole round.
+
+- **Nothing about it is ever posted in a group.** Not the stop, not the
+  resume, not a refusal — a refusal in a group would announce that a kill switch
+  exists, to exactly the people it is kept from. Typed in a group, even the
+  confirmation comes back as a DM to whoever ran it.
+- **It survives a redeploy.** Railway wipes the disk on every push, and the
+  incident that made somebody stop the flow is very often the reason a push is
+  coming — a switch held only in memory would turn itself back on at the worst
+  possible moment. The state lives in the DM to Ethan and Larry, which is both
+  the notification and the durable record.
+- **Recovery reads a private chat, which only the userbot can do.** A bot cannot
+  read its own history at all. `recover_cashout_switch()` asks the userbot for
+  the BOT as an entity — from a user account's side that is simply the DM with
+  it — and reads the newest marker back. This works because the userbot **is**
+  Ethan's or Larry's account. If that ever stops being true the switch stops
+  being durable, and the boot warning is what says so.
+- **Open requests are kept, not cancelled.** Stopping is a pause. Dropping them
+  would strand cashouts that were already in flight.
+- **It is not a silent hole.** A `CASHOUT REQUEST` or a `/out` arriving while
+  stopped is DMed to Ethan and Larry with its text, saying plainly that it was
+  not forwarded, booked or chased. Ordinary chatter is not reported.
+- **`/help` documents it and `/status` leads with it.** When the flow is
+  stopped `/status` says so on its first line, before the counts — which all
+  look perfectly normal while nothing is being forwarded. Both are rendered from
+  the live code and covered by tests, so the entry cannot quietly drift out.
+- **Failing to read it back changes nothing.** Guessing "running" could start
+  moving money that was deliberately stopped; guessing "stopped" would take the
+  flow out of service with nobody knowing why. The flag is left alone and a
+  person is told.
+- **Reading it back can never take the userbot down.** It runs inside
+  `run_userbot()`'s reconnect loop, so an exception escaping it is retried
+  forever and the userbot never finishes starting. The whole scan is guarded.
+  This was a real bug, caught by `test_caption` hanging.
+
+## Guarding against a duplicate request
+
+One cashout must produce one post, one ladder and one thing to answer. Three
+guards stack, and they catch different things:
+
+| Guard | Catches |
+|---|---|
+| `_is_duplicate(('cashout', source, id))` | The **same message** reaching both input paths. Keys off the message id. |
+| `_cashout_claims` | The same request **still being posted** — the window between deciding to post and having posted. |
+| `_pending_cashouts` fingerprint scan | The same request text arriving again while the first is **open**, within `CASHOUT_DEDUP_SECONDS` (120). |
+
+The middle one is the fix for the 2026-08-04 duplicate, and it is worth
+understanding why the other two could not catch it. The fingerprint scan
+compares against `_pending_cashouts`, but that entry is only written **after**
+`bot.send_message()` returns — and that is an `await` on a network call. asyncio
+runs the next ready task inside it, so a second copy arriving in the window
+compared itself against a list that was still empty, passed, and posted. Both
+then appended, so the group got two posts, two ladders and two DMs. **This needs
+no second container** — one process racing itself is enough, which is why it
+survived every fix aimed at the deploy changeover.
+
+- **Claim before the send, with no `await` in between.** The look and the claim
+  have to be one indivisible step, or it is the same race one level down.
+- **Hand over on success.** The claim is released the moment the request is on
+  `_pending_cashouts`, which then answers the question. Two windows that can
+  disagree is how the guard would start refusing a *genuine* second cashout —
+  the one that legitimately arrives right after the first is paid.
+- **Release on failure.** A claim held for a post that never happened would
+  swallow the retry, and the group would then be told nothing at all. A silent
+  miss is worse than the duplicate this guards against.
+- Reproduced by `tests/test_race.py`, which drives the copies through
+  `asyncio.gather`. The sequential version of the same case (`test_cashout.py`
+  7b) passed throughout — **awaiting two calls one after the other cannot
+  reproduce a race**, because the first completes before the second starts.
+
+## Relaying the screenshot
+
+The `/out` answering a request is usually written as the caption on the Cash App
+screenshot proving the money went. Both travel to the chime group that asked, as
+**one message**: the picture, with the `/out` as its caption.
+
+- **`copy_message`, never `forward_message`.** A forward carries a "Forwarded
+  from" header naming the account it came from and links back to the handling
+  group. The chime groups are never told who handles their cashouts, or that the
+  handling group exists at all. A copy arrives as an ordinary message from the
+  bot with no sender, no username and no back-link.
+- **The `/out` outranks the picture.** If the copy fails for any reason the
+  instruction is still sent on its own, because losing the screenshot is a
+  nuisance and losing the `/out` strands a real cashout.
+- **Only when the `/out` is on it.** A screenshot posted *instead* of the `/out`
+  is the crew signalling they are stuck — it raises the alarm through
+  `flag_cashout_issue()` and is not relayed anywhere.
+
+## Marking a cashout done
+
+The ❤ on the original request is the **only durable record** that a cashout was
+actioned: the open requests live in memory and a redeploy wipes them. A request
+that was paid but never marked reads as still outstanding to anyone scrolling.
+
+`heart_request()` tries the bot token first and falls back to the user account,
+which can react where the bot often cannot. **When both fail, Ethan is DMed with
+the error** — it is not a cosmetic miss, and the alert says plainly that the
+money side is already done so nobody pays twice. A request that has simply been
+deleted is not a failure and raises nothing.
+
+The usual causes are the bot not being an administrator in that group, or the
+group restricting which reactions may be used. Neither is visible from the code,
+which is why the error text is carried into the DM.
 
 ## Retracting a payment
 
@@ -265,12 +378,14 @@ cashout requests.
   *requests* are guarded (`CASHOUT_DEDUP_SECONDS`); payments are not.
 - **Two containers still cannot be prevented from in-process.** The duplicate
   guard is per-request state held in memory, so two overlapping Railway
-  containers each see a clean slate. **Confirmed as the real cause** of the
-  2026-08-03 duplicate: the logs show `[CONFLICT] Another process is polling
-  this token` and two independent `reminder #1` rounds for one request. Three
-  things now narrow the window — the SIGTERM fix above, `TELETHON_START_DELAY`,
-  and `BOT_START_DELAY` — but a genuine second *service* would defeat all of
-  them. That is a Railway-side fix.
+  containers each see a clean slate. The logs from 2026-08-03 show `[CONFLICT]
+  Another process is polling this token` and two independent `reminder #1`
+  rounds for one request. Three things narrow the window — the SIGTERM fix
+  above, `TELETHON_START_DELAY`, and `BOT_START_DELAY` — but a genuine second
+  *service* would defeat all of them. That is a Railway-side fix.
+
+  **This is no longer the only way to get a duplicate, and was not the cause of
+  the one on 2026-08-04.** See below.
 - **A near-miss keyword is silent.** `CASH OUT REQUEST` matches nothing,
   forwards nowhere, and tells nobody — indistinguishable from a quiet day.
 - **The idle watchdog covers only the two CHIME groups**, not the VENMO targets.
@@ -288,6 +403,10 @@ cashout requests.
 | `tests/test_startup.py` | Polling waits out the changeover; the conflict watcher |
 | `tests/test_mentions.py` | An `@` in a muted group arrives as a DM |
 | `tests/test_retract.py` | Reacting to a payment undoes it in the target |
+| `tests/test_race.py` | Two copies of one request arriving at the same moment |
+| `tests/test_screenshot.py` | The screenshot travels with the `/out`, carrying no identity |
+| `tests/test_heart.py` | A cashout that cannot be marked done is not silent |
+| `tests/test_switch.py` | `/cashout off` stops everything, and survives a redeploy |
 | `backfill.py` | Manual one-off backfill, separate from the boot sweep |
 | `telethon_login.py` | Generates a `TELETHON_SESSION`; `--deploy` for Railway |
 

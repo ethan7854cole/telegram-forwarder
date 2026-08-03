@@ -844,6 +844,169 @@ _OUT_AMOUNT_RE = re.compile(r'/out(?:@\w+)?\s+\$?\s*([\d,]+(?:\.\d+)?)', re.I)
 # handling chat id -> [request, ...], oldest first
 _pending_cashouts = {}
 
+# handling chat id -> {fingerprint: when it was claimed}
+#
+# _pending_cashouts is only written AFTER the request has been posted, and
+# posting is an await on a network call. asyncio runs the next ready task inside
+# that await, so a second copy of the same request arriving in the window
+# compares itself against a list that is still empty, passes, and posts again -
+# two identical messages in the handling group, two escalation ladders and two
+# things to answer for one cashout. That is a single-container bug: it needs no
+# second Railway process, only two copies close enough together.
+#
+# The claim is taken BEFORE the send, with no await between deciding and
+# recording, so nothing can interleave. This is what _pending_cashouts cannot
+# be: a record of a request that is still in flight.
+#
+# It is held for the length of the send and no longer - once the request is on
+# _pending_cashouts, that list answers the question and the claim is dropped.
+# Giving the claim its own window would mean two clocks that can disagree, and
+# a claim outliving the request it stood for would refuse the genuine second
+# cashout that arrives right after the first is paid.
+_cashout_claims = {}
+
+
+def _claim_cashout(handling, fingerprint, now):
+    """Reserve this request text, or report that somebody already holds it.
+
+    Contains no await on purpose. The look and the claim have to be one
+    indivisible step, or this is just the same race one level down."""
+    if not CASHOUT_DEDUP_SECONDS:
+        return True
+    claims = _cashout_claims.setdefault(handling, {})
+    for held, claimed in list(claims.items()):
+        # Only reachable if a send neither returned nor raised for the whole
+        # window. Nothing should sit here that long; this is the safety net that
+        # stops one wedged send from muting a route for good.
+        if (now - claimed).total_seconds() > CASHOUT_DEDUP_SECONDS:
+            del claims[held]
+    if fingerprint in claims:
+        return False
+    claims[fingerprint] = now
+    return True
+
+
+def _release_cashout(handling, fingerprint):
+    """Give the claim back when the post never happened.
+
+    A claim held for a message that failed to send would swallow the next
+    genuine attempt, and the group would then be told nothing at all - a silent
+    miss, which is worse than the duplicate this guards against."""
+    claims = _cashout_claims.get(handling)
+    if claims:
+        claims.pop(fingerprint, None)
+        if not claims:
+            _cashout_claims.pop(handling, None)
+
+
+# ---------------------------------------------------------------------------
+# Emergency stop
+#
+# One switch that takes the whole cashout flow out of service: nothing
+# forwarded, nothing chased, no ledger moved. For when something is going wrong
+# and the right move is to stop the bot touching real money until a person has
+# looked at it.
+#
+# It has to survive a redeploy, and that is the hard part. Railway wipes the
+# disk and boots a replacement container on every push, so a switch held only in
+# memory would turn itself back ON at the worst possible moment - the incident
+# is very often the reason somebody is about to push. So the state lives in a
+# message, the same way the ledger does, and is read back on boot.
+#
+# That message goes in the PRIVATE chat with Ethan and Larry, never in a group.
+# Which means the marker has to be readable from a private chat, and a bot
+# cannot read its own history at all - only the userbot can. It works because
+# the userbot IS one of their accounts, so the bot's DM to them is a
+# conversation the userbot can open and read back. See recover_cashout_switch().
+#
+# Silent in the groups, but never silent to a person: anything real that arrives
+# while the stop is on is reported to Ethan and Larry rather than dropped.
+# ---------------------------------------------------------------------------
+
+CASHOUT_STOP_MARK = '⏸️ CASHOUT FORWARDING STOPPED'
+CASHOUT_RESUME_MARK = '▶️ CASHOUT FORWARDING RESUMED'
+
+_cashout_stopped = False
+_cashout_stopped_by = None
+
+
+def cashout_stopped():
+    return _cashout_stopped
+
+
+async def set_cashout_stopped(stopping, who=None):
+    """Take the cashout flow out of service, or put it back.
+
+    The order differs by direction, and both directions fail safe. STOPPING
+    sets the flag FIRST: the point of the switch is that it takes effect at
+    once, and a marker that fails to post must never leave the flow running.
+    RESUMING posts the marker first and only then clears the flag, so the flow
+    is never live without a record saying so.
+
+    Returns the chats the marker could not be posted to. An empty list means the
+    state will survive the next redeploy."""
+    global _cashout_stopped, _cashout_stopped_by
+
+    if stopping:
+        _cashout_stopped = True
+        _cashout_stopped_by = who
+
+    stamp = datetime.now(LOCAL_TZ).strftime('%I:%M %p - %d %b %Y')
+    if stopping:
+        body = (f"{CASHOUT_STOP_MARK}\n\n"
+                "Cashout requests are NOT being forwarded and nothing is being "
+                "chased. Nothing has been posted in any group.\n\n"
+                f"Stopped at {stamp}"
+                f"{f' by {who}' if who else ''}.\n\n"
+                "Send /cashout on to start it again.")
+    else:
+        body = (f"{CASHOUT_RESUME_MARK}\n\n"
+                "Cashout requests are being forwarded again as normal.\n\n"
+                f"Resumed at {stamp}"
+                f"{f' by {who}' if who else ''}.")
+
+    # Private only. Nothing about the switch is ever posted in a group - not the
+    # stop, not the resume. This message is also the durable record, which is
+    # why it is sent even when nobody needs telling.
+    failed = await dm_handles(CASHOUT_ADMIN_HANDLES, body)
+    await warn_unreachable(failed)
+
+    if not stopping:
+        # The record exists. Only now does the flow go live again.
+        _cashout_stopped = False
+        _cashout_stopped_by = None
+
+    print(f"{'⏸️' if stopping else '▶️'} [SWITCH] cashout forwarding "
+          f"{'STOPPED' if stopping else 'RESUMED'}"
+          f"{f' by {who}' if who else ''}"
+          f"{f' - could not reach {failed}' if failed else ''}", flush=True)
+    return failed
+
+
+async def _note_while_stopped(chat_id, text, user_id, username):
+    """Report anything real that the stop swallowed.
+
+    The switch must not become a silent hole. A cashout request that arrived
+    while the flow was out of service, or a /out answering one, is real money
+    that nobody would otherwise hear about - which is the failure this whole bot
+    exists to prevent. Ordinary chatter in those groups is not reported."""
+    text = text or ''
+    source = _canonical(chat_id, CASHOUT_ROUTES)
+    if source is not None and CASHOUT_KEYWORD.lower() in text.lower():
+        what = f"A CASHOUT REQUEST arrived in {chat_name(source)}"
+    elif _canonical(chat_id, _CASHOUT_HANDLERS) is not None and _OUT_CMD_RE.search(text):
+        what = f"A /out was sent in {chat_name(chat_id)}"
+    else:
+        return                              # not something the flow would act on
+
+    print(f"⏸️ [SWITCH] ignored while stopped: {what}", flush=True)
+    await warn_unreachable(await dm_handles(
+        CASHOUT_ADMIN_HANDLES,
+        f"⏸️ {what}, but cashout forwarding is STOPPED.\n\n"
+        f"{' '.join(text.split())[:300]}\n\n"
+        "It has NOT been forwarded, booked or chased, and nobody else has been "
+        "told. Handle it by hand, or send /cashout on to start the flow again."))
+
 
 def is_caption_out(text):
     """Does this media caption carry a /out?
@@ -965,7 +1128,15 @@ async def heart_request(chat_id, message_id):
     Falls back to the user account because the bot may not be able to react on
     someone else's message in that chat, and the account already can. A message
     that has been deleted is not an error and gets no retry - there is nothing
-    left to mark."""
+    left to mark.
+
+    Both routes failing is NOT a cosmetic miss. The ❤ is the durable record that
+    a request was actioned - the only one, since the open requests themselves
+    live in memory and a redeploy wipes them. A cashout that was paid but never
+    marked reads as still outstanding to anyone scrolling the group. So when
+    neither route can place it, Ethan is told, with the error, rather than it
+    ending as one line in a log nobody is reading."""
+    bot_error = user_error = None
     try:
         await bot.set_message_reaction(chat_id, message_id,
                                        [ReactionTypeEmoji(CASHOUT_HEART)])
@@ -976,6 +1147,7 @@ async def heart_request(chat_id, message_id):
             print(f"🗑️ [CASHOUT] request {message_id} in {chat_name(chat_id)} is "
                   "gone - nothing to heart, leaving it.", flush=True)
             return False
+        bot_error = e
         print(f"⚠️ [CASHOUT] bot could not react in {chat_name(chat_id)}: {e}",
               flush=True)
 
@@ -989,9 +1161,25 @@ async def heart_request(chat_id, message_id):
                 print(f"❤️ [CASHOUT] hearted {message_id} in {chat_name(chat_id)} "
                       "via user account", flush=True)
                 return True
+            user_error = 'the user account could not resolve that chat'
         except Exception as e:
+            user_error = e
             print(f"❌ [CASHOUT] user-account reaction failed in "
                   f"{chat_name(chat_id)}: {e}", flush=True)
+    else:
+        user_error = 'no user account available (USERBOT_SEND off, or not connected)'
+
+    await notify_admin(
+        f"⚠️ A cashout in {chat_name(chat_id)} was completed but could NOT be "
+        f"marked with the {CASHOUT_HEART}.\n\n"
+        f"Request message: {message_id}\n"
+        f"Bot: {bot_error}\n"
+        f"User account: {user_error}\n\n"
+        "The money side is done - the /out was sent and the totals are booked. "
+        "Only the mark is missing, so that request will look outstanding in the "
+        "group. Placing it by hand settles it.\n\n"
+        "If this keeps happening the bot is most likely not an administrator in "
+        "that group, or the group restricts which reactions may be used.")
     return False
 
 
@@ -1022,10 +1210,18 @@ async def open_cashout_request(source, text, sent_at, origin_msg_id):
                       "second copy", flush=True)
                 return
 
+    # The check above can only see requests that finished posting. This covers
+    # the one still in flight - see _cashout_claims.
+    if not _claim_cashout(handling, fingerprint, now):
+        print(f"🔁 [CASHOUT] identical request already being posted to "
+              f"{chat_name(handling)} - not posting a second copy", flush=True)
+        return
+
     body = f"{correct_timestamp(text, sent_at)}\n\n{CASHOUT_MENTIONS}"
     try:
         sent = await bot.send_message(handling, body)
     except Exception as e:
+        _release_cashout(handling, fingerprint)
         print(f"❌ [CASHOUT] could not post {chat_name(source)} request to "
               f"{chat_name(handling)}: {e}", flush=True)
         await notify_admin(
@@ -1058,6 +1254,12 @@ async def open_cashout_request(source, text, sent_at, origin_msg_id):
         'exhausted': False,
     }
     _pending_cashouts.setdefault(handling, []).append(request)
+    # Handover. The request is now on the books, and the check at the top of
+    # this function can see it, so the claim has done its job. Releasing here
+    # rather than on a clock of its own keeps _pending_cashouts the single
+    # answer to "is this a duplicate" - two windows that could disagree is how
+    # the guard would start refusing genuine second cashouts.
+    _release_cashout(handling, fingerprint)
     print(f"📤 [CASHOUT] {chat_name(source)} -> {chat_name(handling)} "
           f"(msg {sent.message_id}), waiting {CASHOUT_TIMEOUT_MINUTES}m for /out",
           flush=True)
@@ -1224,11 +1426,14 @@ def _match_request(queue, reply_to):
 
 
 async def handle_cashout_reply(handling, text, user_id, username, reply_to,
-                               full_name=None):
+                               full_name=None, message_id=None, has_media=False):
     """A message in a handling group, while at least one request is open there.
 
     Nothing here runs unless a request we forwarded is genuinely outstanding, so
-    ordinary traffic - including an ordinary /out - is never touched."""
+    ordinary traffic - including an ordinary /out - is never touched.
+
+    `message_id` and `has_media` are what let the screenshot travel with the
+    /out - see the copy_message call below."""
     queue = _pending_cashouts.get(handling)
     if not queue:
         return
@@ -1259,14 +1464,39 @@ async def handle_cashout_reply(handling, text, user_id, username, reply_to,
     request = target
     # Normally the group that asked, but a route may send the /out elsewhere.
     out_to = request.get('out_to', request['origin'])
-    try:
-        await bot.send_message(out_to, text)
-    except Exception as e:
-        # Left open deliberately: the request is not settled until the /out has
-        # actually landed somewhere anyone can see it.
-        print(f"❌ [CASHOUT] /out could not be sent to {chat_name(out_to)}: {e}",
-              flush=True)
-        return
+
+    # The screenshot is the proof the money went, and the group that asked is
+    # the group that wants to see it.
+    #
+    # copy_message, NEVER forward_message. A forward carries a "Forwarded from"
+    # header naming the account it came from, and links back to the handling
+    # group - the chime groups are never told who handles their cashouts, or
+    # that the handling group exists at all. A copy arrives as an ordinary
+    # message from the bot: the picture, the /out as its caption, and no trace
+    # of the sender, their username or the chat it was taken from.
+    delivered = False
+    if has_media and message_id is not None:
+        try:
+            await bot.copy_message(out_to, handling, message_id, caption=text)
+            delivered = True
+            print(f"🖼️ [CASHOUT] screenshot + /out copied to {chat_name(out_to)}",
+                  flush=True)
+        except Exception as e:
+            # Losing the picture is a nuisance; losing the /out strands the
+            # cashout. Fall through and send the instruction on its own.
+            print(f"⚠️ [CASHOUT] could not copy the screenshot to "
+                  f"{chat_name(out_to)}: {e} - sending the /out by itself",
+                  flush=True)
+
+    if not delivered:
+        try:
+            await bot.send_message(out_to, text)
+        except Exception as e:
+            # Left open deliberately: the request is not settled until the /out
+            # has actually landed somewhere anyone can see it.
+            print(f"❌ [CASHOUT] /out could not be sent to {chat_name(out_to)}: {e}",
+                  flush=True)
+            return
 
     queue.remove(request)
     if not queue:
@@ -1312,6 +1542,13 @@ async def observe_cashout(chat_id, text, message_id, sent_at,
     if BOT_ID is not None and user_id == BOT_ID:
         return                              # never act on our own posts
 
+    # The emergency stop sits here, above every branch, so ONE check covers
+    # opening a request, answering one and flagging a problem with one. Anything
+    # real that this swallows is reported rather than dropped.
+    if _cashout_stopped:
+        await _note_while_stopped(chat_id, text, user_id, username)
+        return
+
     source = _canonical(chat_id, CASHOUT_ROUTES)
     if source is not None:
         if not text or CASHOUT_KEYWORD.lower() not in text.lower():
@@ -1326,7 +1563,8 @@ async def observe_cashout(chat_id, text, message_id, sent_at,
         if _is_duplicate(('cashout-reply', handling, message_id)):
             return
         await handle_cashout_reply(handling, text, user_id, username, reply_to,
-                                   full_name)
+                                   full_name, message_id=message_id,
+                                   has_media=has_media)
 
 
 async def _confirm_gone(client, chat, msg_id):
@@ -1511,6 +1749,13 @@ async def cashout_watchdog():
     while True:
         await asyncio.sleep(20)
         now = datetime.now(timezone.utc)
+
+        # Out of service: no reminders, no escalation DMs. The open requests are
+        # deliberately KEPT rather than dropped - stopping is a pause, and
+        # resuming has to find them still there.
+        if _cashout_stopped:
+            continue
+
         for handling, queue in list(_pending_cashouts.items()):
             for request in list(queue):
                 if request['exhausted']:
@@ -1906,10 +2151,17 @@ async def status(message):
         paused = sorted(t for t in IDLE_ALERT_CHATS if _idle_slot(t)['paused'])
         prompts = ('off in ' + ', '.join(str(t) for t in paused)) if paused else 'on'
         open_requests = sum(len(q) for q in _pending_cashouts.values())
-        txt = (f"Bot Online\nGroups: {len(FORWARD_RULES)}\n"
+        # First line when it is off, not buried at the bottom. Somebody reading
+        # /status during an incident needs to know the flow is out of service
+        # before they read anything else - the counts below all look normal
+        # while nothing is actually being forwarded.
+        heading = ('⏸️ CASHOUT FORWARDING IS STOPPED - /cashout on to start it\n\n'
+                   if _cashout_stopped else '')
+        txt = (f"{heading}Bot Online\nGroups: {len(FORWARD_RULES)}\n"
                f"Forwarded: {forwarded_count}\nUptime: {get_uptime()}\n"
                f"Userbot: {userbot_status}\n"
                f"Payment prompts: {prompts}\n"
+               f"Cashout flow: {'STOPPED' if _cashout_stopped else 'running'}\n"
                f"Cashouts awaiting /out: {open_requests}")
         await bot.reply_to(message, txt)
 
@@ -1942,6 +2194,18 @@ async def help_command(message):
         "/pause piccaso — stops them in CHIME PICCASO only\n"
         "/resume — starts them again, same three forms\n"
         "\n"
+        "EMERGENCY STOP — from here, or from any cashout group\n"
+        "\n"
+        "/cashout off — stops the whole cashout flow: nothing\n"
+        "forwarded, nothing chased, no totals moved. Open\n"
+        "requests are kept, not cancelled.\n"
+        "/cashout on — starts it again\n"
+        "/cashout — says which it currently is\n"
+        "Nothing is ever posted in a group — the switch is\n"
+        "private to you and Larry. It survives a redeploy,\n"
+        "and anything real that arrives while stopped is\n"
+        "sent to you both.\n"
+        "\n"
         "CASHOUTS — automatic, nothing to type\n"
         "\n"
         f"A \"{CASHOUT_KEYWORD}\" in CHIME PICCASO or CHIME GAFFER is\n"
@@ -1956,7 +2220,8 @@ async def help_command(message):
         "\n"
         "INFO\n"
         "\n"
-        "/status — bot state, userbot, which groups are paused\n"
+        "/status — bot state, userbot, paused groups, and\n"
+        "whether the cashout flow is stopped\n"
         "/ping — quick alive check\n"
         "/help — this list\n"
         "\n"
@@ -2128,6 +2393,97 @@ async def idle_pause_command(message):
     set_idle_paused(chat_id, pausing)
     print(f"{'🔇' if pausing else '🔔'} [IDLE] {chat_id} "
           f"{'paused' if pausing else 'resumed'} by {user_id}", flush=True)
+
+
+@bot.message_handler(commands=['cashout'])
+async def cashout_switch_command(message):
+    """/cashout off - stop the whole cashout flow. /cashout on - start it again.
+
+    Bare /cashout reports the state. Ethan and Larry only, from a DM or from any
+    of the cashout groups, because when this is needed it is needed from
+    whatever chat is already open."""
+    chat_id = message.chat.id
+    user_id = getattr(message.from_user, 'id', None)
+
+    in_dm = chat_id in LEDGER_ADMINS
+    in_cashout_chat = (_canonical(chat_id, CASHOUT_ROUTES) is not None
+                       or _canonical(chat_id, _CASHOUT_HANDLERS) is not None)
+    if not (in_dm or in_cashout_chat):
+        return
+
+    # Every answer this command gives is private. Typed in a group, replying
+    # there would put the switch in front of the crew - which is the one thing
+    # it must never do, and the reason a refusal is silent there too rather than
+    # announcing that a kill switch exists.
+    async def answer(text):
+        if in_dm:
+            await bot.reply_to(message, text)
+        else:
+            try:
+                await bot.send_message(user_id, text)
+            except Exception as e:
+                print(f"⚠️ [SWITCH] could not confirm privately to {user_id}: {e}",
+                      flush=True)
+
+    if user_id not in LEDGER_ADMINS:
+        # Logged, never answered. In a group a refusal would announce that a
+        # kill switch exists, to exactly the people it is kept from; and the
+        # only private chats this command is accepted in are Ethan's and
+        # Larry's, so there is nobody else here to answer.
+        print(f"⛔ [SWITCH] /cashout by {user_id} denied in {chat_id}", flush=True)
+        return
+
+    parts = (message.text or '').split()
+    argument = parts[1].lower() if len(parts) > 1 else ''
+    who = f"@{getattr(message.from_user, 'username', None) or user_id}"
+
+    if argument in ('off', 'stop'):
+        if _cashout_stopped:
+            await answer("⏸️ Already stopped. /cashout on to start it.")
+            return
+        failed = await set_cashout_stopped(True, who)
+        open_now = sum(len(q) for q in _pending_cashouts.values())
+        # The private message IS the durable record, so failing to deliver it
+        # means the stop will not survive the next deploy. Say so plainly.
+        warning = ('\n\n⚠️ Could not reach ' + ', '.join(f'@{h}' for h in failed)
+                   + ', so this will NOT survive a redeploy. Check /cashout again '
+                     'after the next deploy.') if failed else ''
+        await answer(
+            "⏸️ Cashout forwarding STOPPED.\n\n"
+            "No requests forwarded, nothing chased, no totals moved.\n"
+            "Nothing has been posted in any group.\n"
+            f"{open_now} request(s) already open are kept, not cancelled.\n\n"
+            "Anything real that arrives while stopped is sent to you and Larry "
+            "instead of being dropped.\n\n"
+            "Send /cashout on to start it again." + warning)
+        return
+
+    if argument in ('on', 'start'):
+        if not _cashout_stopped:
+            await answer("▶️ Already running.")
+            return
+        failed = await set_cashout_stopped(False, who)
+        open_now = sum(len(q) for q in _pending_cashouts.values())
+        await answer(
+            "▶️ Cashout forwarding RESUMED.\n\n"
+            "Nothing was posted in any group.\n\n"
+            f"{open_now} request(s) still open; chasing continues from here.\n\n"
+            "Anything that arrived while it was stopped was NOT queued - if you "
+            "were told about one, it still needs handling by hand.")
+        return
+
+    open_now = sum(len(q) for q in _pending_cashouts.values())
+    if _cashout_stopped:
+        await answer(
+            "⏸️ Cashout forwarding is STOPPED"
+            f"{f' (by {_cashout_stopped_by})' if _cashout_stopped_by else ''}.\n\n"
+            f"{open_now} request(s) held open.\n\n"
+            "Send /cashout on to start it again.")
+    else:
+        await answer(
+            "▶️ Cashout forwarding is running normally.\n\n"
+            f"{open_now} request(s) open.\n\n"
+            "Send /cashout off to stop everything.")
 
 
 @bot.message_handler(commands=['set'])
@@ -2551,6 +2907,86 @@ async def recover_one_ledger(client, target):
     return False
 
 
+async def recover_cashout_switch(client):
+    """Restore the emergency stop from the last marker the bot published.
+
+    The same principle as recover_ledgers(): Railway wipes the disk on every
+    deploy, so a message is the durable record. Without this, /cashout off would
+    quietly undo itself on the next push - and the incident that made somebody
+    stop the flow is very often the reason a push is coming.
+
+    The marker is private, so it cannot be read the way the ledger is. A bot
+    cannot read its own history at all; only a user account can. This works
+    because the userbot IS Ethan's or Larry's account, so the bot's DM to them
+    is simply one of the userbot's own conversations - opened here by asking for
+    the BOT as an entity, which from the user account's side is that chat.
+
+    Failing to read is NOT treated as "running": it leaves the flag alone and
+    says so, because guessing wrong in that direction starts moving real
+    money."""
+    global _cashout_stopped, _cashout_stopped_by
+
+    newest = None
+    reachable = False
+    # The WHOLE scan is guarded. This runs inside run_userbot()'s reconnect
+    # loop, so anything escaping it is retried forever and the userbot never
+    # finishes starting - the boot equivalent of the SIGTERM handler that caused
+    # the exact failure it was written to prevent.
+    try:
+        entity = await client.get_entity(BOT_ID)
+        async for message in client.iter_messages(entity, limit=100):
+            sender = await message.get_sender()
+            if BOT_ID is None or getattr(sender, 'id', None) != BOT_ID:
+                continue               # our own side of the conversation
+            text = message.raw_text or ''
+            if CASHOUT_STOP_MARK in text:
+                newest = (message.date, True)
+            elif CASHOUT_RESUME_MARK in text:
+                newest = (message.date, False)
+            else:
+                continue
+            break                      # newest marker wins; history is newest first
+        reachable = True
+    except Exception as e:
+        print(f"⚠️ [SWITCH] could not read the switch back from the private "
+              f"chat: {e}", flush=True)
+
+    if not reachable:
+        # Neither direction is safe to assume. Guessing "running" could start
+        # moving money that was deliberately stopped; guessing "stopped" would
+        # take the flow out of service with nobody knowing why. So change
+        # nothing and make sure a person is told.
+        print("⚠️ [SWITCH] the private chat could not be read - leaving the switch "
+              f"as it is ({'STOPPED' if _cashout_stopped else 'running'}).",
+              flush=True)
+        await warn_unreachable(await dm_handles(
+            CASHOUT_ADMIN_HANDLES,
+            "⚠️ On starting up, the bot could not read back whether cashout "
+            "forwarding was stopped.\n\n"
+            f"It is currently {'STOPPED' if _cashout_stopped else 'RUNNING'}, "
+            "which is the default and may not be what you left it as.\n\n"
+            "Send /cashout to check, and /cashout off if it should be stopped."))
+        return
+
+    if newest is None:
+        print("▶️ [SWITCH] no marker found - cashout forwarding is running.",
+              flush=True)
+        return
+
+    _cashout_stopped = newest[1]
+    _cashout_stopped_by = None
+    print(f"{'⏸️' if newest[1] else '▶️'} [SWITCH] recovered from the groups: "
+          f"cashout forwarding is {'STOPPED' if newest[1] else 'running'} "
+          f"(marker from {newest[0]:%m-%d %H:%M})", flush=True)
+    if newest[1]:
+        await warn_unreachable(await dm_handles(
+            CASHOUT_ADMIN_HANDLES,
+            "⏸️ This bot has just restarted and cashout forwarding is still "
+            "STOPPED, as it was before the restart.\n\n"
+            "Nothing is being forwarded or chased. Send /cashout on when you "
+            "want it back."))
+
+
 async def recover_ledgers(client):
     """Rebuild every target's ledger from the last totals this bot published.
 
@@ -2691,6 +3127,9 @@ async def run_userbot():
                 await ready.wait()
                 await close_deleted_cashouts(client, event.chat_id, event.deleted_ids)
 
+            # Before the ledgers: if the flow was stopped, that has to be true
+            # again the moment this container starts handling anything.
+            await recover_cashout_switch(client)
             await recover_ledgers(client)
             try:
                 await catch_up(client)
