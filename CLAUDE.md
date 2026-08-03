@@ -17,7 +17,7 @@ python3 tests/run.py            # all suites
 python3 tests/run.py cashout    # only matching suites
 ```
 
-455 checks across 13 suites, all stubbed — nothing touches Telegram, the
+473 checks across 14 suites, all stubbed — nothing touches Telegram, the
 network, or the live groups. They cover the pre-existing behaviour as well as
 the new, so they are the guard against a change quietly altering something that
 already worked.
@@ -145,6 +145,24 @@ A `/out` at any point completes it. Stopping is not giving up — the request
 stays **open**, so a late `/out` is still forwarded, booked and hearted, and
 deleting either copy still settles it.
 
+## The deploy changeover
+
+Railway boots the replacement container before the outgoing one has gone, so
+for a few seconds two of everything is live. Three separate things keep that
+from doing damage, and all three are needed:
+
+| | What it protects |
+|---|---|
+| `_schedule_disconnect()` | The outgoing container actually **leaves** on SIGTERM. It is PID 1, so an unhandled signal is ignored; and until 2026-08-03 the handler itself crashed and never reached `os._exit`. |
+| `TELETHON_START_DELAY` | Two user sessions on one auth key from two IPs makes Telegram **destroy the key**, stopping all forwarding. Both sessions also receive every message, which is what **duplicates** posts. |
+| `BOT_START_DELAY` | Two pollers **split** the updates — Telegram gives each to exactly one. The container holding the open cashout requests may not be the one that gets the `/out`, and it is then dropped as ordinary traffic. |
+
+The two holds are not equivalent in cost. Deferring the Bot API poll loses
+**nothing**: Telegram queues updates server-side for 24 hours and delivers the
+backlog on the first poll. The userbot hold is genuinely deaf, which is what
+`catch_up()` exists to repair afterwards — and it repairs payments only, not
+cashout requests.
+
 ## Gotchas
 
 - A stale `~/forwarder.py` (unrelated, 1.5 KB) sits in the home directory, and
@@ -176,17 +194,14 @@ deleting either copy still settles it.
 - **A duplicate payment is not detected.** When the catch-up sweep re-sent a
   window in Aug 2026, it re-booked every amount and nothing noticed. Cashout
   *requests* are guarded (`CASHOUT_DEDUP_SECONDS`); payments are not.
-- **Nothing in-process can stop two containers double-posting.** The duplicate
+- **Two containers still cannot be prevented from in-process.** The duplicate
   guard is per-request state held in memory, so two overlapping Railway
-  containers each see a clean slate and each post once. **Confirmed as the real
-  cause** of the 2026-08-03 duplicate: the logs show `[CONFLICT] Another process
-  is polling this token` and two independent `reminder #1` rounds for one
-  request. The broken SIGTERM handler above made the overlap far longer than it
-  should have been; that is fixed, but `TELETHON_START_DELAY` only holds back
-  the *userbot*. The new container starts polling the Bot API immediately, and
-  the cashout flow runs off both paths — so a deploy can still overlap. The
-  structural fix is on Railway's side (stop the old container before starting
-  the new one), not in this file.
+  containers each see a clean slate. **Confirmed as the real cause** of the
+  2026-08-03 duplicate: the logs show `[CONFLICT] Another process is polling
+  this token` and two independent `reminder #1` rounds for one request. Three
+  things now narrow the window — the SIGTERM fix above, `TELETHON_START_DELAY`,
+  and `BOT_START_DELAY` — but a genuine second *service* would defeat all of
+  them. That is a Railway-side fix.
 - **A near-miss keyword is silent.** `CASH OUT REQUEST` matches nothing,
   forwards nowhere, and tells nobody — indistinguishable from a quiet day.
 - **The idle watchdog covers only the two CHIME groups**, not the VENMO targets.
@@ -201,6 +216,7 @@ deleting either copy still settles it.
 | `tests/test_parity.py` | Both cashout routes must behave identically |
 | `tests/test_caption.py` | A `/out` captioning a screenshot, through both real dispatchers |
 | `tests/test_shutdown.py` | SIGTERM always reaches the exit, however the disconnect goes |
+| `tests/test_startup.py` | Polling waits out the changeover; the conflict watcher |
 | `backfill.py` | Manual one-off backfill, separate from the boot sweep |
 | `telethon_login.py` | Generates a `TELETHON_SESSION`; `--deploy` for Railway |
 

@@ -81,14 +81,27 @@ TELETHON_ENABLED = bool(API_ID and API_HASH)
 USERBOT_SEND = os.getenv('USERBOT_SEND', '1') != '0'
 
 # Railway overlaps deploys: the replacement container boots while the outgoing
-# one is still alive. For the Bot API that is a harmless getUpdates 409, but for
-# Telethon it is fatal - two IPs on one auth key and Telegram destroys the key
-# permanently, which silently stops every forward until someone logs in again.
-# Holding the new container back past the changeover keeps the two from ever
-# being connected at the same moment. Costs one quiet minute after a deploy.
+# one is still alive. For Telethon that is fatal - two IPs on one auth key and
+# Telegram destroys the key permanently, which silently stops every forward
+# until someone logs in again. Holding the new container back past the
+# changeover keeps the two from ever being connected at the same moment. Costs
+# one quiet minute after a deploy.
 ON_RAILWAY = bool(os.getenv('RAILWAY_ENVIRONMENT') or os.getenv('RAILWAY_SERVICE_ID')
                   or os.getenv('RAILWAY_PROJECT_ID'))
 TELETHON_START_DELAY = int(os.getenv('TELETHON_START_DELAY', '45' if ON_RAILWAY else '0'))
+
+# The Bot API poll is held back for exactly the same reason, which the getUpdates
+# 409 was long written off as "harmless". It is not. Telegram hands each update
+# to exactly ONE poller, so two containers do not duplicate - they SPLIT. The
+# outgoing container is the one holding the open cashout requests in memory, so
+# a /out that happens to land on the incoming container finds nothing pending
+# and is ignored as ordinary traffic. A real cashout goes unanswered and nothing
+# reports it.
+#
+# Waiting costs nothing here: Telegram queues updates server-side for 24 hours
+# and delivers the backlog the moment polling starts. Unlike the userbot, which
+# is genuinely deaf while held back, this only defers.
+BOT_START_DELAY = int(os.getenv('BOT_START_DELAY', str(TELETHON_START_DELAY)))
 
 # On connect, look back over this window and forward anything that was missed
 # while the listener was down. 0 disables the sweep. The cap is a guard against
@@ -139,7 +152,19 @@ class _ConflictWatcher:
     A 409 is worth shouting about because it is never only a polling problem.
     Every process polling this token is also running run_userbot() with the
     same TELETHON_SESSION from a different IP, and that is what makes Telegram
-    destroy the auth key and stop all forwarding."""
+    destroy the auth key and stop all forwarding.
+
+    It is also not the harmless thing it was once written off as. Telegram gives
+    each update to exactly ONE poller, so two containers SPLIT the updates
+    rather than duplicating them - and the open cashout requests live in the
+    memory of one of them. A /out delivered to the wrong container finds nothing
+    pending and is dropped as ordinary traffic."""
+
+    # run_bot() now waits BOT_START_DELAY before its first poll, so the deploy
+    # changeover should be over before this can fire at all. A conflict is
+    # therefore no longer the expected cost of a deploy, and the threshold is
+    # low: it means the hold was too short, or there really are two services.
+    ALERT_AFTER = int(os.getenv('BOT_CONFLICT_ALERTS', '5'))
 
     def __init__(self):
         self.conflicts = 0
@@ -154,18 +179,20 @@ class _ConflictWatcher:
         print(f"⚠️ [CONFLICT x{self.conflicts}] Another process is polling this "
               f"token.", flush=True)
 
-        # A Railway deploy changeover overlaps the old and new container for a
-        # few seconds, which is normal and self-clears. Sustained conflict is a
-        # genuine second instance.
-        if self.conflicts >= 15 and not self.warned:
+        if self.conflicts >= self.ALERT_AFTER and not self.warned:
             self.warned = True
             await notify_admin(
                 "🚨 TWO BOT INSTANCES ARE RUNNING on the same token.\n\n"
-                "Telegram keeps cutting one of them off (getUpdates 409). Both are "
-                "also using the same TELETHON_SESSION from different IPs, which "
-                "destroys the session key and stops ALL forwarding.\n\n"
-                "Check for a duplicate Railway service on this repo. Replacing "
-                "TELETHON_SESSION while this is true will just burn the new one too.")
+                "Telegram keeps cutting one of them off (getUpdates 409), and it "
+                "splits incoming messages between them - a /out can land on the "
+                "instance that never saw the request, and be ignored.\n\n"
+                "Both are also using the same TELETHON_SESSION from different IPs, "
+                "which destroys the session key and stops ALL forwarding.\n\n"
+                f"Polling waits {BOT_START_DELAY}s on start-up specifically to let a "
+                "deploy changeover finish, so this is either a second Railway "
+                "service on this repo, or that hold is too short - raise "
+                "BOT_START_DELAY. Replacing TELETHON_SESSION while this is true "
+                "will just burn the new one too.")
         return True             # handled: suppress the repeated stack-trace log
 
 
@@ -2312,6 +2339,14 @@ async def run_userbot():
 # ---------------------------------------------------------------------------
 
 async def run_bot():
+    # Before the first poll only. Nothing is missed - see BOT_START_DELAY.
+    if BOT_START_DELAY:
+        print(f"⏸️ [BOT] Holding {BOT_START_DELAY}s before polling so the outgoing "
+              "container releases the token first. Updates queue at Telegram and "
+              "arrive when polling starts (set BOT_START_DELAY=0 to disable).",
+              flush=True)
+        await asyncio.sleep(BOT_START_DELAY)
+
     while True:
         try:
             # message_reaction is NOT included by default and has to be asked
