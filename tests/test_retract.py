@@ -86,6 +86,39 @@ def totals_posts(chat):
             if c == chat and 'Total In' in t and 'Total Out' in t]
 
 
+class FakeEntity:
+    def __init__(self, cid):
+        self.id, self.title, self.username = cid, str(cid), None
+
+
+class TeleMsg:
+    def __init__(self, mid, text):
+        self.id, self.raw_text = mid, text
+
+
+class FakeClient:
+    """Stands in for the userbot when the in-memory record is gone."""
+
+    def __init__(self, source=None, history=None, resolvable=True):
+        self.source = source or {}
+        self.history = history or {}
+        self.resolvable = resolvable
+
+    async def get_entity(self, cid):
+        if not self.resolvable:
+            raise ValueError('no entity')
+        return FakeEntity(cid)
+
+    async def get_messages(self, entity, ids=None):
+        return [self.source.get(ids[0])]
+
+    def iter_messages(self, entity, limit=None):
+        async def gen():
+            for m in self.history.get(entity.id, [])[:limit]:
+                yield m
+        return gen()
+
+
 async def main():
     # -- 1. the ordinary retraction ------------------------------------------
     reset()
@@ -188,6 +221,63 @@ async def main():
     await forward(mid=506)
     check('the -100 spelling is recognised',
           await f.retract_payment(-2335630148, 506, ETHAN) is True)
+
+    # -- 10. after a redeploy: recovered from the group history -------------
+    # The in-memory record is gone, which is what a deploy does. The messages
+    # in the groups are the durable record, so read them instead.
+    reset()
+    forwarded_body = ('You received $10.00 from Gabriel W.\n'
+                      '02:54 PM - 03 Aug 2026\n'
+                      'Total In : 110.00$\nTotal Out: 20.00$')
+    source_body = ('You received $10.00 from Gabriel W.\n'
+                   '03:08 PM - 03 Aug 2026\n'
+                   'Total In : 999.00$\nTotal Out: 999.00$')
+    f._delivered.clear()                          # exactly what a restart leaves
+    f._active_client = FakeClient(
+        source={600: TeleMsg(600, source_body)},
+        history={GAFFER: [TeleMsg(7788, forwarded_body),
+                          TeleMsg(7700, 'something else entirely')]})
+    did = await f.retract_payment(CHIMEREV, 600, ETHAN)
+    check('a payment forwarded before the restart is still retractable', did is True)
+    check('the copy is found by content, not by id',
+          deleted == [(GAFFER, 7788)], str(deleted))
+    check('the amount comes off Total In', f.ledger_snapshot(GAFFER)[0] == 90.0,
+          str(f.ledger_snapshot(GAFFER)))
+    check('and both totals are republished', len(totals_posts(GAFFER)) == 1, str(sent))
+
+    # -- 11. history fallback: the cases that must NOT act -------------------
+    reset()
+    f._delivered.clear()
+    f._active_client = FakeClient(
+        source={601: TeleMsg(601, 'just chatting, no payment here')},
+        history={GAFFER: [TeleMsg(7789, forwarded_body)]})
+    check('a message with no amount retracts nothing',
+          await f.retract_payment(CHIMEREV, 601, ETHAN) is False)
+    check('and moves no books', f.ledger_snapshot(GAFFER) == (100.0, 20.0),
+          str(f.ledger_snapshot(GAFFER)))
+
+    reset()
+    f._delivered.clear()
+    f._active_client = FakeClient(
+        source={602: TeleMsg(602, source_body)},
+        history={GAFFER: [TeleMsg(7790, 'You received $99.00 from Someone Else')]})
+    check('no matching copy in the target retracts nothing',
+          await f.retract_payment(CHIMEREV, 602, ETHAN) is False)
+    check('and deletes nothing', deleted == [], str(deleted))
+
+    reset()
+    f._delivered.clear()
+    f._active_client = None
+    check('with no userbot it fails quietly',
+          await f.retract_payment(CHIMEREV, 603, ETHAN) is False)
+
+    reset()
+    f._delivered.clear()
+    f._active_client = FakeClient(source={604: TeleMsg(604, source_body)},
+                                  history={}, resolvable=False)
+    check('an unreadable group retracts nothing',
+          await f.retract_payment(CHIMEREV, 604, ETHAN) is False)
+    f._active_client = None
 
     print()
     if failures:

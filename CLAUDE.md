@@ -17,7 +17,7 @@ python3 tests/run.py            # all suites
 python3 tests/run.py cashout    # only matching suites
 ```
 
-534 checks across 16 suites, all stubbed — nothing touches Telegram, the
+544 checks across 16 suites, all stubbed — nothing touches Telegram, the
 network, or the live groups. They cover the pre-existing behaviour as well as
 the new, so they are the guard against a change quietly altering something that
 already worked.
@@ -164,9 +164,16 @@ and takes the amount back off that group's Total In.
   corrected figures as the newest ones, and Ethan is told to remove the stray
   copy by hand.
 - **Once.** The delivery record is popped, so a second reaction does nothing.
-- **In memory**, so a redeploy forgets what was forwarded and a later reaction
-  finds nothing. Not worth fixing: Telegram refuses to let a bot delete a group
-  message more than 48 hours old anyway.
+- **Memory first, then the groups.** The delivery record is in memory, so a
+  redeploy wipes it — which made the feature work only for payments forwarded
+  since the last restart, and deploys are frequent. `retract_from_history()` is
+  the fallback: read the original back through the userbot, take the amount
+  from its own `You received` line, and find the copy in the target by
+  `_catchup_signature()`. The timestamp and the totals are both rewritten on
+  the way out, so the name and the amount are all that survive forwarding —
+  the same basis the catch-up sweep already uses.
+- **Still bounded by Telegram**, which refuses to let a bot delete a group
+  message more than 48 hours old, and by `RETRACT_SCAN_LIMIT` (300 messages).
 
 ## Mention watch
 

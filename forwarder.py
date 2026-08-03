@@ -805,6 +805,12 @@ RETRACT_SOURCES = _with_variants(
 _delivered = OrderedDict()
 RETRACT_MEMORY = int(os.getenv('RETRACT_MEMORY', '400'))
 
+# How deep to read the target group when the record above is gone. A redeploy
+# wipes it, and deploys are frequent, so the memory alone made this work only
+# for payments forwarded since the last restart - which is not what anyone
+# means by "undo that one".
+RETRACT_SCAN_LIMIT = int(os.getenv('RETRACT_SCAN_LIMIT', '300'))
+
 
 def remember_delivery(source_key, target, message_id, amount):
     """Note what a forward put where, so a reaction can undo exactly that."""
@@ -1616,6 +1622,76 @@ def retract_text(amount, after):
             f"➖ Total Out: {after[1]:,.2f}$")
 
 
+async def _source_message_text(client, chat_id, message_id):
+    """Read the original back, since a reaction carries only ids and no text."""
+    try:
+        entity = await _resolve_one(client, chat_id)
+        if entity is None:
+            return None
+        found = await client.get_messages(entity, ids=[message_id])
+        if not found or found[0] is None:
+            return None
+        return found[0].raw_text or None
+    except Exception as e:
+        print(f"⚠️ [RETRACT] could not read the original in {chat_name(chat_id)}: {e}",
+              flush=True)
+        return None
+
+
+async def _find_forwarded_copy(client, target, text):
+    """Locate the copy we posted in the target, by content.
+
+    Reuses the catch-up sweep's signature, which is the only thing common to
+    both sides: the timestamp and the totals are BOTH rewritten on the way out,
+    so the name and the amount are all that survive forwarding. Newest match
+    wins - if the same amount really was received twice, the one being reacted
+    to is the recent one."""
+    want = _catchup_signature(text)
+    try:
+        entity = await _resolve_one(client, target)
+        if entity is None:
+            return None
+        async for msg in client.iter_messages(entity, limit=RETRACT_SCAN_LIMIT):
+            if msg.raw_text and _catchup_signature(msg.raw_text) == want:
+                return msg.id
+    except Exception as e:
+        print(f"⚠️ [RETRACT] could not search {chat_name(target)}: {e}", flush=True)
+    return None
+
+
+async def retract_from_history(rule_key, message_id):
+    """Work out what a forward did by reading the groups, not memory.
+
+    This is what makes retraction survive a redeploy. The amount comes from the
+    original's own text - which is exactly what was asked for: take off what
+    the "You received" line says."""
+    client = _active_client
+    if client is None:
+        return None
+    text = await _source_message_text(client, rule_key, message_id)
+    if not text:
+        return None
+    amount = parse_received_amount(text)
+    if amount is None:
+        print(f"↩️ [RETRACT] message {message_id} carries no amount - not a payment",
+              flush=True)
+        return None
+
+    found = []
+    for target in FORWARD_RULES.get(rule_key, []):
+        copy_id = await _find_forwarded_copy(client, target, text)
+        if copy_id is None:
+            print(f"↩️ [RETRACT] no copy of that payment found in "
+                  f"{chat_name(target)} within {RETRACT_SCAN_LIMIT} messages",
+                  flush=True)
+            continue
+        found.append((target, copy_id, amount))
+    if found:
+        print(f"↩️ [RETRACT] recovered {amount:,.2f} from the group history "
+              "(not in memory - forwarded before the last restart)", flush=True)
+    return found or None
+
+
 async def retract_payment(chat_id, message_id, user_id):
     """Undo a forwarded payment, because its original was reacted to.
 
@@ -1643,9 +1719,14 @@ async def retract_payment(chat_id, message_id, user_id):
     # Popped, not read: a second reaction on the same message must do nothing.
     entries = _delivered.pop((rule_key, message_id), None)
     if not entries:
-        print(f"↩️ [RETRACT] nothing known about message {message_id} in "
-              f"{chat_name(chat_id)} - forwarded before the last restart, or "
-              "never forwarded at all.", flush=True)
+        # Nothing in memory. A redeploy wipes it, so fall back to reading the
+        # groups - the messages themselves are the durable record here, exactly
+        # as they are for the ledger.
+        entries = await retract_from_history(rule_key, message_id)
+    if not entries:
+        print(f"↩️ [RETRACT] nothing to retract for message {message_id} in "
+              f"{chat_name(chat_id)} - no copy found, or never forwarded.",
+              flush=True)
         return False
 
     for target, target_msg_id, amount in entries:
