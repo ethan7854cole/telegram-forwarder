@@ -17,7 +17,7 @@ python3 tests/run.py            # all suites
 python3 tests/run.py cashout    # only matching suites
 ```
 
-473 checks across 14 suites, all stubbed — nothing touches Telegram, the
+504 checks across 15 suites, all stubbed — nothing touches Telegram, the
 network, or the live groups. They cover the pre-existing behaviour as well as
 the new, so they are the guard against a change quietly altering something that
 already worked.
@@ -145,6 +145,30 @@ A `/out` at any point completes it. Stopping is not giving up — the request
 stays **open**, so a late `/out` is still forwarded, booked and hearted, and
 deleting either copy still settles it.
 
+## Mention watch
+
+The four cashout groups are **muted**, so an `@Larryyxx` or `@ethannxxxx` in one
+of them reaches nobody until somebody happens to scroll back. `observe_mentions()`
+turns it into a DM carrying the group, who sent it, their numeric id, the time
+and the message itself — enough not to have to open the group at all.
+
+Watched in `MENTION_CHATS`, which defaults to the four `CASHOUT_ROUTES`
+endpoints (both chime groups, both handling groups). The VENMO targets are
+deliberately out. Both id spellings are matched.
+
+- **Telegram never tells a bot whether a chat is muted.** That is a per-user
+  notification setting the API does not expose, so this does not try to detect
+  it — the groups are simply watched.
+- **Every mention is sent.** Unlike the cashout escalations, these are separate
+  events rather than repeats of one, so the once-per-request rule does not apply.
+- **Skipped:** the bot's own posts, since it tags people on every request and
+  reminder; and whoever sent the message, who does not need telling about their
+  own.
+- Only real `@handle` mentions count. `bob@larryyxx` and `@larryyxxx` do not.
+- Reaches only messages the input paths already see, so a mention inside a media
+  caption in a chime group is missed. Mentions are plain text in practice, and
+  widening the media gates for this would put the payment path at risk.
+
 ## The deploy changeover
 
 Railway boots the replacement container before the outgoing one has gone, so
@@ -217,6 +241,7 @@ cashout requests.
 | `tests/test_caption.py` | A `/out` captioning a screenshot, through both real dispatchers |
 | `tests/test_shutdown.py` | SIGTERM always reaches the exit, however the disconnect goes |
 | `tests/test_startup.py` | Polling waits out the changeover; the conflict watcher |
+| `tests/test_mentions.py` | An `@` in a muted group arrives as a DM |
 | `backfill.py` | Manual one-off backfill, separate from the boot sweep |
 | `telethon_login.py` | Generates a `TELETHON_SESSION`; `--deploy` for Railway |
 

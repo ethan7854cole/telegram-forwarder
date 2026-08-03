@@ -731,6 +731,54 @@ CASHOUT_DEDUP_SECONDS = int(os.getenv('CASHOUT_DEDUP_SECONDS', '120'))
 
 CASHOUT_HEART = os.getenv('CASHOUT_HEART', '❤')
 
+# ---------------------------------------------------------------------------
+# Mention watch
+# ---------------------------------------------------------------------------
+#
+# The groups are MUTED. An @ in one of them therefore reaches nobody until
+# somebody happens to scroll back through it, which is exactly the silent
+# failure this bot exists to remove elsewhere. A private message is the only
+# thing that actually arrives.
+
+# Watched in the four groups on the cashout routes - both chime groups and both
+# handling groups. The VENMO targets are deliberately out: nobody is chased
+# there. Override with a comma-separated list of ids.
+def _default_mention_chats():
+    chats = []
+    for _source, _route in CASHOUT_ROUTES.items():
+        for _cid in (_source, _route['handling']):
+            if _cid not in chats:
+                chats.append(_cid)
+    return chats
+
+
+def _with_variants(chat_ids):
+    """Both spellings of every id, so a match cannot depend on which form
+    Telegram happened to use - see _id_variants."""
+    both = set()
+    for chat_id in chat_ids:
+        both.add(chat_id)
+        both.update(_id_variants(chat_id))
+    return both
+
+
+_raw_mention_chats = os.getenv('MENTION_CHATS', '').strip()
+MENTION_CHATS = _with_variants(
+    [int(c.strip()) for c in _raw_mention_chats.split(',') if c.strip()]
+    if _raw_mention_chats else _default_mention_chats())
+
+# Whose mentions to watch for, and who hears about them.
+MENTION_WATCH_HANDLES = _handle_list(
+    os.getenv('MENTION_WATCH_HANDLES', 'ethannxxxx,larryyxx'))
+MENTION_ALERT_HANDLES = _handle_list(
+    os.getenv('MENTION_ALERT_HANDLES', 'ethannxxxx,larryyxx'))
+
+# "@handle" as a whole word. The lookbehind stops an email tail or a doubled @
+# from counting, and \b stops @larryyxx matching inside @larryyxxx.
+_MENTION_RE = (re.compile(
+    r'(?<![\w@])@(' + '|'.join(re.escape(h) for h in MENTION_WATCH_HANDLES) + r')\b',
+    re.I) if MENTION_WATCH_HANDLES else None)
+
 # @username -> numeric id. A bot can only DM an id, so the ones we know are
 # seeded here and the rest are learned the first time that person speaks in a
 # watched chat. @Larryyxx and @ethannxxxx, matching LEDGER_ADMINS.
@@ -1511,6 +1559,66 @@ async def deliver_to_target(target, fixed, text, from_bot):
     return True
 
 
+def mention_alert_text(chat_id, who, user_id, when, text):
+    """Who, where, when, and what they actually said.
+
+    The message itself is included because the point is to save a trip back
+    into a muted group - a notice that says only "you were mentioned" would
+    make you open the thing it is standing in for."""
+    stamp = (when.astimezone(LOCAL_TZ).strftime('%I:%M %p - %d %b %Y')
+             if when else 'time unknown')
+    body = ' '.join((text or '').split())
+    if len(body) > 400:
+        body = body[:400] + '…'
+    return ("🔔 YOU WERE MENTIONED\n\n"
+            f"Group: {chat_name(chat_id)}\n"
+            f"By: {who}\n"
+            f"Their id: {user_id}\n"
+            f"At: {stamp}\n\n"
+            f"{body}")
+
+
+async def observe_mentions(chat_id, text, message_id, sent_at,
+                           user_id=None, username=None, full_name=None):
+    """Privately tell Ethan and Larry when somebody @s them in a watched group.
+
+    Telegram never tells a bot whether a chat is muted - that is a per-user
+    setting the API does not expose - so this does not try to detect it. These
+    four groups are muted as a matter of course, which is the whole reason the
+    DM has to exist.
+
+    Skipped: the bot's own posts, since it tags people on every request and
+    reminder; and whoever sent the message, who does not need telling about
+    their own. Every mention is sent - unlike the cashout escalations, these
+    are separate events rather than repeats of one."""
+    if _MENTION_RE is None or not text:
+        return
+    if chat_id not in MENTION_CHATS:
+        return
+    if BOT_ID is not None and user_id == BOT_ID:
+        return
+    if not _MENTION_RE.search(text):
+        return
+    if _is_duplicate(('mention', chat_id, message_id)):
+        return                          # both input paths see the same message
+
+    author = (username or '').lower()
+    targets = [h for h in MENTION_ALERT_HANDLES if h.lower() != author]
+    if not targets:
+        return
+
+    who = describe_user(username, full_name)
+    print(f"🔔 [MENTION] {who} mentioned someone in {chat_name(chat_id)}", flush=True)
+    missed = await dm_handles(
+        targets, mention_alert_text(chat_id, who, user_id, sent_at, text))
+    if missed:
+        # Deliberately not warn_unreachable(): that one says "about an overdue
+        # cashout", which this is not, and a mention is not worth waking the
+        # admin a second time over.
+        print(f"❌ [MENTION] could not DM: {', '.join('@' + h for h in missed)}",
+              flush=True)
+
+
 # ---------------------------------------------------------------------------
 # Bot API handlers (unchanged behaviour, async syntax)
 # ---------------------------------------------------------------------------
@@ -1818,6 +1926,14 @@ async def cashout_from_bot_api(message):
                           getattr(reply, 'message_id', None),
                           full_name or None,
                           has_media=getattr(message, 'content_type', 'text') != 'text')
+
+    # Every Bot API handler that can carry a mention already routes through
+    # here, so this is the one place it has to be called from. Kept after the
+    # cashout work: a mention never changes what a message means, and the
+    # money side goes first.
+    await observe_mentions(message.chat.id, text, message.message_id, sent_at,
+                           getattr(sender, 'id', None),
+                           getattr(sender, 'username', None), full_name or None)
 
 
 @bot.message_reaction_handler(func=lambda r: True)
@@ -2266,6 +2382,10 @@ async def run_userbot():
                                       getattr(event.message, 'reply_to_msg_id', None),
                                       full_name or None,
                                       has_media=not plain)
+                await observe_mentions(event.chat_id, text, event.id,
+                                       event.message.date, sender_id,
+                                       getattr(sender, 'username', None),
+                                       full_name or None)
 
                 if not plain:
                     return          # a caption is never a payment notification
