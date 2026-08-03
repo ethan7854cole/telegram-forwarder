@@ -933,6 +933,7 @@ async def open_cashout_request(source, text, sent_at, origin_msg_id):
         # the recurring part and a DM is a one-off "this one needs you".
         'crew_told': False,
         'admin_told': False,
+        'issue_told': False,               # answered with something that is not a /out
         'nudges': 0,
         'exhausted': False,
     }
@@ -1007,6 +1008,42 @@ def cashout_submitted_text(request, handling):
             "Waiting on a reaction, then the /out.")
 
 
+def cashout_issue_text(request, handling, who, user_id):
+    """For Ethan and Larry: a request was taken on, then answered with anything
+    except the /out. Names WHO, because the next step is asking them."""
+    return ("⚠️ SOMETHING IS WRONG WITH A CASHOUT\n\n"
+            f"{_cashout_preview(request)}\n\n"
+            f"From: {chat_name(request['origin'])}\n"
+            f"Waiting in: {chat_name(handling)}\n\n"
+            f"{who} acknowledged it, then sent a message or a screenshot "
+            "instead of the /out.\n"
+            f"Their id: {user_id}\n\n"
+            "Please check the group's messages.")
+
+
+async def flag_cashout_issue(handling, request, user_id, username, full_name=None):
+    """A crew member who already acknowledged a request posts something that is
+    not a /out.
+
+    Different in kind from silence, so it does not wait for the 7-minute window:
+    somebody is engaged with this request and still not sending the /out, which
+    usually means they have hit a problem. Ethan and Larry are told at once, and
+    the crew are NOT - they are the ones being asked about, and they already
+    have the request in front of them.
+
+    Once per request, like every other private escalation here."""
+    if request['issue_told']:
+        return
+    request['issue_told'] = True
+    who = describe_user(username, full_name)
+    print(f"⚠️ [CASHOUT] {who} answered an acknowledged request in "
+          f"{chat_name(handling)} without a /out - telling Ethan and Larry",
+          flush=True)
+    missed = await dm_handles(CASHOUT_ADMIN_HANDLES,
+                              cashout_issue_text(request, handling, who, user_id))
+    await warn_unreachable(missed)
+
+
 def cashout_picked_up_text(request, who):
     return (f"👀 The cashout process is being handled by {who}.\n\n"
             f"{_cashout_preview(request)}\n\n"
@@ -1066,7 +1103,8 @@ def _match_request(queue, reply_to):
     return queue[0]
 
 
-async def handle_cashout_reply(handling, text, user_id, username, reply_to):
+async def handle_cashout_reply(handling, text, user_id, username, reply_to,
+                               full_name=None):
     """A message in a handling group, while at least one request is open there.
 
     Nothing here runs unless a request we forwarded is genuinely outstanding, so
@@ -1075,7 +1113,15 @@ async def handle_cashout_reply(handling, text, user_id, username, reply_to):
     if not queue:
         return
 
-    if _is_responder(user_id, username):
+    text = text or ''
+    responder = _is_responder(user_id, username)
+    target = _match_request(queue, reply_to)
+
+    # Read BEFORE the loop below sets it. The first thing a crew member says is
+    # an acknowledgement; a later one, with still no /out, is not.
+    was_acknowledged = target['seen']
+
+    if responder:
         # Somebody is on it. Put the reminder clock back for this group's open
         # requests; they stay open until a /out actually arrives.
         now = datetime.now(timezone.utc)
@@ -1086,9 +1132,11 @@ async def handle_cashout_reply(handling, text, user_id, username, reply_to):
               f"{chat_name(handling)} - reminder clock reset", flush=True)
 
     if not _OUT_CMD_RE.search(text):
+        if responder and was_acknowledged:
+            await flag_cashout_issue(handling, target, user_id, username, full_name)
         return
 
-    request = _match_request(queue, reply_to)
+    request = target
     # Normally the group that asked, but a route may send the /out elsewhere.
     out_to = request.get('out_to', request['origin'])
     try:
@@ -1129,19 +1177,24 @@ async def handle_cashout_reply(handling, text, user_id, username, reply_to):
 
 
 async def observe_cashout(chat_id, text, message_id, sent_at,
-                          user_id=None, username=None, reply_to=None):
+                          user_id=None, username=None, reply_to=None,
+                          full_name=None, has_media=False):
     """Single entry point for both input paths.
 
-    Called for every text message in a watched chat. Decides whether it opens a
-    cashout request, answers one, or is none of our business."""
-    if not text:
+    Called for every message in a watched chat that the gates upstream let
+    through. Decides whether it opens a cashout request, answers one, flags a
+    problem with one, or is none of our business.
+
+    `has_media` is what lets a screenshot with NO caption count: posting one
+    instead of the /out is itself the signal that something has gone wrong."""
+    if not text and not has_media:
         return
     if BOT_ID is not None and user_id == BOT_ID:
         return                              # never act on our own posts
 
     source = _canonical(chat_id, CASHOUT_ROUTES)
     if source is not None:
-        if CASHOUT_KEYWORD.lower() not in text.lower():
+        if not text or CASHOUT_KEYWORD.lower() not in text.lower():
             return
         if _is_duplicate(('cashout', source, message_id)):
             return
@@ -1152,7 +1205,8 @@ async def observe_cashout(chat_id, text, message_id, sent_at,
     if handling is not None:
         if _is_duplicate(('cashout-reply', handling, message_id)):
             return
-        await handle_cashout_reply(handling, text, user_id, username, reply_to)
+        await handle_cashout_reply(handling, text, user_id, username, reply_to,
+                                   full_name)
 
 
 async def _confirm_gone(client, chat, msg_id):
@@ -1728,10 +1782,15 @@ async def cashout_from_bot_api(message):
     sent_at = (datetime.fromtimestamp(message.date, tz=timezone.utc)
                if getattr(message, 'date', None) else None)
     text = getattr(message, 'text', None) or getattr(message, 'caption', None)
+    sender = getattr(message, 'from_user', None)
+    full_name = ' '.join(part for part in (getattr(sender, 'first_name', None),
+                                           getattr(sender, 'last_name', None)) if part)
     await observe_cashout(message.chat.id, text, message.message_id, sent_at,
-                          getattr(message.from_user, 'id', None),
-                          getattr(message.from_user, 'username', None),
-                          getattr(reply, 'message_id', None))
+                          getattr(sender, 'id', None),
+                          getattr(sender, 'username', None),
+                          getattr(reply, 'message_id', None),
+                          full_name or None,
+                          has_media=getattr(message, 'content_type', 'text') != 'text')
 
 
 @bot.message_reaction_handler(func=lambda r: True)
@@ -1762,10 +1821,22 @@ async def on_request_reaction(reaction):
 CAPTIONED_TYPES = ['photo', 'document', 'video', 'animation']
 
 
-@bot.message_handler(content_types=CAPTIONED_TYPES,
-                     func=lambda m: is_caption_out(getattr(m, 'caption', None)))
+def media_concerns_cashout(message):
+    """Two reasons the cashout flow needs to see a piece of media.
+
+    A /out written as a caption, anywhere - that answers a request. And
+    ANYTHING posted in a handling group, caption or not: a screenshot sent
+    instead of the /out is how the crew signal they have hit a problem, and
+    that has to reach Ethan and Larry rather than sit there looking like
+    silence."""
+    if is_caption_out(getattr(message, 'caption', None)):
+        return True
+    return _canonical(getattr(message.chat, 'id', None), _CASHOUT_HANDLERS) is not None
+
+
+@bot.message_handler(content_types=CAPTIONED_TYPES, func=media_concerns_cashout)
 async def cashout_caption(message):
-    """A /out captioning the screenshot that proves the payment was sent.
+    """Media the cashout flow cares about - see media_concerns_cashout().
 
     forward_text below is text-only on purpose and never sees this message.
     Only the cashout path runs: process_incoming is deliberately NOT called
@@ -2134,15 +2205,18 @@ async def run_userbot():
             async def on_source_message(event):
                 await ready.wait()
                 sender = await event.get_sender()
-                text = event.raw_text
-                if not text:
-                    return
-                # Captioned media is dropped exactly as it always was, with one
-                # exception: a /out written on the screenshot of the payment is
-                # still the answer to a request we are chasing. It reaches the
-                # cashout path below and stops there.
+                text = event.raw_text or ''
                 plain = _is_plain_text(event.message)
-                if not plain and not is_caption_out(text):
+                in_handling = _canonical(event.chat_id, _CASHOUT_HANDLERS) is not None
+
+                # Media is dropped as it always was, with two exceptions: a /out
+                # written on the payment screenshot answers a request, and
+                # anything at all in a handling group may be the crew saying
+                # they are stuck. Both reach the cashout path below and stop
+                # there - the payment side stays strictly plain text.
+                if not plain and not (is_caption_out(text) or in_handling):
+                    return
+                if not text and plain:
                     return
                 remember_user(sender)
 
@@ -2156,10 +2230,15 @@ async def run_userbot():
                 # or the /out answering one is as likely to be typed by a person.
                 # It never consumes the message - the two keyword filters cannot
                 # both match, so the payment path still gets its turn below.
+                full_name = ' '.join(
+                    part for part in (getattr(sender, 'first_name', None),
+                                      getattr(sender, 'last_name', None)) if part)
                 await observe_cashout(event.chat_id, text, event.id,
                                       event.message.date, sender_id,
                                       getattr(sender, 'username', None),
-                                      getattr(event.message, 'reply_to_msg_id', None))
+                                      getattr(event.message, 'reply_to_msg_id', None),
+                                      full_name or None,
+                                      has_media=not plain)
 
                 if not plain:
                     return          # a caption is never a payment notification

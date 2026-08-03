@@ -159,6 +159,102 @@ async def main():
     check('an identical request after the first is settled still posts',
           len(sent) == 1, str(sent))
 
+    # -- 7e. acknowledged, then answered with anything but a /out ------------
+    # Different in kind from silence: somebody is engaged and still not sending
+    # the /out, which usually means they have hit a problem. Ethan and Larry
+    # hear at once rather than after the 7-minute window.
+    ETHAN, LARRY = f.ADMIN_ID, 7418675217
+    f._user_ids['larryyxx'] = LARRY
+
+    reset()
+    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $200', 940, now, user_id=42)
+    req = f._pending_cashouts[MHLARRY][0]
+    await f.note_cashout_seen(MHLARRY, req['message_id'], 77, 'Maynuddin23',
+                              'Maynuddin Ahmed')
+    dms.clear(); sent.clear()
+
+    await f.observe_cashout(MHLARRY, 'cashapp is not letting me', 941, now,
+                            user_id=77, username='Maynuddin23',
+                            full_name='Maynuddin Ahmed')
+    alerts = [t for uid, t in dms if 'SOMETHING IS WRONG' in t]
+    check('Ethan and Larry are both told at once', len(alerts) == 2, str(dms))
+    check('the crew are NOT told', not [t for uid, t in dms if uid == 77], str(dms))
+    check('it names which crew member',
+          alerts and '@Maynuddin23' in alerts[0] and 'Maynuddin Ahmed' in alerts[0],
+          str(alerts[:1]))
+    check('it carries their id', alerts and 'Their id: 77' in alerts[0], str(alerts[:1]))
+    check('it says to check the group', alerts and "check the group's messages" in alerts[0],
+          str(alerts[:1]))
+    check('it carries the routing',
+          alerts and 'CHIME PICCASO' in alerts[0] and 'MH X LARRY GROUP 2' in alerts[0],
+          str(alerts[:1]))
+    check('nothing is posted in the group', sent == [], str(sent))
+    check('the request stays open', MHLARRY in f._pending_cashouts)
+
+    # once per request, however much they say
+    dms.clear()
+    await f.observe_cashout(MHLARRY, 'still stuck', 942, now,
+                            user_id=77, username='Maynuddin23')
+    check('the alert does not repeat',
+          not [t for uid, t in dms if 'SOMETHING IS WRONG' in t], str(dms))
+
+    # -- 7f. a screenshot with NO caption counts as the same signal ----------
+    reset()
+    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $200', 943, now, user_id=42)
+    req = f._pending_cashouts[MHLARRY][0]
+    await f.note_cashout_seen(MHLARRY, req['message_id'], 77, 'Maynuddin23')
+    dms.clear()
+    await f.observe_cashout(MHLARRY, None, 944, now, user_id=77,
+                            username='Maynuddin23', has_media=True)
+    check('a bare screenshot after acknowledging raises the alert',
+          len([t for uid, t in dms if 'SOMETHING IS WRONG' in t]) == 2, str(dms))
+
+    # -- 7g. and the cases that must NOT raise it ---------------------------
+    # The first thing anyone says is an acknowledgement, not a problem.
+    reset()
+    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $200', 945, now, user_id=42)
+    dms.clear()
+    await f.observe_cashout(MHLARRY, 'looking now', 946, now,
+                            user_id=77, username='Maynuddin23')
+    check('the first message is just an acknowledgement',
+          not [t for uid, t in dms if 'SOMETHING IS WRONG' in t], str(dms))
+
+    # A /out is the answer, not a problem.
+    reset()
+    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $200', 947, now, user_id=42)
+    req = f._pending_cashouts[MHLARRY][0]
+    await f.note_cashout_seen(MHLARRY, req['message_id'], 77, 'Maynuddin23')
+    dms.clear()
+    # reset() here does not clear the ledger, so measure the movement, not the
+    # absolute figure.
+    before_out = f.ledger_snapshot(PICCASO)[1]
+    await f.observe_cashout(MHLARRY, '/out 200', 948, now,
+                            user_id=77, username='Maynuddin23')
+    check('a /out raises no alert',
+          not [t for uid, t in dms if 'SOMETHING IS WRONG' in t], str(dms))
+    check('and still completes the cashout',
+          f.ledger_snapshot(PICCASO)[1] == before_out + 200.0,
+          str((before_out, f.ledger_snapshot(PICCASO))))
+    check('and closes the request', MHLARRY not in f._pending_cashouts)
+
+    # A stranger talking is not the crew hitting a problem.
+    reset()
+    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $200', 949, now, user_id=42)
+    req = f._pending_cashouts[MHLARRY][0]
+    await f.note_cashout_seen(MHLARRY, req['message_id'], 77, 'Maynuddin23')
+    dms.clear()
+    await f.observe_cashout(MHLARRY, 'unrelated chatter', 950, now,
+                            user_id=999, username='randomguy')
+    check('a stranger raises no alert',
+          not [t for uid, t in dms if 'SOMETHING IS WRONG' in t], str(dms))
+
+    # With nothing open, the handling group is ordinary traffic.
+    reset()
+    dms.clear()
+    await f.observe_cashout(MHLARRY, 'anything at all', 951, now,
+                            user_id=77, username='Maynuddin23')
+    check('nothing pending means no alert', dms == [] and sent == [], str(dms))
+
     # -- 8. alternate -100 id spelling still matches -------------------------
     reset()
     await f.observe_cashout(-1002335630148, '/out 5', 914, now, user_id=77, username='Maynuddin23')

@@ -217,14 +217,22 @@ async def main():
           await route(photo) == 'cashout_caption', str(await route(photo)))
     check('a document captioned /out reaches it too',
           await route(BotApiMsg(MHLARRY, 'document', caption='/out 75')) == 'cashout_caption')
-    check('a screenshot with an ordinary caption is still ignored',
-          await route(BotApiMsg(MHLARRY, 'photo', caption='here is the proof')) is None)
-    check('a screenshot with no caption at all is still ignored',
-          await route(BotApiMsg(MHLARRY, 'photo')) is None)
+    # In a HANDLING group any media now reaches the cashout flow, caption or
+    # not: a screenshot sent instead of the /out is the crew signalling a
+    # problem, and it must not look like silence.
+    check('a screenshot with an ordinary caption reaches the cashout flow',
+          await route(BotApiMsg(MHLARRY, 'photo', caption='here is the proof'))
+          == 'cashout_caption')
+    check('a screenshot with no caption at all reaches it too',
+          await route(BotApiMsg(MHLARRY, 'photo')) == 'cashout_caption')
+
+    # Everywhere else media is still ignored unless it carries a /out.
+    check('a screenshot in a chime group is still ignored',
+          await route(BotApiMsg(PICCASO, 'photo', caption='here is the proof')) is None)
     check('a captioned CASHOUT REQUEST reaches no handler',
           await route(BotApiMsg(PICCASO, 'photo', caption='CASHOUT REQUEST $500')) is None)
-    check('a captioned payment notification reaches no handler',
-          await route(BotApiMsg(MHLARRY, 'photo',
+    check('a captioned payment notification in a chime group is ignored',
+          await route(BotApiMsg(PICCASO, 'photo',
                                 caption='You received $15.0 from Gabriel W.')) is None)
     check('a sticker is still ignored',
           await route(BotApiMsg(MHLARRY, 'sticker')) is None)

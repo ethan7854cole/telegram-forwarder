@@ -17,7 +17,7 @@ python3 tests/run.py            # all suites
 python3 tests/run.py cashout    # only matching suites
 ```
 
-438 checks across 13 suites, all stubbed — nothing touches Telegram, the
+455 checks across 13 suites, all stubbed — nothing touches Telegram, the
 network, or the live groups. They cover the pre-existing behaviour as well as
 the new, so they are the guard against a change quietly altering something that
 already worked.
@@ -59,15 +59,24 @@ the bot cannot deliver, because a bot cannot open a chat with someone who has
 never pressed Start and cannot address an `@username` at all. `USERBOT_SEND=0`
 disables that.
 
-Both paths take **plain text only**, with one exception. The crew answer a
-request with the Cash App screenshot proving they sent the money and write the
-`/out` as its caption, so `is_caption_out()` lets a caption through — but only
-when it carries a `/out`, and only as far as the cashout flow. The caption is
-relayed verbatim to the chime group that asked and books that group's Total
-Out, exactly as a typed `/out` does; the screenshot itself is not forwarded.
-`process_incoming()` is never reached from a caption, or a screenshot could be
-read as a payment notification and invent a deposit. A captioned
-`CASHOUT REQUEST` still opens nothing.
+Both paths take **plain text only** for payments, and always will:
+`process_incoming()` is never reached from media, or a screenshot of a
+notification would be read as the notification and invent a deposit.
+
+Media reaches the **cashout flow** in two cases, and no others:
+
+- **A `/out` written as a caption**, anywhere — `is_caption_out()`. The crew
+  answer with the Cash App screenshot proving they sent the money and put the
+  `/out` on it. The caption is relayed verbatim to the chime group that asked
+  and books that group's Total Out, exactly as a typed `/out` does; the
+  screenshot itself is not forwarded.
+- **Anything at all posted in a handling group** — `media_concerns_cashout()`
+  on the Bot API side, the `in_handling` gate on the Telethon side. A
+  screenshot sent *instead* of the `/out` is the crew signalling they are
+  stuck, and it must not look like silence. See `flag_cashout_issue()`.
+
+A captioned `CASHOUT REQUEST` still opens nothing, and a captioned `/add` does
+nothing.
 
 ## Invariants — do not break these without being asked
 
@@ -116,6 +125,21 @@ in the group: they have acknowledged it there, so re-tagging them is noise.
 |---|---|
 | +7 min | one DM to the crew |
 | +14 min | one DM to Ethan + Larry, then chasing **stops** |
+
+**They answer with something that is not a `/out`** — `flag_cashout_issue()`.
+Not a rung on either ladder: it fires **immediately**, without waiting for a
+window. A crew member who has already acknowledged a request and then sends a
+message or a screenshot with no `/out` is engaged but stuck, which is a
+different problem from silence and needs a person, not another timer.
+
+| Trigger | What happens |
+|---|---|
+| acknowledged, then any non-`/out` message or media from a responder | one DM to Ethan + Larry, naming the crew member and their numeric id |
+
+The crew are **not** told — they are the ones being asked about. Nothing is
+posted in the group. Once per request (`issue_told`), and the ladder it was
+already on carries on underneath. The *first* thing anyone says is an
+acknowledgement, not a problem, so the alert needs a prior acknowledgement.
 
 A `/out` at any point completes it. Stopping is not giving up — the request
 stays **open**, so a late `/out` is still forwarded, booked and hearted, and
