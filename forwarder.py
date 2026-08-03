@@ -1618,8 +1618,12 @@ def retract_text(amount, after):
     both, and the message being deleted here was one of them - so without this
     the next redeploy would read an older figure and quietly put the payment
     back on."""
-    heading = (f"↩️ Retracted = -{amount:,.2f}$" if amount > 0
-               else "↩️ Forwarded payment retracted")
+    # Word for word what "/add -10" posts, because that is exactly what this
+    # is: Total In adjusted downwards. A retraction the group has never seen
+    # before would read as a different kind of event; this one is already
+    # familiar, and the payment vanishing at the same moment says the rest.
+    heading = (f"✏️ Total In adjusted by -{amount:,.2f}$" if amount > 0
+               else "✏️ Forwarded payment retracted")
     return (f"{heading}\n\n"
             f"📊 Group Total:\n"
             f"➕ Total In : {after[0]:,.2f}$\n"
@@ -1756,11 +1760,21 @@ async def retract_payment(chat_id, message_id, user_id):
             continue
 
         before = ledger_snapshot(target)
-        after = (max(0.0, before[0] - amount), before[1])
+        # Refused rather than clamped, which is what /add -N already does with
+        # an overshoot. Clamping would silently invent a figure and then delete
+        # the evidence; refusing leaves both the books and the message alone
+        # and points at the command that CAN set it outright.
         if amount > before[0]:
-            print(f"⚠️ [RETRACT] {amount:,.2f} is more than {chat_name(target)} has "
-                  f"in Total In ({before[0]:,.2f}) - clamped at zero rather than "
-                  "publishing a negative.", flush=True)
+            print(f"⛔ [RETRACT] {amount:,.2f} is more than {chat_name(target)} has "
+                  f"in Total In ({before[0]:,.2f}) - refusing.", flush=True)
+            await bot.send_message(
+                target,
+                f"⛔ Retracting {amount:,.2f}$ would take Total In below zero.\n\n"
+                f"➕ Total In : {before[0]:,.2f}$\n"
+                f"➖ Total Out: {before[1]:,.2f}$\n\n"
+                "Nothing was changed. Use /set in <amount> to correct it outright.")
+            continue
+        after = (before[0] - amount, before[1])
 
         try:
             await bot.send_message(target, retract_text(amount, after))

@@ -17,7 +17,7 @@ python3 tests/run.py            # all suites
 python3 tests/run.py cashout    # only matching suites
 ```
 
-555 checks across 16 suites, all stubbed — nothing touches Telegram, the
+559 checks across 16 suites, all stubbed — nothing touches Telegram, the
 network, or the live groups. They cover the pre-existing behaviour as well as
 the new, so they are the guard against a change quietly altering something that
 already worked.
@@ -172,6 +172,10 @@ and takes the amount back off that group's Total In.
   `_catchup_signature()`. The timestamp and the totals are both rewritten on
   the way out, so the name and the amount are all that survive forwarding —
   the same basis the catch-up sweep already uses.
+- **It posts what `/add -N` posts**, word for word — `✏️ Total In adjusted by
+  -10.00$` and the totals block. Same event, same familiar shape, and an
+  overshoot is **refused** exactly as `/add -N` refuses one rather than being
+  clamped: clamping would invent a figure and then delete the evidence for it.
 - **An empty `_ledger` means "not loaded yet", NEVER "zero".** Subtracting from
   the assumed zero wrote `0.00/0.00` into a live group on 2026-08-03 and made
   that the newest totals message — which is exactly what `recover_ledgers()`

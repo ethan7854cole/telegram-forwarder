@@ -161,6 +161,9 @@ async def main():
           len(totals_posts(GAFFER)) == 1, str(sent))
     check('the correction names the amount',
           any('15.00' in t for t in totals_posts(GAFFER)), str(totals_posts(GAFFER)))
+    check('and reads exactly like /add -15',
+          any(t.startswith('✏️ Total In adjusted by -15.00$')
+              for t in totals_posts(GAFFER)), str(totals_posts(GAFFER)))
 
     # -- 2. reacting twice must not deduct twice -----------------------------
     again = await f.retract_payment(CHIMEREV, 500, ETHAN)
@@ -223,17 +226,23 @@ async def main():
     check('and Ethan is told to delete it by hand',
           any('could not be deleted' in t for _, t, _ in dms), str(dms))
 
-    # -- 8. the deduction can never publish a negative -----------------------
+    # -- 8. an overshoot is REFUSED, exactly as /add -N refuses one ----------
+    # Clamping would invent a figure and then delete the evidence for it.
     reset(opening=(5.0, 0.0))
     await forward(mid=505)                       # +15 on a Total In of 5
     check('booked on top', f.ledger_snapshot(GAFFER)[0] == 20.0,
           str(f.ledger_snapshot(GAFFER)))
     f.ledger_commit(GAFFER, (2.0, 0.0))          # something else took it down
-    sent.clear()
+    sent.clear(); deleted.clear()
     await f.retract_payment(CHIMEREV, 505, ETHAN)
-    check('a deduction bigger than the balance clamps at zero',
-          f.ledger_snapshot(GAFFER)[0] == 0.0, str(f.ledger_snapshot(GAFFER)))
-    check('and never publishes a negative',
+    check('a deduction bigger than the balance is refused',
+          f.ledger_snapshot(GAFFER) == (2.0, 0.0), str(f.ledger_snapshot(GAFFER)))
+    check('it says so in the group',
+          any('below zero' in t for c, t, _ in sent if c == GAFFER), str(sent))
+    check('it points at /set',
+          any('/set in' in t for c, t, _ in sent if c == GAFFER), str(sent))
+    check('the copy is left in place', deleted == [], str(deleted))
+    check('and no negative is ever published',
           not any('-' in t.split('Total In')[1][:14] for t in totals_posts(GAFFER)),
           str(totals_posts(GAFFER)))
 
