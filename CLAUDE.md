@@ -17,7 +17,7 @@ python3 tests/run.py            # all suites
 python3 tests/run.py cashout    # only matching suites
 ```
 
-746 checks across 22 suites, all stubbed — nothing touches Telegram, the
+770 checks across 23 suites, all stubbed — nothing touches Telegram, the
 network, or the live groups. They cover the pre-existing behaviour as well as
 the new, so they are the guard against a change quietly altering something that
 already worked.
@@ -81,8 +81,19 @@ nothing.
 ## Invariants — do not break these without being asked
 
 - **A `/out` is acted on only while a request the bot forwarded is still open in
-  that chat.** With nothing pending it is ordinary traffic and must be left
-  completely alone, including the `/add`/`/out`/`/set` ledger commands.
+  that chat** — with **one** exception, below. Otherwise it is ordinary traffic
+  and must be left completely alone, including the `/add`/`/out`/`/set` ledger
+  commands.
+- **The exception: a `/out` from Ethan or Larry in a handling group always
+  completes a cashout**, open request or not — `force_complete_cashout()`.
+  Open requests live in memory, so a redeploy wipes them, and a redeploy is
+  exactly when somebody needs to finish a cashout the bot has forgotten. Before
+  this their `/out` did nothing at all: it sat in the group looking actioned to
+  everyone reading it while the group that asked was told nothing and its books
+  never moved. It relays, books and tells both admins what it did; there is no
+  ❤, because the request it answers is not in memory and neither is its message
+  id. **The crew's `/out` with nothing open is still ignored** — that is what
+  keeps this from firing on chatter.
 - **Only Ethan (`7578145913`) and Larry (`7418675217`) may move ledger figures.**
 - **Anything that changes the ledger must post a message containing BOTH total
   lines.** `recover_ledgers()` rebuilds each group's books after a deploy by
@@ -464,6 +475,7 @@ cashout requests.
 | `tests/test_switch.py` | `/cashout off` stops everything, and survives a redeploy |
 | `tests/test_redaction.py` | No crew name reaches a target group; every other route keeps them |
 | `tests/test_matching.py` | A `/out` settles the request it paid, not the oldest |
+| `tests/test_manual.py` | Ethan and Larry can finish a cashout with nothing open |
 | `backfill.py` | Manual one-off backfill, separate from the boot sweep |
 | `telethon_login.py` | Generates a `TELETHON_SESSION`; `--deploy` for Railway |
 

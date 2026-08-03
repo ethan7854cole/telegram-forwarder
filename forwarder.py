@@ -1585,20 +1585,104 @@ def _match_request(queue, reply_to, text=None):
     return queue[0]
 
 
+async def _deliver_out(out_to, handling, text, username=None, full_name=None,
+                       message_id=None, has_media=False):
+    """Put the /out in front of the group that asked. True if it landed.
+
+    Shared by the ordinary completion and the manual one below, so the two
+    cannot drift: the screenshot, the redaction and the fall-back to plain text
+    have to behave identically whichever route settles the cashout.
+
+    The screenshot is the proof the money went, and the group that asked is the
+    group that wants to see it. copy_message, NEVER forward_message - a forward
+    carries a "Forwarded from" header naming the account it came from and links
+    back to the handling group, and the chime groups are never told who handles
+    their cashouts or that the handling group exists at all."""
+    relay = clean_out_for_relay(text, username, full_name)
+
+    if has_media and message_id is not None:
+        try:
+            await bot.copy_message(out_to, handling, message_id, caption=relay)
+            print(f"🖼️ [CASHOUT] screenshot + /out copied to {chat_name(out_to)}",
+                  flush=True)
+            return True
+        except Exception as e:
+            # Losing the picture is a nuisance; losing the /out strands the
+            # cashout. Fall through and send the instruction on its own.
+            print(f"⚠️ [CASHOUT] could not copy the screenshot to "
+                  f"{chat_name(out_to)}: {e} - sending the /out by itself",
+                  flush=True)
+
+    try:
+        await send_group(out_to, relay)
+        return True
+    except Exception as e:
+        print(f"❌ [CASHOUT] /out could not be sent to {chat_name(out_to)}: {e}",
+              flush=True)
+        return False
+
+
+async def force_complete_cashout(handling, text, user_id, username,
+                                 full_name=None, message_id=None, has_media=False):
+    """Ethan or Larry finishing a cashout by hand, with nothing open here.
+
+    The standing rule is that a /out with no request pending is ordinary traffic
+    and is left completely alone. That rule is right for the crew and wrong for
+    Ethan and Larry, because open requests live in MEMORY: a redeploy wipes
+    them, and a redeploy is exactly the moment somebody needs to finish a
+    cashout the bot has forgotten. Until now their /out did nothing at all - it
+    sat in the group looking actioned to everyone reading it, while the group
+    that asked was told nothing and its books never moved.
+
+    Ethan and Larry only. The crew's /out with nothing open stays ordinary
+    traffic, which is what keeps this from firing on chatter.
+
+    There is nothing to ❤: the request this answers is not in memory, so its
+    message id is not either. The money side is what matters here, and it is
+    done exactly as the ordinary completion does it."""
+    source = _CASHOUT_HANDLERS.get(handling)
+    if source is None:
+        return
+    out_to = CASHOUT_ROUTES.get(source, {}).get('out_to', source)
+
+    print(f"🔧 [CASHOUT] no request open in {chat_name(handling)} - completing "
+          f"by hand for {username or user_id}", flush=True)
+
+    if not await _deliver_out(out_to, handling, text, username, full_name,
+                              message_id, has_media):
+        return                          # nothing landed, so nothing is booked
+
+    booked = await book_cashout_out(out_to, text)
+
+    await warn_unreachable(await dm_handles(
+        CASHOUT_ADMIN_HANDLES,
+        f"🔧 A /out was completed by hand in {chat_name(handling)}.\n\n"
+        f"Nothing was open there — most likely the request was lost in a "
+        f"redeploy — so it was taken at face value.\n\n"
+        f"Sent to: {chat_name(out_to)}\n"
+        f"Booked: {f'{booked:,.2f}$' if booked else 'nothing (no figure in the /out)'}\n\n"
+        "No ❤ was placed: the original request is not in memory, so there is "
+        "nothing to mark. Worth adding by hand if it is still there."))
+
+
 async def handle_cashout_reply(handling, text, user_id, username, reply_to,
                                full_name=None, message_id=None, has_media=False):
-    """A message in a handling group, while at least one request is open there.
+    """A message in a handling group.
 
-    Nothing here runs unless a request we forwarded is genuinely outstanding, so
-    ordinary traffic - including an ordinary /out - is never touched.
+    Ordinary traffic is never touched - including an ordinary /out - unless a
+    request we forwarded is genuinely outstanding. The one exception is a /out
+    from Ethan or Larry, which completes a cashout even with nothing open; see
+    force_complete_cashout().
 
     `message_id` and `has_media` are what let the screenshot travel with the
-    /out - see the copy_message call below."""
+    /out - see _deliver_out()."""
+    text = text or ''
     queue = _pending_cashouts.get(handling)
     if not queue:
+        if user_id in LEDGER_ADMINS and _OUT_CMD_RE.search(text):
+            await force_complete_cashout(handling, text, user_id, username,
+                                         full_name, message_id, has_media)
         return
-
-    text = text or ''
     responder = _is_responder(user_id, username)
     target = _match_request(queue, reply_to, text)
 
@@ -1634,34 +1718,13 @@ async def handle_cashout_reply(handling, text, user_id, username, reply_to,
     # that the handling group exists at all. A copy arrives as an ordinary
     # message from the bot: the picture, the /out as its caption, and no trace
     # of the sender, their username or the chat it was taken from.
-    # What the chime group actually sees - see clean_out_for_relay(). The
-    # ORIGINAL text is kept for book_cashout_out() below, so nothing done here
-    # can ever change the figure that reaches the ledger.
-    relay = clean_out_for_relay(text, username, full_name)
-
-    delivered = False
-    if has_media and message_id is not None:
-        try:
-            await bot.copy_message(out_to, handling, message_id, caption=relay)
-            delivered = True
-            print(f"🖼️ [CASHOUT] screenshot + /out copied to {chat_name(out_to)}",
-                  flush=True)
-        except Exception as e:
-            # Losing the picture is a nuisance; losing the /out strands the
-            # cashout. Fall through and send the instruction on its own.
-            print(f"⚠️ [CASHOUT] could not copy the screenshot to "
-                  f"{chat_name(out_to)}: {e} - sending the /out by itself",
-                  flush=True)
-
-    if not delivered:
-        try:
-            await send_group(out_to, relay)
-        except Exception as e:
-            # Left open deliberately: the request is not settled until the /out
-            # has actually landed somewhere anyone can see it.
-            print(f"❌ [CASHOUT] /out could not be sent to {chat_name(out_to)}: {e}",
-                  flush=True)
-            return
+    # Left open deliberately if this fails: the request is not settled until the
+    # /out has actually landed somewhere anyone can see it. The ORIGINAL text is
+    # kept for book_cashout_out() below, so the redaction inside _deliver_out()
+    # can never change the figure that reaches the ledger.
+    if not await _deliver_out(out_to, handling, text, username, full_name,
+                              message_id, has_media):
+        return
 
     queue.remove(request)
     if not queue:
