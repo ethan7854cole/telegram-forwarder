@@ -813,10 +813,14 @@ RETRACT_SCAN_LIMIT = int(os.getenv('RETRACT_SCAN_LIMIT', '300'))
 
 
 def remember_delivery(source_key, target, message_id, amount):
-    """Note what a forward put where, so a reaction can undo exactly that."""
+    """Note what a forward put where, so a reaction can undo exactly that.
+
+    The trailing None is the Telethon entity, which only the history fallback
+    has. This id came from our own send, so the bot token can address it
+    directly and no entity is needed."""
     if source_key is None or message_id is None:
         return
-    _delivered.setdefault(source_key, []).append((target, message_id, amount))
+    _delivered.setdefault(source_key, []).append((target, message_id, amount, None))
     while len(_delivered) > RETRACT_MEMORY:
         _delivered.popitem(last=False)
 
@@ -1650,13 +1654,17 @@ async def _find_forwarded_copy(client, target, text):
     try:
         entity = await _resolve_one(client, target)
         if entity is None:
-            return None
+            return None, None
         async for msg in client.iter_messages(entity, limit=RETRACT_SCAN_LIMIT):
             if msg.raw_text and _catchup_signature(msg.raw_text) == want:
-                return msg.id
+                # The entity travels with the id. A message id only means
+                # anything alongside the chat it was read from, and handing the
+                # Bot API an id found this way is what produced "message to
+                # delete not found" on 2026-08-03.
+                return msg.id, entity
     except Exception as e:
         print(f"⚠️ [RETRACT] could not search {chat_name(target)}: {e}", flush=True)
-    return None
+    return None, None
 
 
 async def retract_from_history(rule_key, message_id):
@@ -1679,13 +1687,13 @@ async def retract_from_history(rule_key, message_id):
 
     found = []
     for target in FORWARD_RULES.get(rule_key, []):
-        copy_id = await _find_forwarded_copy(client, target, text)
+        copy_id, entity = await _find_forwarded_copy(client, target, text)
         if copy_id is None:
             print(f"↩️ [RETRACT] no copy of that payment found in "
                   f"{chat_name(target)} within {RETRACT_SCAN_LIMIT} messages",
                   flush=True)
             continue
-        found.append((target, copy_id, amount))
+        found.append((target, copy_id, amount, entity))
     if found:
         print(f"↩️ [RETRACT] recovered {amount:,.2f} from the group history "
               "(not in memory - forwarded before the last restart)", flush=True)
@@ -1729,7 +1737,24 @@ async def retract_payment(chat_id, message_id, user_id):
               flush=True)
         return False
 
-    for target, target_msg_id, amount in entries:
+    for target, target_msg_id, amount, entity in entries:
+        # An empty ledger is "not loaded yet", NOT "zero". Subtracting from a
+        # guess wrote 0.00/0.00 into a live group on 2026-08-03 and made that
+        # the newest totals message, which is what recover_ledgers() then reads
+        # back. The Bot API handles updates on its own schedule and does not
+        # wait for the boot sweep, so this really does happen.
+        if target not in _ledger and _active_client is not None:
+            await recover_one_ledger(_active_client, target)
+        if target not in _ledger:
+            print(f"⛔ [RETRACT] {chat_name(target)} books are not loaded - refusing "
+                  "to subtract from a figure that is only a guess.", flush=True)
+            await notify_admin(
+                f"⚠️ Could not retract from {chat_name(target)}: its running totals "
+                "are not loaded yet, and subtracting from an assumed zero would "
+                "wipe the books.\n\nNothing was changed. Try the reaction again in "
+                "a minute.")
+            continue
+
         before = ledger_snapshot(target)
         after = (max(0.0, before[0] - amount), before[1])
         if amount > before[0]:
@@ -1748,21 +1773,47 @@ async def retract_payment(chat_id, message_id, user_id):
 
         ledger_commit(target, after, f" (retracted {amount:,.2f} by {user_id})")
 
-        try:
-            await bot.delete_message(target, target_msg_id)
+        if await delete_forwarded_copy(target, target_msg_id, entity):
             print(f"🗑️ [RETRACT] {amount:,.2f} taken back off {chat_name(target)} "
                   "and the forwarded copy deleted", flush=True)
-        except Exception as e:
-            # Telegram refuses to let a bot delete a group message older than
-            # 48 hours. The books are already right; only the copy is stranded.
-            print(f"⚠️ [RETRACT] could not delete the copy in {chat_name(target)}: "
-                  f"{e}", flush=True)
+        else:
             await notify_admin(
                 f"⚠️ Retracted {amount:,.2f}$ from {chat_name(target)}, but the "
-                f"forwarded message could not be deleted:\n{e}\n\n"
+                "forwarded message could not be deleted.\n\n"
                 "The totals are correct - the old message is still sitting there "
                 "showing the figures from before. Delete it by hand.")
     return True
+
+
+async def delete_forwarded_copy(target, message_id, entity=None):
+    """Remove the copy, by whichever route can actually address it.
+
+    The bot token is tried first: when the id came from our own send it is
+    exactly right, and the bot is the message's author. When the id was instead
+    FOUND by the userbot, it is only meaningful alongside the entity it was read
+    from - so the user account, holding that entity, is the one that can
+    reliably address it. Handing that id to the Bot API instead is what produced
+    "message to delete not found".
+
+    Telegram also refuses to let a bot delete a group message over 48 hours old,
+    which no amount of routing fixes."""
+    try:
+        await bot.delete_message(target, message_id)
+        return True
+    except Exception as e:
+        print(f"⚠️ [RETRACT] bot could not delete {message_id} in "
+              f"{chat_name(target)}: {e}", flush=True)
+
+    if entity is None or _active_client is None:
+        return False
+    try:
+        await _active_client.delete_messages(entity, [message_id])
+        print(f"🗑️ [RETRACT] deleted via the user account instead", flush=True)
+        return True
+    except Exception as e:
+        print(f"⚠️ [RETRACT] the user account could not delete it either: {e}",
+              flush=True)
+        return False
 
 
 def mention_alert_text(chat_id, who, user_id, when, text):
@@ -2454,36 +2505,46 @@ async def catch_up(client):
         print("⏪ [CATCHUP] nothing missed.", flush=True)
 
 
+async def recover_one_ledger(client, target):
+    """Restore one target's books from the last totals this bot published there.
+
+    Split out of recover_ledgers so anything that needs the books BEFORE the
+    boot sweep has reached them can ask for them. That is not hypothetical: the
+    Bot API starts handling updates on its own schedule, with no dependency on
+    the userbot having connected, so a reaction can arrive while _ledger is
+    still empty."""
+    try:
+        entity = await client.get_entity(target)
+    except Exception as e:
+        print(f"⚠️ [LEDGER] {target} unreachable, will open on first message: {e}",
+              flush=True)
+        return False
+
+    async for message in client.iter_messages(entity, limit=200):
+        sender = await message.get_sender()
+        if BOT_ID is None or getattr(sender, 'id', None) != BOT_ID:
+            continue
+        total_in, total_out = parse_totals(message.raw_text or '')
+        if total_in is None or total_out is None:
+            continue
+        _ledger[target] = {'in': total_in, 'out': total_out}
+        print(f"📒 [LEDGER] {target} recovered: in={total_in:,.2f} "
+              f"out={total_out:,.2f} (from {message.date:%m-%d %H:%M})", flush=True)
+        return True
+
+    print(f"📒 [LEDGER] {target} has no prior totals - opens on first message",
+          flush=True)
+    return False
+
+
 async def recover_ledgers(client):
-    """Rebuild each target's ledger from the last totals this bot published there.
+    """Rebuild every target's ledger from the last totals this bot published.
 
     Railway wipes the filesystem on every deploy, so the books cannot live on
     disk. They live in the messages themselves: the bot's own posts carry the
     figures, so reading the newest one back restores the running totals."""
     for target in sorted(TARGET_CHATS):
-        try:
-            entity = await client.get_entity(target)
-        except Exception as e:
-            print(f"⚠️ [LEDGER] {target} unreachable, will open on first message: {e}",
-                  flush=True)
-            continue
-
-        found = False
-        async for message in client.iter_messages(entity, limit=200):
-            sender = await message.get_sender()
-            if BOT_ID is None or getattr(sender, 'id', None) != BOT_ID:
-                continue
-            total_in, total_out = parse_totals(message.raw_text or '')
-            if total_in is None or total_out is None:
-                continue
-            _ledger[target] = {'in': total_in, 'out': total_out}
-            print(f"📒 [LEDGER] {target} recovered: in={total_in:,.2f} "
-                  f"out={total_out:,.2f} (from {message.date:%m-%d %H:%M})", flush=True)
-            found = True
-            break
-        if not found:
-            print(f"📒 [LEDGER] {target} has no prior totals - opens on first message",
-                  flush=True)
+        await recover_one_ledger(client, target)
 
 
 async def run_userbot():

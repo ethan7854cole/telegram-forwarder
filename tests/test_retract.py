@@ -23,7 +23,7 @@ MHLARRY, PICCASO = -1003894781195, -5350880041      # the one that is not
 ETHAN, LARRY = f.ADMIN_ID, 7418675217
 STRANGER = 999
 
-sent, deleted, dms, failures = [], [], [], []
+sent, deleted, user_deleted, dms, failures = [], [], [], [], []
 _next_id = [4000]
 
 
@@ -68,7 +68,7 @@ def check(label, cond, detail=''):
 
 
 def reset(opening=(100.0, 20.0)):
-    sent.clear(); deleted.clear(); dms.clear()
+    sent.clear(); deleted.clear(); user_deleted.clear(); dms.clear()
     f._ledger.clear(); f._delivered.clear(); f._seen_messages.clear()
     f.bot.fail_send = f.bot.fail_delete = False
     if opening:
@@ -91,18 +91,33 @@ class FakeEntity:
         self.id, self.title, self.username = cid, str(cid), None
 
 
+class Sender:
+    def __init__(self, uid):
+        self.id = uid
+
+
 class TeleMsg:
-    def __init__(self, mid, text):
+    """Defaults to being FROM the bot, since that is what recover_one_ledger
+    accepts - only the bot's own posts carry trustworthy totals."""
+
+    def __init__(self, mid, text, sender_id=111222):
         self.id, self.raw_text = mid, text
+        self.date = NOW
+        self._sender = Sender(sender_id)
+
+    async def get_sender(self):
+        return self._sender
 
 
 class FakeClient:
     """Stands in for the userbot when the in-memory record is gone."""
 
-    def __init__(self, source=None, history=None, resolvable=True):
+    def __init__(self, source=None, history=None, resolvable=True,
+                 can_delete=True):
         self.source = source or {}
         self.history = history or {}
         self.resolvable = resolvable
+        self.can_delete = can_delete
 
     async def get_entity(self, cid):
         if not self.resolvable:
@@ -117,6 +132,12 @@ class FakeClient:
             for m in self.history.get(entity.id, [])[:limit]:
                 yield m
         return gen()
+
+    async def delete_messages(self, entity, ids):
+        if not self.can_delete:
+            raise RuntimeError('not an admin here')
+        user_deleted.append((entity.id, ids[0]))
+        return True
 
 
 async def main():
@@ -277,6 +298,66 @@ async def main():
                                   history={}, resolvable=False)
     check('an unreadable group retracts nothing',
           await f.retract_payment(CHIMEREV, 604, ETHAN) is False)
+    f._active_client = None
+
+    # -- 12. the books must never be subtracted from a guess ----------------
+    # An empty ledger means "not loaded yet", not "zero". Getting this wrong
+    # wrote 0.00/0.00 into a live group and made that the newest totals message.
+    reset(opening=None)                     # exactly what a fresh boot looks like
+    f._delivered.clear()
+    f._active_client = FakeClient(
+        source={700: TeleMsg(700, source_body)},
+        history={GAFFER: [TeleMsg(7799, forwarded_body)]})
+    did = await f.retract_payment(CHIMEREV, 700, ETHAN)
+    check('an unloaded ledger is recovered before subtracting',
+          f.ledger_snapshot(GAFFER) == (100.0, 20.0), str(f.ledger_snapshot(GAFFER)))
+    check('and the retraction then goes through', did is True)
+
+    reset(opening=None)
+    f._delivered.clear()
+    # The copy is there and matches by content, but it is not FROM the bot, so
+    # recover_one_ledger will not trust its totals - leaving the books unknown.
+    f._active_client = FakeClient(
+        source={701: TeleMsg(701, source_body)},
+        history={GAFFER: [TeleMsg(7801, forwarded_body, sender_id=999)]})
+    sent.clear()
+    did = await f.retract_payment(CHIMEREV, 701, ETHAN)
+    check('with no recoverable totals it refuses outright', did is True)
+    check('and never publishes a zeroed ledger',
+          not any('Total In : 0.00' in t for t in totals_posts(GAFFER)), str(sent))
+    check('nothing is deleted when it refuses', deleted == [], str(deleted))
+    check('and Ethan is told why',
+          any('not loaded yet' in t for _, t, _ in dms), str(dms))
+
+    # -- 13. deleting a copy the userbot found -------------------------------
+    # Its id is only meaningful alongside the entity it was read from, so when
+    # the bot token cannot address it the user account must.
+    reset()
+    f._delivered.clear()
+    f.bot.fail_delete = True                # "message to delete not found"
+    f._active_client = FakeClient(
+        source={702: TeleMsg(702, source_body)},
+        history={GAFFER: [TeleMsg(7802, forwarded_body)]})
+    did = await f.retract_payment(CHIMEREV, 702, ETHAN)
+    f.bot.fail_delete = False
+    check('the user account deletes what the bot could not', did is True)
+    check('and it used the entity the message came from',
+          user_deleted == [(GAFFER, 7802)], str(user_deleted))
+    check('so no by-hand warning is sent',
+          not any('could not be deleted' in t for _, t, _ in dms), str(dms))
+
+    reset()
+    f._delivered.clear()
+    f.bot.fail_delete = True
+    f._active_client = FakeClient(
+        source={703: TeleMsg(703, source_body)},
+        history={GAFFER: [TeleMsg(7803, forwarded_body)]}, can_delete=False)
+    await f.retract_payment(CHIMEREV, 703, ETHAN)
+    f.bot.fail_delete = False
+    check('when neither can delete, the books are still right',
+          f.ledger_snapshot(GAFFER)[0] == 90.0, str(f.ledger_snapshot(GAFFER)))
+    check('and Ethan is asked to remove it by hand',
+          any('could not be deleted' in t for _, t, _ in dms), str(dms))
     f._active_client = None
 
     print()

@@ -17,7 +17,7 @@ python3 tests/run.py            # all suites
 python3 tests/run.py cashout    # only matching suites
 ```
 
-544 checks across 16 suites, all stubbed — nothing touches Telegram, the
+555 checks across 16 suites, all stubbed — nothing touches Telegram, the
 network, or the live groups. They cover the pre-existing behaviour as well as
 the new, so they are the guard against a change quietly altering something that
 already worked.
@@ -172,6 +172,17 @@ and takes the amount back off that group's Total In.
   `_catchup_signature()`. The timestamp and the totals are both rewritten on
   the way out, so the name and the amount are all that survive forwarding —
   the same basis the catch-up sweep already uses.
+- **An empty `_ledger` means "not loaded yet", NEVER "zero".** Subtracting from
+  the assumed zero wrote `0.00/0.00` into a live group on 2026-08-03 and made
+  that the newest totals message — which is exactly what `recover_ledgers()`
+  reads back, so the wipe would have survived a redeploy. The Bot API handles
+  updates on its own schedule and does **not** wait for the boot sweep, so a
+  reaction really can arrive before the books exist. `retract_payment()` calls
+  `recover_one_ledger()` first and refuses outright if that fails.
+- **A found message id travels with its entity.** An id only means anything
+  alongside the chat it was read from. Handing the Bot API an id the userbot
+  found produced `message to delete not found`; `delete_forwarded_copy()` tries
+  the bot token first, then the user account holding that entity.
 - **Still bounded by Telegram**, which refuses to let a bot delete a group
   message more than 48 hours old, and by `RETRACT_SCAN_LIMIT` (300 messages).
 
