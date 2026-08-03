@@ -203,6 +203,93 @@ async def main():
     check('and the request stays open',
           len(f._pending_cashouts.get(MHLARRY, [])) == 1)
 
+    # -- 10b. the crew's words are relayed; their names are not -------------
+    # copy_message strips what TELEGRAM attaches. It cannot strip what a person
+    # typed, and the crew do write "sent by @Maynuddin23" on their own
+    # screenshots. The chime groups are never told who handles their cashouts,
+    # so the relayed text is cleaned of crew handles and names first.
+    reset()
+    await open_request()
+    await answer(MHLARRY, '/out 25 - sent by @Maynuddin23', mid=920)
+    cap = copies[0][3] if copies else ''
+    check('a typed crew handle never reaches the chime group',
+          'maynuddin' not in cap.lower(), cap)
+    check('the /out itself survives redaction', '/out 25' in cap, cap)
+    check('and the full amount is still booked',
+          f.ledger_snapshot(PICCASO)[1] == 25.0, str(f.ledger_snapshot(PICCASO)))
+
+    # Every crew handle, not just the sender's.
+    reset()
+    await open_request()
+    await answer(MHLARRY, '/out 25 @MHSUPPORTZONE @maynuddin233 all done', mid=921)
+    cap = copies[0][3] if copies else ''
+    check('the other crew handles go too',
+          'mhsupportzone' not in cap.lower() and 'maynuddin233' not in cap.lower(), cap)
+
+    # Written without the @, it is still a name.
+    reset()
+    await open_request()
+    await answer(MHLARRY, '/out 25 maynuddin233 sent it', mid=922)
+    check('a bare crew name goes as well',
+          'maynuddin' not in (copies[0][3] or '').lower(), str(copies))
+
+    # Somebody new on the crew is exactly what a fixed list would miss.
+    reset()
+    await open_request()
+    await answer(MHLARRY, '/out 25 @somebrandnewguy handled it', mid=923)
+    check('an unknown @handle is stripped too',
+          'somebrandnewguy' not in (copies[0][3] or '').lower(), str(copies))
+
+    # The display name, which is not a handle at all.
+    reset()
+    await open_request()
+    await f.observe_cashout(MHLARRY, '/out 25 done by Maynuddin Ahmed', 924,
+                            datetime.now(timezone.utc), user_id=CREW_ID,
+                            username=CREW_USER, full_name='Maynuddin Ahmed',
+                            has_media=True)
+    check('the sender display name is stripped',
+          'maynuddin ahmed' not in (copies[0][3] or '').lower(), str(copies))
+
+    # The plain-text /out relays verbatim too, so it needs the same cleaning.
+    reset()
+    await open_request()
+    await answer(MHLARRY, '/out 25 - @Maynuddin23 sent it', mid=925, has_media=False)
+    relayed = [t for c, t, _ in sent if c == PICCASO]
+    check('the no-screenshot path is cleaned as well',
+          relayed and 'maynuddin' not in relayed[0].lower(), str(relayed))
+    check('and that amount is booked in full too',
+          f.ledger_snapshot(PICCASO)[1] == 25.0, str(f.ledger_snapshot(PICCASO)))
+
+    # The exact shape, pinned. Subtracting words would leave "/out 25 - sent
+    # by", which reads like a bug and still hints a name was removed. The
+    # message is rebuilt from the figure and the cashtag instead.
+    reset()
+    await open_request()
+    await answer(MHLARRY, '/out 25 $jenny-buhr sent by @Maynuddin23', mid=927)
+    check('a named /out is rebuilt, not patched',
+          copies and copies[0][3] == '/out 25\n$jenny-buhr', str(copies))
+
+    reset()
+    await open_request()
+    await answer(MHLARRY, '/out 40 maynuddin233 handled', mid=928)
+    check('with no cashtag it is just the figure',
+          copies and copies[0][3] == '/out 40', str(copies))
+
+    # A clean /out keeps the crew's own wording, exactly as it always has.
+    reset()
+    await open_request()
+    await answer(MHLARRY, '/out 25 all good mate', mid=929)
+    check('a clean /out is still relayed verbatim',
+          copies and copies[0][3] == '/out 25 all good mate', str(copies))
+
+    # What must NOT be touched: the cashtag is the whole point of the message.
+    reset()
+    await open_request()
+    await answer(MHLARRY, '/out 120\n$Hawkins-Floral-Decor', mid=926)
+    cap = copies[0][3] if copies else ''
+    check('a cashtag is left alone', '$Hawkins-Floral-Decor' in cap, cap)
+    check('and so is the figure', '/out 120' in cap, cap)
+
     # -- 10. a captioned CASHOUT REQUEST is never dispatched at all ---------
     # This gate sits UPSTREAM of observe_cashout(), in media_concerns_cashout():
     # captioned media reaches the cashout flow only when the caption carries a

@@ -17,7 +17,7 @@ python3 tests/run.py            # all suites
 python3 tests/run.py cashout    # only matching suites
 ```
 
-676 checks across 20 suites, all stubbed — nothing touches Telegram, the
+710 checks across 21 suites, all stubbed — nothing touches Telegram, the
 network, or the live groups. They cover the pre-existing behaviour as well as
 the new, so they are the guard against a change quietly altering something that
 already worked.
@@ -242,6 +242,34 @@ screenshot proving the money went. Both travel to the chime group that asked, as
   is the crew signalling they are stuck — it raises the alarm through
   `flag_cashout_issue()` and is not relayed anywhere.
 
+## No crew name ever reaches a target group
+
+`copy_message` strips what *Telegram* attaches. It cannot strip what a person
+typed, and the crew do write "sent by @Maynuddin23" on their own screenshots.
+The chime and VENMO groups are told figures, never who moved them.
+
+- **Guarded at the door, not at each caller.** `send_group()` is the single
+  outbound function; it redacts whenever the destination is in `TARGET_CHATS`.
+  That is what makes "never" true for messages that do not exist yet — a new
+  milestone, a new correction, anything added later.
+- **`strip_identities()` takes out ANY `@mention`**, not only the configured
+  ones, because somebody new on the crew is exactly what a fixed list misses.
+  Bare names go too: a handle written without its `@` is still a name. The
+  known set is read from `CASHOUT_CREW_HANDLES`, `CASHOUT_RESPONDERS` and
+  `CASHOUT_MENTIONS`, so there is no second list to forget.
+- **A named `/out` is rebuilt, not patched.** Subtracting words leaves
+  `/out 25 - sent by`, which reads like a bug and still hints a name was
+  removed. `clean_out_for_relay()` rebuilds it as the figure and the cashtag —
+  `/out 25` and `$jenny-buhr` — and the screenshot still travels. A `/out` with
+  nothing to hide is relayed **verbatim**, exactly as before.
+- **The ledger reads the original.** `book_cashout_out()` is passed the
+  untouched text, so redaction can never change the figure that reaches the
+  books.
+- **The mirror matters just as much**, and is the easier thing to break: the
+  handling groups are tagged with those exact handles on every request, and the
+  DM naming who is stuck would be worthless redacted. Both are pass-throughs
+  and both are tested.
+
 ## Marking a cashout done
 
 The ❤ on the original request is the **only durable record** that a cashout was
@@ -407,6 +435,7 @@ cashout requests.
 | `tests/test_screenshot.py` | The screenshot travels with the `/out`, carrying no identity |
 | `tests/test_heart.py` | A cashout that cannot be marked done is not silent |
 | `tests/test_switch.py` | `/cashout off` stops everything, and survives a redeploy |
+| `tests/test_redaction.py` | No crew name reaches a target group; every other route keeps them |
 | `backfill.py` | Manual one-off backfill, separate from the boot sweep |
 | `telethon_login.py` | Generates a `TELETHON_SESSION`; `--deploy` for Railway |
 

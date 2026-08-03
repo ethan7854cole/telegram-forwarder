@@ -137,7 +137,7 @@ bot = AsyncTeleBot(BOT_TOKEN)
 
 async def notify_admin(msg):
     try:
-        await bot.send_message(ADMIN_ID, msg)
+        await send_group(ADMIN_ID, msg)
     except Exception as e:
         print(f"Notify Admin Error: {e}", flush=True)
 
@@ -421,7 +421,7 @@ async def check_milestones(target, before, after):
     for kind, level, body in alerts:
         print(f"🏁 [MILESTONE {kind}] ${level:,} crossed in {target}", flush=True)
         try:
-            await bot.send_message(target, body)
+            await send_group(target, body)
             print(f"   🎯 {kind} milestone sent to {target}", flush=True)
         except Exception as e:
             print(f"   ❌ milestone send failed for {target}: {e}", flush=True)
@@ -581,7 +581,7 @@ async def idle_watchdog():
             if quiet < due:
                 continue
             try:
-                await bot.send_message(target, idle_alert_text(target, due, slot['sent']))
+                await send_group(target, idle_alert_text(target, due, slot['sent']))
                 slot['sent'] += 1
                 print(f"⏳ [IDLE] {target} quiet {_humanise(due)}, "
                       f"prompt #{slot['sent']} sent", flush=True)
@@ -1058,6 +1058,119 @@ def _is_responder(user_id, username):
     return user_id in LEDGER_ADMINS        # Ethan and Larry always count
 
 
+# A Telegram @username: 5-32 characters, starting with a letter. The lookbehind
+# is what keeps "bob@larryyxx" from matching, exactly as the mention watch does.
+_HANDLE_RE = re.compile(r'(?<![\w@])@[A-Za-z][A-Za-z0-9_]{3,31}')
+
+
+def _crew_identifiers():
+    """Every handle the config knows the crew by, lowercased and without the @.
+
+    Read from the live config rather than hardcoded, so adding somebody to
+    CASHOUT_CREW_HANDLES or CASHOUT_MENTIONS covers this too and there is no
+    second list to forget."""
+    words = set()
+    for handle in list(CASHOUT_CREW_HANDLES) + list(CASHOUT_RESPONDERS):
+        words.add(str(handle).lower().lstrip('@'))
+    for handle in CASHOUT_MENTIONS.split():
+        words.add(handle.strip().lower().lstrip('@'))
+    return {w for w in words if w}
+
+
+def strip_identities(text, username=None, full_name=None):
+    """Take every crew handle and name out of something bound for a chime group.
+
+    The /out is relayed verbatim, which is right for the figure and wrong for
+    the people: a crew member typing "sent by @Maynuddin23" on their own
+    screenshot would put that straight into the group that asked. The chime
+    groups are never told who handles their cashouts.
+
+    ANY @mention goes, not only the ones in the config - somebody new on the
+    crew is exactly the case a fixed list would miss. Bare names go too, since
+    a handle written without its @ is still a name.
+
+    Only what is RELAYED is cleaned. book_cashout_out() reads the original, so
+    the amount can never be redacted out from under the ledger."""
+    if not text:
+        return text
+
+    cleaned = _HANDLE_RE.sub('', text)
+
+    names = set(_crew_identifiers())
+    if username:
+        names.add(str(username).lower().lstrip('@'))
+    # Longest first, so "maynuddin233" is not left as a stray "3" by "maynuddin23".
+    phrases = sorted(names, key=len, reverse=True)
+    if full_name and full_name.strip():
+        phrases.insert(0, full_name.strip().lower())
+
+    for phrase in phrases:
+        if phrase:
+            cleaned = re.sub(r'(?<!\w)' + re.escape(phrase) + r'(?!\w)', '',
+                             cleaned, flags=re.I)
+
+    cleaned = re.sub(r'[ \t]{2,}', ' ', cleaned)
+    cleaned = re.sub(r'[ \t]+(\r?\n)', r'\1', cleaned)
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    cleaned = cleaned.strip()
+
+    # Redacting everything away would leave nothing to send, and an empty
+    # message is a failed send - which leaves the request open and the cashout
+    # unanswered. The instruction itself is what has to survive.
+    return cleaned or '/out'
+
+
+# A cashtag, never an amount: $jenny-buhr and $Hawkins-Floral-Decor match,
+# $500 does not, because the character after the $ must be a letter.
+_CASHTAG_RE = re.compile(r'\$[A-Za-z][\w.\-]*')
+
+
+def clean_out_for_relay(text, username=None, full_name=None):
+    """What the chime group is shown when the /out named somebody.
+
+    A /out with nothing to hide is relayed **verbatim**, exactly as it always
+    has been - the crew's own wording is theirs and the group that asked is
+    used to seeing it.
+
+    When it does name somebody, subtracting the words leaves a sentence with
+    holes in it - "/out 25 - sent by" - which reads like a bug and still hints
+    that a name was removed. So the message is rebuilt instead, from the only
+    two things the group that asked actually needs: the figure and the cashtag.
+    The screenshot still travels; only the words around it are replaced."""
+    cleaned = strip_identities(text, username, full_name)
+    if cleaned == text:
+        return text                     # nothing was hidden - leave it alone
+
+    amount = _OUT_AMOUNT_RE.search(text or '')
+    cashtag = _CASHTAG_RE.search(cleaned)
+
+    rebuilt = f"/out {amount.group(1)}" if amount else '/out'
+    if cashtag:
+        rebuilt += f"\n{cashtag.group(0)}"
+    print(f"🧾 [CASHOUT] the /out named somebody - relaying it as "
+          f"{rebuilt.splitlines()[0]!r} only", flush=True)
+    return rebuilt
+
+
+async def send_group(chat_id, text, **kwargs):
+    """The one door out. Everything the bot says goes through here.
+
+    A crew handle must never reach a TARGET group - CHIME PICCASO, CHIME
+    GAFFER or either VENMO group. Those groups are told figures and never who
+    moved them, and that has to hold for every message, not only the /out
+    relay: a forwarded payment, a milestone, a correction, anything added
+    later. Guarding the door rather than each caller is what makes "never"
+    true, including for code that does not exist yet.
+
+    Everywhere else is a pass-through. It has to be: the handling groups are
+    tagged with those exact handles on every request, which is the whole point
+    of CASHOUT_MENTIONS, and the DMs to Ethan and Larry deliberately name the
+    crew member who is stuck."""
+    if chat_id in TARGET_CHATS:
+        text = strip_identities(text)
+    return await bot.send_message(chat_id, text, **kwargs)
+
+
 async def dm_handles(handles, text):
     """Private warning to each of these handles. Returns those it could not reach.
 
@@ -1072,7 +1185,7 @@ async def dm_handles(handles, text):
         user_id = _user_ids.get(key)
         if user_id:
             try:
-                await bot.send_message(user_id, text)
+                await send_group(user_id, text)
                 sent = True
                 print(f"✉️ [CASHOUT] DM sent to @{handle} via bot", flush=True)
             except Exception as e:
@@ -1219,7 +1332,7 @@ async def open_cashout_request(source, text, sent_at, origin_msg_id):
 
     body = f"{correct_timestamp(text, sent_at)}\n\n{CASHOUT_MENTIONS}"
     try:
-        sent = await bot.send_message(handling, body)
+        sent = await send_group(handling, body)
     except Exception as e:
         _release_cashout(handling, fingerprint)
         print(f"❌ [CASHOUT] could not post {chat_name(source)} request to "
@@ -1294,7 +1407,7 @@ async def book_cashout_out(origin, text):
     before = ledger_snapshot(origin)
     after = (before[0], before[1] + amount)
     try:
-        await bot.send_message(origin,
+        await send_group(origin,
                                f"📤 Out = -{amount:,.2f}$\n\n"
                                f"📊 Group Total:\n"
                                f"➕ Total In : {after[0]:,.2f}$\n"
@@ -1474,10 +1587,15 @@ async def handle_cashout_reply(handling, text, user_id, username, reply_to,
     # that the handling group exists at all. A copy arrives as an ordinary
     # message from the bot: the picture, the /out as its caption, and no trace
     # of the sender, their username or the chat it was taken from.
+    # What the chime group actually sees - see clean_out_for_relay(). The
+    # ORIGINAL text is kept for book_cashout_out() below, so nothing done here
+    # can ever change the figure that reaches the ledger.
+    relay = clean_out_for_relay(text, username, full_name)
+
     delivered = False
     if has_media and message_id is not None:
         try:
-            await bot.copy_message(out_to, handling, message_id, caption=text)
+            await bot.copy_message(out_to, handling, message_id, caption=relay)
             delivered = True
             print(f"🖼️ [CASHOUT] screenshot + /out copied to {chat_name(out_to)}",
                   flush=True)
@@ -1490,7 +1608,7 @@ async def handle_cashout_reply(handling, text, user_id, username, reply_to,
 
     if not delivered:
         try:
-            await bot.send_message(out_to, text)
+            await send_group(out_to, relay)
         except Exception as e:
             # Left open deliberately: the request is not settled until the /out
             # has actually landed somewhere anyone can see it.
@@ -1682,7 +1800,7 @@ async def nudge_unacknowledged(handling, request, waited):
     forwarded, booked and hearted, and Larry was told on the first round."""
     request['nudges'] += 1
     try:
-        await bot.send_message(handling, cashout_nudge_text(waited),
+        await send_group(handling, cashout_nudge_text(waited),
                                reply_to_message_id=request['message_id'])
         print(f"⏰ [CASHOUT] reminder #{request['nudges']} in {chat_name(handling)} "
               f"after {_humanise(waited)}", flush=True)
@@ -1831,7 +1949,7 @@ async def deliver_to_target(target, fixed, text, from_bot, source_key=None):
         body = rewrite_totals(fixed, *ledger_snapshot(target))
     try:
         # Always sent with the bot token, never from the user account.
-        sent = await bot.send_message(target, body)
+        sent = await send_group(target, body)
     except Exception as e:
         # Nothing committed: the ledger stays level with the last message
         # the group can actually see.
@@ -2012,7 +2130,7 @@ async def retract_payment(chat_id, message_id, user_id):
         if amount > before[0]:
             print(f"⛔ [RETRACT] {amount:,.2f} is more than {chat_name(target)} has "
                   f"in Total In ({before[0]:,.2f}) - refusing.", flush=True)
-            await bot.send_message(
+            await send_group(
                 target,
                 f"⛔ Retracting {amount:,.2f}$ would take Total In below zero.\n\n"
                 f"➕ Total In : {before[0]:,.2f}$\n"
@@ -2022,7 +2140,7 @@ async def retract_payment(chat_id, message_id, user_id):
         after = (before[0] - amount, before[1])
 
         try:
-            await bot.send_message(target, retract_text(amount, after))
+            await send_group(target, retract_text(amount, after))
         except Exception as e:
             # Nothing committed and nothing deleted: the copy stays, and so do
             # the books that match it.
@@ -2174,7 +2292,7 @@ async def help_command(message):
         return
 
     groups = ' or '.join(IDLE_NAMES[t] for t in sorted(IDLE_ALERT_CHATS))
-    await bot.send_message(message.chat.id,
+    await send_group(message.chat.id,
         "📖 COMMANDS\n"
         "\n"
         f"LEDGER — type these inside {groups}\n"
@@ -2307,7 +2425,7 @@ async def ledger_command(message):
         heading = f"📤 Out = -{amount:,.2f}$"
 
     try:
-        await bot.send_message(chat_id,
+        await send_group(chat_id,
                                f"{heading}\n\n"
                                f"📊 Group Total:\n"
                                f"➕ Total In : {after[0]:,.2f}$\n"
@@ -2420,7 +2538,7 @@ async def cashout_switch_command(message):
             await bot.reply_to(message, text)
         else:
             try:
-                await bot.send_message(user_id, text)
+                await send_group(user_id, text)
             except Exception as e:
                 print(f"⚠️ [SWITCH] could not confirm privately to {user_id}: {e}",
                       flush=True)
@@ -2516,7 +2634,7 @@ async def ledger_set_command(message):
     after = (amount, before[1]) if column == 'in' else (before[0], amount)
 
     try:
-        await bot.send_message(chat_id,
+        await send_group(chat_id,
                                f"✏️ Corrected: Total {'In' if column == 'in' else 'Out'} "
                                f"set to {amount:,.2f}$\n\n"
                                f"📊 Group Total:\n"
