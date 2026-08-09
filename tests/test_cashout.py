@@ -160,9 +160,10 @@ async def main():
           len(sent) == 1, str(sent))
 
     # -- 7e. acknowledged, then answered with anything but a /out ------------
-    # Different in kind from silence: somebody is engaged and still not sending
-    # the /out, which usually means they have hit a problem. Ethan and Larry
-    # hear at once rather than after the 7-minute window.
+    # Somebody is engaged and still not sending the /out, which usually means
+    # they have hit a problem. The alert is HELD first: the crew routinely edit
+    # the /out onto the message they just sent, and firing on the first version
+    # would make an alert out of the ordinary way they work.
     ETHAN, LARRY = f.ADMIN_ID, 7418675217
     f._user_ids['larryyxx'] = LARRY
 
@@ -176,8 +177,15 @@ async def main():
     await f.observe_cashout(MHLARRY, 'cashapp is not letting me', 941, now,
                             user_id=77, username='Maynuddin23',
                             full_name='Maynuddin Ahmed')
+    check('nothing is sent while the hold is running',
+          [t for _, t in dms if 'SOMETHING IS WRONG' in t] == [], str(dms))
+    check('but the alert is armed', req['issue_due'] is not None)
+
+    req['issue_due'] = datetime.now(timezone.utc) - timedelta(seconds=1)
+    await f.flush_pending_issue(MHLARRY, req)
     alerts = [t for uid, t in dms if 'SOMETHING IS WRONG' in t]
-    check('Ethan and Larry are both told at once', len(alerts) == 2, str(dms))
+    check('Ethan and Larry are both told once the hold is up',
+          len(alerts) == 2, str(dms))
     check('the crew are NOT told', not [t for uid, t in dms if uid == 77], str(dms))
     check('it names which crew member',
           alerts and '@Maynuddin23' in alerts[0] and 'Maynuddin Ahmed' in alerts[0],
@@ -206,6 +214,8 @@ async def main():
     dms.clear()
     await f.observe_cashout(MHLARRY, None, 944, now, user_id=77,
                             username='Maynuddin23', has_media=True)
+    req['issue_due'] = datetime.now(timezone.utc) - timedelta(seconds=1)
+    await f.flush_pending_issue(MHLARRY, req)
     check('a bare screenshot after acknowledging raises the alert',
           len([t for uid, t in dms if 'SOMETHING IS WRONG' in t]) == 2, str(dms))
 
@@ -282,7 +292,9 @@ async def main():
     f._user_ids['maynuddin23'] = 555            # learned id, so the bot can DM
     await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $700', 930, now, user_id=42)
     req = f._pending_cashouts[MHLARRY][0]
-    req['last_seen'] = now - timedelta(minutes=6)        # push past the timeout
+    # The ladder runs on absolute time from when the request was posted, so it
+    # is 'opened' - not 'last_seen' - that makes a rung due.
+    req['opened'] = datetime.now(timezone.utc) - timedelta(minutes=6)
     sent.clear(); dms.clear()
 
     real_sleep = asyncio.sleep
@@ -311,29 +323,54 @@ async def main():
     check('Ethan and Larry both warned', len(admin_dms) == 2, str(len(admin_dms)))
     check('admin DMs carry the routing',
           all('From:' in t and 'Waiting in:' in t for t in admin_dms), str(admin_dms))
-    check('the crew were warned too', len(crew_dms) == 1, str(len(crew_dms)))
+    # The point of the whole change: while the group ladder is still running,
+    # the crew are tagged in the GROUP and nowhere else.
+    check('the crew are NOT DMed while the group ladder runs',
+          len(crew_dms) == 0, str(crew_dms))
+    check('at least one reminder went out', req['nudges'] >= 1, str(req['nudges']))
+    check('request stays open while unanswered', MHLARRY in f._pending_cashouts)
+    check('the reminder is not signed -ETHAN',
+          nudges and 'ETHAN' not in nudges[0][1], nudges[0][1] if nudges else '')
+
+    # ...and only once it has run out does the private word go to them.
+    sent.clear(); dms.clear()
+    req['opened'] = datetime.now(timezone.utc) - timedelta(minutes=18)
+    f.asyncio.sleep = fast
+    task = asyncio.create_task(f.cashout_watchdog())
+    await real_sleep(0.25)
+    task.cancel()
+    f.asyncio.sleep = real_sleep
+
+    crew_dms = [t for uid, t in dms if uid == 555]        # learned id, above
+    check('the crew get their one DM once past 17 min',
+          len(crew_dms) == 1, str(len(crew_dms)))
     check('crew DM carries no routing',
           all('From:' not in t and 'Waiting in:' not in t for t in crew_dms), str(crew_dms))
     check('crew DM names no group',
           not any(n in t for t in crew_dms
                   for n in ('CHIME PICCASO', 'MH X LARRY', 'CHIME GAFFER', 'Chime Rev')),
           str(crew_dms))
-    check('group reminders stop after three rounds (5/10/15 min)',
-          f.CASHOUT_MAX_NUDGES == 3, str(f.CASHOUT_MAX_NUDGES))
-    check('an acknowledged request gets a longer window than a silent one',
-          f.CASHOUT_SEEN_MINUTES == 7 and f.CASHOUT_TIMEOUT_MINUTES == 5,
-          str((f.CASHOUT_SEEN_MINUTES, f.CASHOUT_TIMEOUT_MINUTES)))
-    check('at least one reminder went out', req['nudges'] >= 1, str(req['nudges']))
-    check('request stays open while unanswered', MHLARRY in f._pending_cashouts)
-    check('the reminder is not signed -ETHAN',
-          nudges and 'ETHAN' not in nudges[0][1], nudges[0][1] if nudges else '')
+    # Jumping the clock past several rungs at once - what a /cashout off pause
+    # does - catches up with ONE post, never one per missed rung.
+    check('a skipped ladder catches up with a single post',
+          len([s for s in sent if s[0] == MHLARRY]) == 1, str(sent))
+    check('group reminders run at 5, 8 and 12 minutes',
+          f.CASHOUT_NUDGE_MINUTES == [5, 8, 12], str(f.CASHOUT_NUDGE_MINUTES))
+    check('the crew DM waits for 10 minutes of silence',
+          f.CASHOUT_CREW_DM_MINUTES == 10, str(f.CASHOUT_CREW_DM_MINUTES))
+    check('an acknowledged request gives Larry the word 6 minutes on',
+          f.CASHOUT_SEEN_DM_MINUTES == 6, str(f.CASHOUT_SEEN_DM_MINUTES))
+    check('chasing stops once the crew have been told', req['exhausted'] is True)
+    check('the request is still open after chasing stops',
+          MHLARRY in f._pending_cashouts)
 
     # -- NOTHING the bot posts into a handling group carries Ethan's name ----
     reset()
     await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $400', 960, now, user_id=42)
     await f.observe_cashout(GAFFER, 'CASHOUT REQUEST $60', 961, now, user_id=42)
     for chat in (MHLARRY, CHIMEREV):
-        f._pending_cashouts[chat][0]['last_seen'] = now - timedelta(minutes=6)
+        f._pending_cashouts[chat][0]['opened'] = (
+            datetime.now(timezone.utc) - timedelta(minutes=6))
     f.asyncio.sleep = fast
     task = asyncio.create_task(f.cashout_watchdog())
     await real_sleep(0.25)

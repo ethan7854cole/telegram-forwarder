@@ -47,6 +47,18 @@ async def open_one():
     return f._pending_cashouts[MHLARRY][0]
 
 
+def clock(req, waited, seen_min=None):
+    """Place a request `waited` minutes after it opened.
+
+    Both marks are set relative to 'opened', never to the wall clock, because
+    the acknowledged ladder is measured from the gap between them - moving one
+    without the other silently changes which mark Larry's notice lands on."""
+    now = datetime.now(timezone.utc)
+    req['opened'] = now - timedelta(minutes=waited)
+    if seen_min is not None:
+        req['seen_at'] = req['opened'] + timedelta(minutes=seen_min)
+
+
 async def run_watchdog(seconds=0.2):
     async def fast(_): await real_sleep(0.01)
     f.asyncio.sleep = fast
@@ -73,69 +85,89 @@ class Reaction:
 async def main():
     now = datetime.now(timezone.utc)
 
-    # -- a crew reaction resets the clock ------------------------------------
+    # -- a crew reaction takes the chase OUT of the group --------------------
     reset()
+    f._user_ids['larryyxx'] = LARRY
     req = await open_one()
     req['last_seen'] = now - timedelta(minutes=10)          # overdue
     ok = await f.note_cashout_seen(MHLARRY, req['message_id'], 77, 'Maynuddin23')
     check('a crew reaction is accepted', ok is True)
-    check('the clock is back to zero',
+    check('it records that somebody engaged',
           (datetime.now(timezone.utc) - req['last_seen']).total_seconds() < 5)
     check('the request is marked seen', req['seen'] is True)
+    check('it records when it was acknowledged', req['seen_at'] is not None)
+    check('and by whom', bool(req['seen_by']), str(req['seen_by']))
     check('it does NOT close the request', MHLARRY in f._pending_cashouts)
 
-    # -- and that buys a full timeout of quiet -------------------------------
-    sent.clear()
-    await run_watchdog()
-    check('no reminder inside the fresh timeout', sent == [], str(sent))
-
-    # -- a reaction buys 7 minutes, not the 5 an unanswered request gets ------
-    req['last_seen'] = datetime.now(timezone.utc) - timedelta(minutes=6)
+    # -- nothing happens in the six minutes after the reaction ---------------
     sent.clear(); dms.clear()
+    clock(req, 8, seen_min=3)                  # five minutes since the reaction
     await run_watchdog()
-    check('6 minutes is not yet up for an acknowledged request',
+    check('nothing before the six minutes are up',
           sent == [] and dms == [], str((sent, dms)))
 
-    # -- when the 7 minutes lapse, the chase goes PRIVATE ---------------------
-    # They acknowledged it in the group, so tagging them there again is noise.
-    req['last_seen'] = datetime.now(timezone.utc) - timedelta(minutes=8)
-    sent.clear(); dms.clear()
+    # -- six minutes on, the GROUP stays silent and Larry is told instead ----
+    clock(req, 9, seen_min=3)                  # six minutes since the reaction
     await run_watchdog()
-    check('an acknowledged request is never re-tagged in the group',
+    check('an acknowledged request is NOT re-tagged in the group',
           sent == [], str(sent))
-    crew = [t for uid, t in dms if uid == 77]
-    check('the crew are told privately instead', len(crew) == 1, str(dms))
-    check('and their DM carries no routing',
-          crew and 'Waiting in:' not in crew[0], str(crew))
-    check('Larry is not pulled in yet',
-          not [t for uid, t in dms if uid == LARRY], str(dms))
-
-    # -- one window later it is handed to Larry, and the chasing stops --------
-    req['last_seen'] = datetime.now(timezone.utc) - timedelta(minutes=8)
-    sent.clear(); dms.clear()
-    await run_watchdog()
-    check('Larry gets the acknowledged-but-stuck notice',
-          any('Acknowledged in the group' in t for _, t in dms), str(dms))
-    check('the chasing is now exhausted', req['exhausted'] is True)
+    larry = [t for uid, t in dms if uid == LARRY]
+    check('Larry is told six minutes after the reaction',
+          len(larry) == 1, str(dms))
+    check('his notice says acknowledged and still not processed',
+          larry and 'ACKNOWLEDGED BUT STILL NOT PROCESSED' in larry[0], str(larry))
+    check('it names who acknowledged it',
+          larry and '@Maynuddin23' in larry[0], str(larry))
+    check('it carries the routing, as every admin DM does',
+          larry and 'Waiting in:' in larry[0] and 'From:' in larry[0], str(larry))
+    check('the crew are not DMed', [t for uid, t in dms if uid == 77] == [], str(dms))
+    check('the chasing is over', req['exhausted'] is True)
     check('but the request stays OPEN for a late /out', MHLARRY in f._pending_cashouts)
 
+    # -- and nothing more, ever - including at the crew's 10-minute mark -----
     sent.clear(); dms.clear()
-    for _ in range(3):
-        req['last_seen'] = datetime.now(timezone.utc) - timedelta(minutes=8)
+    for minutes in (10, 12, 17, 20, 30):
+        clock(req, minutes, seen_min=3)
         await run_watchdog()
-    check('nothing at all repeats after that', sent == [] and dms == [],
-          str((sent, dms)))
+    check('no group post and no DM of any kind after that',
+          sent == [] and dms == [], str((sent, dms)))
 
-    # -- unacknowledged: three group rounds, then reminders stop -------------
+    # -- acknowledged AFTER everything else has run out ---------------------
+    # The six minutes run from the acknowledgement, so reacting late does not
+    # shorten them - and the request is picked back up even though chasing had
+    # already stopped.
+    reset()
+    f._user_ids['larryyxx'] = LARRY
+    req = await open_one()
+    clock(req, 13)
+    await run_watchdog()                       # burns the ladder and the crew DM
+    check('chasing had already stopped', req['exhausted'] is True)
+    await f.note_cashout_seen(MHLARRY, req['message_id'], 77, 'Maynuddin23')
+    sent.clear(); dms.clear()
+
+    clock(req, 18, seen_min=14)                # four minutes since the reaction
+    await run_watchdog()
+    check('a late acknowledgement does not shorten the six minutes',
+          [t for uid, t in dms if uid == LARRY] == [], str(dms))
+
+    clock(req, 20, seen_min=14)                # six minutes since the reaction
+    await run_watchdog()
+    check('a late acknowledgement still reaches Larry',
+          [t for uid, t in dms if uid == LARRY] != [], str(dms))
+    check('and the crew are not chased again on top of it',
+          [t for uid, t in dms if uid == 77] == [], str(dms))
+    check('nothing goes back into the group either', sent == [], str(sent))
+
+    # -- unacknowledged: three group rounds across the whole ladder ----------
     reset()
     req = await open_one()
     rounds = 0
-    for _ in range(9):
-        req['last_seen'] = datetime.now(timezone.utc) - timedelta(minutes=6)
+    for minutes in (4, 5, 6, 8, 9, 12, 13, 14, 16):
+        req['opened'] = datetime.now(timezone.utc) - timedelta(minutes=minutes)
         sent.clear()
         await run_watchdog()
         if sent: rounds += 1
-    check('group reminders stop after the 15-minute cap', rounds == 3, str(rounds))
+    check('exactly three group reminders across the ladder', rounds == 3, str(rounds))
     check('the request is still open', MHLARRY in f._pending_cashouts)
 
     # -- a reaction from someone not tagged means nothing --------------------
@@ -148,12 +180,16 @@ async def main():
     check('a stranger reaction does not move the clock', req['last_seen'] == stale)
     check('a stranger reaction does not mark it seen', req['seen'] is False)
 
-    # -- Ethan and Larry count too -------------------------------------------
+    # -- Ethan and Larry do NOT count ----------------------------------------
+    # They used to. Acknowledgement now stops the group chase outright, so an
+    # admin reacting would silence the very reminders meant for the crew.
     reset()
     req = await open_one()
     req['last_seen'] = datetime.now(timezone.utc) - timedelta(minutes=10)
-    check('Larry reacting counts',
-          await f.note_cashout_seen(MHLARRY, req['message_id'], 7418675217, None) is True)
+    check('Larry reacting does NOT acknowledge it',
+          await f.note_cashout_seen(MHLARRY, req['message_id'], LARRY, None) is False)
+    check('and it stays unacknowledged', req['seen'] is False)
+    check('so the group chase is untouched', req['seen_at'] is None)
 
     # -- a reaction on some OTHER message is ignored -------------------------
     reset()
@@ -301,48 +337,75 @@ async def main():
     check('the heart is applied before Larry is told it completed',
           order == ['heart', 'completed-dm'], str(order))
 
-    # -- nobody reacts: Larry AND the crew are told once, on the first round --
+    # -- nobody reacts: Larry on the first rung, the crew not until 17 min ---
     reset()
     f._user_ids['larryyxx'] = 7418675217
     req = await open_one()
     dms.clear()
-    req['last_seen'] = datetime.now(timezone.utc) - timedelta(minutes=6)
+    req['opened'] = datetime.now(timezone.utc) - timedelta(minutes=6)
     await run_watchdog()
     larry = [t for uid, t in dms if uid == LARRY and 'OUT REQUEST HAS CROSSED' in t]
     crew = [t for uid, t in dms if uid == 77]
-    check('Larry is told on the first round', len(larry) == 1, str(dms))
+    check('Larry is told on the first rung', len(larry) == 1, str(dms))
     check('it carries the request and the routing',
           larry and 'CASHOUT REQUEST $500' in larry[0]
           and 'CHIME PICCASO' in larry[0] and 'MH X LARRY GROUP 2' in larry[0], str(larry))
     check('it says nobody has sent a /out',
           larry and 'Nobody has sent a /out' in larry[0], str(larry))
-    check('the crew are told on the same round', len(crew) == 1, str(dms))
-    check('the crew DM carries no routing',
-          crew and 'Waiting in:' not in crew[0] and 'From:' not in crew[0], str(crew))
+    check('the crew are NOT told on the same rung', len(crew) == 0, str(dms))
 
     dms.clear()
-    for _ in range(3):
-        req['last_seen'] = datetime.now(timezone.utc) - timedelta(minutes=6)
+    for minutes in (8, 9):
+        req['opened'] = datetime.now(timezone.utc) - timedelta(minutes=minutes)
         await run_watchdog()
-    check('no DM is ever repeated on later rounds', dms == [], str(dms))
+    check('the crew are still not DMed before their mark', dms == [], str(dms))
+
+    # 10 minutes, unacknowledged: the crew get their one private word. It sits
+    # BETWEEN two group rungs, and must not cancel the 12-minute one.
+    req['opened'] = datetime.now(timezone.utc) - timedelta(minutes=10)
+    sent.clear()
+    await run_watchdog()
+    crew = [t for uid, t in dms if uid == 77]
+    check('the crew are told at 10 minutes', len(crew) == 1, str(dms))
+    check('the crew DM carries no routing',
+          crew and 'Waiting in:' not in crew[0] and 'From:' not in crew[0], str(crew))
+    check('Larry is not told a second time',
+          len([t for uid, t in dms if uid == LARRY
+               and 'OUT REQUEST HAS CROSSED' in t]) == 0, str(dms))
+    check('the chase is not over - the last rung is still to come',
+          req['exhausted'] is False)
+
+    req['opened'] = datetime.now(timezone.utc) - timedelta(minutes=12)
+    await run_watchdog()
+    check('the 12-minute rung still posts after the crew DM',
+          len(sent) == 1, str(sent))
+    check('and only then is the chase over', req['exhausted'] is True)
+
+    dms.clear(); sent.clear()
+    for minutes in (13, 16, 20, 30):
+        req['opened'] = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+        await run_watchdog()
+    check('nothing repeats after both channels run out',
+          sent == [] and dms == [], str((sent, dms)))
 
     # -- a reacted request escalates privately, never back into the group -----
     reset()
     req = await open_one()
     await f.note_cashout_seen(MHLARRY, req['message_id'], 77, 'Maynuddin23')
     dms.clear(); sent.clear()
-    req['last_seen'] = datetime.now(timezone.utc) - timedelta(minutes=8)
+    clock(req, 8, seen_min=1)
     await run_watchdog()
-    check('an acknowledged request is not re-tagged in the group', sent == [], str(sent))
-    check('the crew get the private word instead',
-          [t for uid, t in dms if uid == 77], str(dms))
+    check('an acknowledged request is never re-tagged in the group',
+          sent == [], str(sent))
+    check('and the crew get no private word either',
+          [t for uid, t in dms if uid == 77] == [], str(dms))
 
     # -- a cap can still be re-imposed ---------------------------------------
     reset()
     f.CASHOUT_MAX_NUDGES = 2
     req = await open_one()
-    for _ in range(5):
-        req['last_seen'] = datetime.now(timezone.utc) - timedelta(minutes=6)
+    for minutes in (5, 6, 8, 9, 12, 13, 14, 16):
+        req['opened'] = datetime.now(timezone.utc) - timedelta(minutes=minutes)
         await run_watchdog()
     check('CASHOUT_MAX_NUDGES still caps when set', req['nudges'] == 2, str(req['nudges']))
     f.CASHOUT_MAX_NUDGES = 0

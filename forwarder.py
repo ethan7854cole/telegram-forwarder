@@ -719,21 +719,61 @@ CASHOUT_CREW_HANDLES = _handle_list(
 CASHOUT_PROGRESS_HANDLES = _handle_list(
     os.getenv('CASHOUT_PROGRESS_DM_HANDLES', 'larryyxx'))
 
-# How long a request may sit with nobody acknowledging it before the first chase.
+# How long a request may sit before the first chase, and the master switch for
+# the whole ladder: 0 disables chasing altogether.
 CASHOUT_TIMEOUT_MINUTES = int(os.getenv('CASHOUT_TIMEOUT_MINUTES', '5'))
 
-# ...and how long a request that HAS been acknowledged may sit. A reaction means
-# somebody has said they are on it, so they get a longer, quieter run at it than
-# the opening silence does - and the next step is a private word rather than
-# another tag in the group.
-CASHOUT_SEEN_MINUTES = int(os.getenv('CASHOUT_SEEN_MINUTES', '7'))
 
-# Group reminders stop after this many rounds - three, so an unacknowledged
-# request is chased at 5, 10 and 15 minutes and then left alone. Stopping is not
-# giving up: the request stays OPEN, so a late /out is still forwarded, booked
-# and hearted, and Larry has already been told privately on the first round.
-# 0 removes the cap and chases forever.
+def _minute_ladder(raw, fallback):
+    """A comma-separated list of minutes, sorted and de-duplicated.
+
+    Anything unreadable falls back rather than emptying the ladder. A typo in a
+    Railway variable must not be the thing that quietly stops cashouts being
+    chased - that failure looks exactly like a quiet day."""
+    try:
+        rungs = sorted({int(m.strip()) for m in raw.split(',') if m.strip()})
+    except ValueError:
+        print(f"⚠️ [CASHOUT] unreadable CASHOUT_NUDGE_MINUTES {raw!r} - "
+              f"using {fallback}", flush=True)
+        return list(fallback)
+    return [m for m in rungs if m > 0] or list(fallback)
+
+
+# The group ladder, in minutes SINCE THE REQUEST WAS POSTED - absolute marks,
+# not gaps between reminders. An unanswered request is re-tagged in the handling
+# group at 5, 8 and 12 minutes, and then the group falls silent.
+#
+# Acknowledging it does not move these. A reaction used to silence the group and
+# start a private ladder instead; it no longer does, because what is being
+# chased is the /out, and "seen" is not "paid".
+CASHOUT_NUDGE_MINUTES = _minute_ladder(
+    os.getenv('CASHOUT_NUDGE_MINUTES', '5,8,12'), [5, 8, 12])
+
+# A request nobody has acknowledged by this point earns the crew one private
+# word - once, and only ever for silence. Reacting to it stops this from firing
+# at all; see CASHOUT_SEEN_DM_MINUTES. 0 removes the private step.
+#
+# It may fall BETWEEN two group rungs, and that is fine: it does not end the
+# group ladder, and the ladder does not end it.
+CASHOUT_CREW_DM_MINUTES = int(os.getenv('CASHOUT_CREW_DM_MINUTES', '10'))
+
+# Once the crew HAVE acknowledged it, the group is left alone and this is how
+# long they get before Larry is told it is still not processed. Measured from
+# the acknowledgement, not from when the request opened.
+CASHOUT_SEEN_DM_MINUTES = int(os.getenv('CASHOUT_SEEN_DM_MINUTES', '6'))
+
+# A hard cap on group rounds, on top of the ladder above; 0 lets the ladder
+# alone decide. Stopping is not giving up: the request stays OPEN, so a late
+# /out is still forwarded, booked and hearted.
 CASHOUT_MAX_NUDGES = int(os.getenv('CASHOUT_MAX_NUDGES', '3'))
+
+# How long to hold the "answered without a /out" alert before sending it.
+#
+# The crew routinely post the message first and EDIT the /out onto it a few
+# seconds later. Firing the moment the first version lands turns the ordinary
+# way they work into an alert, every single time. Holding it means the edit
+# arrives first and there is nothing to report. 0 sends immediately.
+CASHOUT_ISSUE_DELAY_SECONDS = int(os.getenv('CASHOUT_ISSUE_DELAY_SECONDS', '60'))
 
 # The same request arriving twice inside this many seconds is one request
 # delivered twice, not two cashouts, and only the first is posted. Beyond the
@@ -1065,9 +1105,14 @@ def remember_user(sender):
 
 
 def _is_responder(user_id, username):
-    if (username or '').lower() in CASHOUT_RESPONDERS:
-        return True
-    return user_id in LEDGER_ADMINS        # Ethan and Larry always count
+    """Whose engagement counts as the CREW picking a request up.
+
+    Ethan and Larry deliberately do NOT count, though they did until
+    2026-08-09 (`user_id in LEDGER_ADMINS`). Acknowledgement now stops the
+    group chase outright, so an admin reacting would silence the very
+    reminders meant to reach the crew - and an admin looking at a request is
+    not the crew acting on it."""
+    return (username or '').lower() in CASHOUT_RESPONDERS
 
 
 # A Telegram @username: 5-32 characters, starting with a letter. The lookbehind
@@ -1183,12 +1228,17 @@ async def send_group(chat_id, text, **kwargs):
     return await bot.send_message(chat_id, text, **kwargs)
 
 
-async def dm_handles(handles, text):
+async def dm_handles(handles, text, receipts=None):
     """Private warning to each of these handles. Returns those it could not reach.
 
     Bot first, because a message from the bot is the one that fits the rest of
     the system. The user account is the fallback for anyone the bot cannot reach
-    - see USERBOT_SEND."""
+    - see USERBOT_SEND.
+
+    Pass `receipts` a list to collect where each copy landed, which is what makes
+    a message retractable later - see delete_crew_notice(). Which client sent it
+    travels with the id, because an id only means anything alongside the chat it
+    was sent through."""
     unreachable = []
     for handle in handles:
         key = handle.lower()
@@ -1197,8 +1247,10 @@ async def dm_handles(handles, text):
         user_id = _user_ids.get(key)
         if user_id:
             try:
-                await send_group(user_id, text)
+                delivered = await send_group(user_id, text)
                 sent = True
+                if receipts is not None and getattr(delivered, 'message_id', None):
+                    receipts.append(('bot', user_id, delivered.message_id))
                 print(f"✉️ [CASHOUT] DM sent to @{handle} via bot", flush=True)
             except Exception as e:
                 # Almost always "bot can't initiate conversation with a user".
@@ -1206,8 +1258,10 @@ async def dm_handles(handles, text):
 
         if not sent and USERBOT_SEND and _active_client is not None:
             try:
-                await _active_client.send_message(handle, text)
+                delivered = await _active_client.send_message(handle, text)
                 sent = True
+                if receipts is not None and getattr(delivered, 'id', None):
+                    receipts.append(('user', handle, delivered.id))
                 # Messaging the logged-in account itself is allowed on purpose.
                 # Telegram files it under Saved Messages, which that person does
                 # see - and if the session belongs to someone ON this list, the
@@ -1367,16 +1421,27 @@ async def open_cashout_request(source, text, sent_at, origin_msg_id):
         'text': text,
         'origin_msg_id': origin_msg_id,    # in the chime group - gets the ❤
         'message_id': sent.message_id,     # in the handling group - reminders reply to it
-        'opened': now,
-        'last_seen': now,                  # reset by a reply OR a reaction
+        'opened': now,                     # the ladder is measured from here
+        # Moved by a reply OR a reaction. Records that somebody engaged; it no
+        # longer moves the ladder, which runs on absolute time from 'opened'.
+        'last_seen': now,
         'seen': False,                     # somebody has acknowledged it
+        'seen_at': None,                   # ...and when, which picks Larry's mark
+        'seen_by': None,                   # ...and who, for his notice
         'progress_told': False,            # Larry has been told it was picked up
+        'larry_told': False,               # ...and that it is STILL not processed
+        # Where the crew's 17-minute chase landed, so it can be taken back once
+        # the /out arrives - see delete_crew_notice().
+        'crew_notice': [],
         # Each private escalation fires at most ONCE per request. Repeating them
         # every round is what made the chase unreadable, so the group post is
         # the recurring part and a DM is a one-off "this one needs you".
         'crew_told': False,
         'admin_told': False,
         'issue_told': False,               # answered with something that is not a /out
+        'issue_due': None,                 # ...and when to say so, if the edit never comes
+        'issue_who': None,                 # ...and who it was
+        'mismatch_told': False,            # paid a different figure than it asked for
         'nudges': 0,
         'exhausted': False,
     }
@@ -1474,23 +1539,60 @@ async def flag_cashout_issue(handling, request, user_id, username, full_name=Non
     """A crew member who already acknowledged a request posts something that is
     not a /out.
 
-    Different in kind from silence, so it does not wait for the 7-minute window:
-    somebody is engaged with this request and still not sending the /out, which
-    usually means they have hit a problem. Ethan and Larry are told at once, and
-    the crew are NOT - they are the ones being asked about, and they already
-    have the request in front of them.
+    Different in kind from silence: somebody is engaged with this request and
+    still not sending the /out, which usually means they have hit a problem.
+    Ethan and Larry hear about it; the crew are NOT told - they are the ones
+    being asked about, and they already have the request in front of them.
 
-    Once per request, like every other private escalation here."""
+    This ARMS the alert rather than sending it. The crew routinely post the
+    message first and edit the /out onto it seconds later, so firing on the
+    first version turns the ordinary way they work into an alert every time.
+    Holding it for CASHOUT_ISSUE_DELAY_SECONDS lets the edit land first - and
+    an edit that carries a /out settles the request, which drops it from the
+    queue and means this never fires at all.
+
+    Armed once per request. A second message during the hold does NOT push the
+    deadline out, or somebody typing steadily would defer it forever."""
+    if request['issue_told'] or request['issue_due']:
+        return
+    who = describe_user(username, full_name)
+    request['issue_who'] = (who, user_id)
+    if CASHOUT_ISSUE_DELAY_SECONDS <= 0:
+        await send_cashout_issue(handling, request)
+        return
+    request['issue_due'] = (datetime.now(timezone.utc)
+                            + timedelta(seconds=CASHOUT_ISSUE_DELAY_SECONDS))
+    print(f"⏳ [CASHOUT] {who} answered an acknowledged request in "
+          f"{chat_name(handling)} without a /out - holding "
+          f"{CASHOUT_ISSUE_DELAY_SECONDS}s for an edit", flush=True)
+
+
+async def send_cashout_issue(handling, request):
+    """Send the held alert. Once per request, like every other one here."""
     if request['issue_told']:
         return
     request['issue_told'] = True
-    who = describe_user(username, full_name)
-    print(f"⚠️ [CASHOUT] {who} answered an acknowledged request in "
-          f"{chat_name(handling)} without a /out - telling Ethan and Larry",
-          flush=True)
+    request['issue_due'] = None
+    who, user_id = request['issue_who']
+    print(f"⚠️ [CASHOUT] no /out edit arrived in {chat_name(handling)} - "
+          f"telling Ethan and Larry about {who}", flush=True)
     missed = await dm_handles(CASHOUT_ADMIN_HANDLES,
                               cashout_issue_text(request, handling, who, user_id))
     await warn_unreachable(missed)
+
+
+async def flush_pending_issue(handling, request):
+    """Send a held alert once its hold is up.
+
+    Runs on every watchdog pass, BEFORE the exhausted guard - the chase being
+    over does not mean a problem raised during it should be swallowed. A /out
+    arriving in the meantime removes the request from the queue entirely, so
+    this is never reached for one that got answered."""
+    if not request['issue_due'] or request['issue_told']:
+        return
+    if datetime.now(timezone.utc) < request['issue_due']:
+        return
+    await send_cashout_issue(handling, request)
 
 
 def cashout_picked_up_text(request, who):
@@ -1510,9 +1612,9 @@ async def note_cashout_seen(chat_id, message_id, user_id, username, full_name=No
     """A tagged responder reacted to the forwarded request.
 
     A reaction is an acknowledgement, so it carries exactly the standing a reply
-    does: the clock goes back to zero and they get another full timeout to send
-    the /out. It does NOT close the request - only a real /out does that - so if
-    the reaction is followed by silence, the chasing simply starts again.
+    does: the handling group STOPS being chased about it. It does NOT close the
+    request - only a real /out does that - so the request stays open and Larry
+    is told, once, that it is acknowledged and still not processed.
 
     Larry is told once, the first time a request is picked up. Reacting is tied
     to one specific message, so unlike a plain reply in the group there is no
@@ -1526,9 +1628,9 @@ async def note_cashout_seen(chat_id, message_id, user_id, username, full_name=No
         if request['message_id'] != message_id:
             continue
         request['last_seen'] = datetime.now(timezone.utc)
-        request['seen'] = True
+        _mark_acknowledged(request, describe_user(username, full_name))
         print(f"👀 [CASHOUT] @{username or user_id} reacted in {chat_name(handling)} "
-              f"- {_humanise(CASHOUT_TIMEOUT_MINUTES)} more for the /out", flush=True)
+              "- group chasing stops, Larry gets the word instead", flush=True)
 
         if not request['progress_told']:
             request['progress_told'] = True     # once per request, not per reaction
@@ -1551,6 +1653,52 @@ def request_amount(text):
     """What a cashout request is asking for, or None if it cannot be read."""
     match = _REQUEST_AMOUNT_RE.search(text or '') or _LOOSE_AMOUNT_RE.search(text or '')
     return _to_float(match.group(1)) if match else None
+
+
+def out_amount(text):
+    """What a /out actually paid, or None if it cannot be read."""
+    paid = _OUT_AMOUNT_RE.search(text or '')
+    return _to_float(paid.group(1)) if paid else None
+
+
+def cashout_shortfall_text(request, handling, asked, paid):
+    """For Larry: the figure that went is not the figure that was asked for."""
+    gap = asked - paid
+    word = 'SHORT BY' if gap > 0 else 'OVER BY'
+    return (f"⚠️ CASHOUT PAID {word} {abs(gap):,.2f}$\n\n"
+            f"From: {chat_name(request['origin'])}\n"
+            f"Paid in: {chat_name(handling)}\n\n"
+            f"{_cashout_preview(request)}\n\n"
+            f"Asked for: {asked:,.2f}$\n"
+            f"Paid: {paid:,.2f}$\n\n"
+            f"The /out has been relayed and {paid:,.2f}$ booked to "
+            f"{chat_name(request.get('out_to', request['origin']))} — the books "
+            "follow what was actually sent, not what was asked for.")
+
+
+async def flag_amount_mismatch(handling, request, text):
+    """The /out does not pay what the request asked for.
+
+    Immediate, not on any timer: an underpayment is only cheap to fix while
+    somebody still remembers the cashout, and nothing else in the flow would
+    ever mention it. The request is settled and hearted either way - the money
+    HAS moved, and pretending otherwise would strand a real payment.
+
+    Larry only, and once. Reading the figure off the SCREENSHOT is not possible
+    here; this compares what was asked with what the /out says was paid, which
+    is the same error caught one step earlier."""
+    asked = request_amount(request.get('text'))
+    paid = out_amount(text)
+    if asked is None or paid is None or asked == paid:
+        return                      # nothing to compare, or nothing wrong
+    if request.get('mismatch_told'):
+        return
+    request['mismatch_told'] = True
+    print(f"⚠️ [CASHOUT] {chat_name(handling)} paid {paid:,.2f} against a request "
+          f"for {asked:,.2f} - telling Larry", flush=True)
+    await warn_unreachable(await dm_handles(
+        CASHOUT_PROGRESS_HANDLES,
+        cashout_shortfall_text(request, handling, asked, paid)))
 
 
 def _match_request(queue, reply_to, text=None):
@@ -1691,14 +1839,15 @@ async def handle_cashout_reply(handling, text, user_id, username, reply_to,
     was_acknowledged = target['seen']
 
     if responder:
-        # Somebody is on it. Put the reminder clock back for this group's open
-        # requests; they stay open until a /out actually arrives.
+        # Somebody is on it. The handling group stops being chased about these;
+        # they stay open until a /out actually arrives.
         now = datetime.now(timezone.utc)
+        who = describe_user(username, full_name)
         for request in queue:
             request['last_seen'] = now
-            request['seen'] = True
+            _mark_acknowledged(request, who)
         print(f"💬 [CASHOUT] @{username or user_id} replied in "
-              f"{chat_name(handling)} - reminder clock reset", flush=True)
+              f"{chat_name(handling)} - group chasing stops", flush=True)
 
     if not _OUT_CMD_RE.search(text):
         if responder and was_acknowledged:
@@ -1745,6 +1894,16 @@ async def handle_cashout_reply(handling, text, user_id, username, reply_to,
     # glance, which of its requests have been dealt with.
     await heart_request(request['origin'], request['origin_msg_id'])
 
+    # ...and the chase that went to the crew is unsaid, now that it is wrong.
+    # After the booking, deliberately: the books moving is what makes it wrong,
+    # and deleting first would leave the instruction gone if the booking failed.
+    await delete_crew_notice(request)
+
+    # Paying 150 against a request for 200 settles the request like any other
+    # /out - the money really did move - but it is not what was asked for, and
+    # nothing else in the flow would ever say so.
+    await flag_amount_mismatch(handling, request, text)
+
     # Last, once the request is marked done in the chime group: Larry is told it
     # completed and which group the screenshot goes to. Sent even if the ❤ could
     # not be applied - the money has moved either way, and he still has to send
@@ -1756,7 +1915,7 @@ async def handle_cashout_reply(handling, text, user_id, username, reply_to,
 
 async def observe_cashout(chat_id, text, message_id, sent_at,
                           user_id=None, username=None, reply_to=None,
-                          full_name=None, has_media=False):
+                          full_name=None, has_media=False, is_edit=False):
     """Single entry point for both input paths.
 
     Called for every message in a watched chat that the gates upstream let
@@ -1788,8 +1947,27 @@ async def observe_cashout(chat_id, text, message_id, sent_at,
 
     handling = _canonical(chat_id, _CASHOUT_HANDLERS)
     if handling is not None:
-        if _is_duplicate(('cashout-reply', handling, message_id)):
+        # An edit is a NEW event for a message we have already seen, so it
+        # cannot share the original's key or it would be dropped as a replay -
+        # which is exactly how the /out edited onto a screenshot went missing.
+        # The edited TEXT is part of the key, so the same edit arriving down
+        # both input paths is still one event, while a second, different edit
+        # (fixing the figure) gets its turn.
+        key = (('cashout-edit', handling, message_id,
+                ' '.join((text or '').split())) if is_edit
+               else ('cashout-reply', handling, message_id))
+        if _is_duplicate(key):
             return
+
+        # A /out is acted on ONCE per message, however often it is edited
+        # afterwards. Editing the cashtag on a /out that has already been
+        # relayed and booked must not book it twice - and with the request
+        # settled and gone, Ethan's or Larry's edit would reach
+        # force_complete_cashout(), which takes a /out at face value.
+        if _OUT_CMD_RE.search(text or '') and _is_duplicate(
+                ('out-done', handling, message_id)):
+            return
+
         await handle_cashout_reply(handling, text, user_id, username, reply_to,
                                    full_name, message_id=message_id,
                                    has_media=has_media)
@@ -1864,9 +2042,9 @@ def cashout_nudge_text(waited_minutes):
     Ethan's belongs there. The milestone and idle messages ARE signed, because
     those only ever go to the chime groups.
 
-    Only ever sent while the request is UNACKNOWLEDGED - once somebody reacts,
-    escalate_acknowledged() takes over and chases privately instead, so there is
-    no longer a "seen, but still no /out" variant of this."""
+    Sent whether or not anybody has acknowledged the request. A reaction says
+    somebody has seen it, not that the money has gone, so it no longer buys
+    silence in the group - only a /out stops this."""
     return (f"⏰ OUT REQUEST HAS CROSSED {_humanise(waited_minutes)} TIMEFRAME\n\n"
             "This cashout request is still waiting on a /out.\n\n"
             f"{CASHOUT_MENTIONS}")
@@ -1887,6 +2065,23 @@ def cashout_admin_dm_text(request, handling, waited_minutes):
             + f"Tagged in the group: {CASHOUT_MENTIONS}")
 
 
+def cashout_acknowledged_text(request, handling, waited_minutes):
+    """For Larry: they have put their hand up, and the money still has not moved.
+
+    Routing included, like every other message to Ethan and Larry - which groups
+    a request travelled between is theirs. It says plainly that the group has
+    stopped being chased, because from here nobody else is going to be prompted:
+    this notice IS the chase."""
+    who = request.get('seen_by') or 'Somebody'
+    return (f"👀 ACKNOWLEDGED BUT STILL NOT PROCESSED — {_humanise(waited_minutes)}\n\n"
+            f"From: {chat_name(request['origin'])}\n"
+            f"Waiting in: {chat_name(handling)}\n\n"
+            f"{_cashout_preview(request)}\n\n"
+            f"{who} acknowledged it in the group, but no /out has been sent.\n"
+            "The group is no longer being reminded about it, and the crew get no "
+            "further private chase. It stays open - a late /out still counts.")
+
+
 def cashout_crew_dm_text(request, waited_minutes):
     """For the crew: the request and what to do about it.
 
@@ -1898,66 +2093,191 @@ def cashout_crew_dm_text(request, waited_minutes):
             "This is still waiting on a /out. Please action it.")
 
 
-async def nudge_unacknowledged(handling, request, waited):
-    """Nobody has so much as reacted to this request.
+def _ladder_rounds():
+    """How many group reminders the ladder allows in total."""
+    total = len(CASHOUT_NUDGE_MINUTES)
+    return min(total, CASHOUT_MAX_NUDGES) if CASHOUT_MAX_NUDGES else total
 
-    The group post is the recurring part - it repeats every
-    CASHOUT_TIMEOUT_MINUTES up to CASHOUT_MAX_NUDGES rounds and then stops. The
-    DMs go out on the FIRST round only: that is the moment anyone needs telling,
-    and sending them again every round is what buried the signal.
 
-    Stopping is not giving up. The request stays open, so a late /out is still
-    forwarded, booked and hearted, and Larry was told on the first round."""
-    request['nudges'] += 1
+def _rungs_due(waited):
+    """How many group reminders should have gone out by now."""
+    return min(sum(1 for m in CASHOUT_NUDGE_MINUTES if waited >= m),
+               _ladder_rounds())
+
+
+def _mark_acknowledged(request, who=None):
+    """Record an acknowledgement, once.
+
+    Only the FIRST one counts. Re-stamping the time on every later reaction or
+    message would keep pushing Larry's notice out, which is the recurring chase
+    this shape exists to avoid."""
+    if request['seen']:
+        return
+    request['seen'] = True
+    request['seen_at'] = datetime.now(timezone.utc)
+    request['seen_by'] = who
+    # An acknowledgement is new information, so it reopens a chase that had
+    # already run out: somebody has just picked up a request everything had
+    # given up on, and it is still not paid. chase_acknowledged() fires once
+    # and sets this again, so there is no loop.
+    request['exhausted'] = False
+
+
+def _ladder_text():
+    """'5, 8 and 12' - the group rungs, for /help and /status.
+
+    Rendered from the live ladder rather than written out, so the help cannot
+    drift away from what the bot actually does."""
+    rungs = [str(m) for m in CASHOUT_NUDGE_MINUTES[:_ladder_rounds()]]
+    if len(rungs) > 1:
+        return ', '.join(rungs[:-1]) + ' and ' + rungs[-1]
+    return rungs[0] if rungs else ''
+
+
+async def post_group_nudge(handling, request, waited, round_no):
+    """The loud part of the ladder: re-tag the crew in the handling group.
+
+    Ethan and Larry are DMed alongside the FIRST reminder only - chasing is
+    their job, so they need it early, and repeating it every round is what
+    buried the signal.
+
+    The crew are deliberately NOT DMed here. They are tagged right there in the
+    group, and their private word comes only once this ladder has run out - see
+    dm_crew_last_resort()."""
+    request['nudges'] = round_no
     try:
         await send_group(handling, cashout_nudge_text(waited),
                                reply_to_message_id=request['message_id'])
-        print(f"⏰ [CASHOUT] reminder #{request['nudges']} in {chat_name(handling)} "
+        print(f"⏰ [CASHOUT] reminder #{round_no} in {chat_name(handling)} "
               f"after {_humanise(waited)}", flush=True)
     except Exception as e:
         print(f"❌ [CASHOUT] reminder failed in {chat_name(handling)}: {e}", flush=True)
 
-    missed = []
-    if not request['admin_told']:
-        request['admin_told'] = True
-        missed += await dm_handles(CASHOUT_ADMIN_HANDLES,
-                                   cashout_admin_dm_text(request, handling, waited))
-    if not request['crew_told']:
-        request['crew_told'] = True
-        missed += await dm_handles(CASHOUT_CREW_HANDLES,
-                                   cashout_crew_dm_text(request, waited))
-    await warn_unreachable(missed)
-
-    if CASHOUT_MAX_NUDGES and request['nudges'] >= CASHOUT_MAX_NUDGES:
-        request['exhausted'] = True
-        print(f"🔕 [CASHOUT] reminders stopped in {chat_name(handling)} after "
-              f"{request['nudges']} rounds ({_humanise(waited)}). The request stays "
-              "open - a late /out still counts.", flush=True)
-
-
-async def escalate_acknowledged(handling, request, waited):
-    """Somebody reacted, then let the window run out without sending the /out.
-
-    They are already tagged on the request and have acknowledged it in the
-    group, so tagging them again there is noise. This escalates privately
-    instead, one step per window and each step at most once per request: the
-    crew first, because actioning it is theirs, then Larry. After that the
-    chasing stops and the request is his."""
-    if not request['crew_told']:
-        request['crew_told'] = True
-        print(f"📣 [CASHOUT] acknowledged but no /out after {_humanise(waited)} in "
-              f"{chat_name(handling)} - telling the crew privately, once", flush=True)
-        await warn_unreachable(await dm_handles(CASHOUT_CREW_HANDLES,
-                                                cashout_crew_dm_text(request, waited)))
-        return
-
-    request['exhausted'] = True
     if not request['admin_told']:
         request['admin_told'] = True
         await warn_unreachable(await dm_handles(
             CASHOUT_ADMIN_HANDLES, cashout_admin_dm_text(request, handling, waited)))
-    print(f"🔕 [CASHOUT] {chat_name(handling)} request left with Larry after "
-          f"{_humanise(waited)} - no further chasing. It stays open.", flush=True)
+
+
+async def dm_crew_last_resort(handling, request, waited):
+    """The group ladder has run out and there is still no /out.
+
+    This is the ONLY timer that reaches the crew privately, and it fires after
+    the group reminders rather than alongside them. Once it has gone the chasing
+    stops: the request stays OPEN, so a late /out is still forwarded, booked and
+    hearted, and deleting either copy still settles it."""
+    request['crew_told'] = True
+    print(f"📣 [CASHOUT] nobody acknowledged it after {_humanise(waited)} in "
+          f"{chat_name(handling)} - telling the crew privately, once", flush=True)
+    # Remember where each copy landed. A late /out makes this message untrue,
+    # and it is taken back rather than left sitting in their inbox.
+    await warn_unreachable(await dm_handles(CASHOUT_CREW_HANDLES,
+                                            cashout_crew_dm_text(request, waited),
+                                            receipts=request['crew_notice']))
+
+
+async def delete_crew_notice(request):
+    """Take back the crew's last-resort chase once the /out has landed.
+
+    That DM says the request is "still waiting on a /out". The moment one
+    arrives it is no longer true, and a chase left sitting in their inbox is
+    read as work still outstanding - which on this flow means somebody paying a
+    second time. Deleting it is the only way to unsay it; Telegram has no edit
+    that removes a notification already delivered.
+
+    Only the CREW's copy. Ethan's and Larry's notices are a record of what
+    happened rather than an instruction, and they stay put.
+
+    A failure here is not cosmetic - the stale instruction is still live - so
+    Ethan is told, with the figure already booked so nobody pays it again."""
+    notices, request['crew_notice'] = request['crew_notice'], []
+    failed = []
+    for kind, where, msg_id in notices:
+        try:
+            if kind == 'bot':
+                await bot.delete_message(where, msg_id)
+            elif _active_client is not None:
+                await _active_client.delete_messages(where, [msg_id])
+            else:
+                failed.append(str(where))
+                continue
+            print(f"🗑️ [CASHOUT] took back the chase DM to {where}", flush=True)
+        except Exception as e:
+            print(f"⚠️ [CASHOUT] could not take back the chase DM to {where}: {e}",
+                  flush=True)
+            failed.append(str(where))
+
+    if failed:
+        await notify_admin(
+            "⚠️ A cashout was completed, but the earlier "
+            f"{_humanise(CASHOUT_CREW_DM_MINUTES)} chase DM to the crew could not "
+            f"be deleted ({', '.join(failed)}).\n\n"
+            "It still reads as waiting on a /out. The money side is already done "
+            "and booked — ask them not to send it again.")
+
+
+async def chase_acknowledged(handling, request, waited):
+    """Somebody reacted, or spoke in the handling group.
+
+    The group falls silent from that moment: they have acknowledged it there, so
+    re-tagging them is noise. Larry is told once instead, CASHOUT_SEEN_DM_MINUTES
+    after the acknowledgement rather than straight away - "still not processed"
+    is not worth saying at the instant somebody reacts, and six minutes later it
+    is. Measured from the acknowledgement, so reacting late does not shorten it.
+
+    The crew's last-resort DM does NOT fire for an acknowledged request. Once
+    they have put their hand up it is Larry's to carry, not theirs to be chased
+    over again in private."""
+    if request['larry_told']:
+        return
+    quiet = (datetime.now(timezone.utc) - request['seen_at']).total_seconds() / 60.0
+    if quiet < CASHOUT_SEEN_DM_MINUTES:
+        return
+
+    request['larry_told'] = True
+    request['exhausted'] = True
+    print(f"👤 [CASHOUT] acknowledged but still no /out after {_humanise(waited)} in "
+          f"{chat_name(handling)} - telling Larry, once. The group is not chased "
+          "again; the request stays open.", flush=True)
+    await warn_unreachable(await dm_handles(
+        CASHOUT_PROGRESS_HANDLES, cashout_acknowledged_text(request, handling, waited)))
+
+
+async def chase_cashout(handling, request, waited):
+    """One pass of the ladder for one open request.
+
+    The rungs are absolute minutes since the request was posted, not gaps
+    between reminders, so nothing that happens in between can push them out.
+
+    Two shapes, and which one applies is decided by whether anybody has
+    acknowledged it. Silence is chased in the open, on the group ladder;
+    an acknowledgement moves it to a single private word to Larry."""
+    if request['seen']:
+        await chase_acknowledged(handling, request, waited)
+        return
+
+    due = _rungs_due(waited)
+    if due > request['nudges']:
+        await post_group_nudge(handling, request, waited, due)
+        if due >= _ladder_rounds():
+            print(f"🔕 [CASHOUT] group reminders stopped in {chat_name(handling)} "
+                  f"after {due} round(s) ({_humanise(waited)})", flush=True)
+
+    if (CASHOUT_CREW_DM_MINUTES > 0 and not request['crew_told']
+            and waited >= CASHOUT_CREW_DM_MINUTES):
+        await dm_crew_last_resort(handling, request, waited)
+
+    # Chasing is over only once BOTH channels have run out. The crew DM can
+    # fall between two group rungs - at 10 minutes it sits between the 8 and
+    # the 12 - and firing it must not cancel the rest of the ladder, nor the
+    # ladder finishing cancel it.
+    ladder_done = request['nudges'] >= _ladder_rounds()
+    crew_done = request['crew_told'] or CASHOUT_CREW_DM_MINUTES <= 0
+    if ladder_done and crew_done and not request['exhausted']:
+        request['exhausted'] = True
+        print(f"🔕 [CASHOUT] {chat_name(handling)} request left alone after "
+              f"{_humanise(waited)}. It stays open - a late /out still counts.",
+              flush=True)
 
 
 async def cashout_watchdog():
@@ -1971,8 +2291,11 @@ async def cashout_watchdog():
         if route['out_to'] != source:
             line += f", /out to {chat_name(route['out_to'])}"
         print(line, flush=True)
-    print(f"📤 [CASHOUT] {len(CASHOUT_ROUTES)} route(s), chasing after "
-          f"{_humanise(CASHOUT_TIMEOUT_MINUTES)} of silence", flush=True)
+    ladder = ', '.join(f"{m}m" for m in CASHOUT_NUDGE_MINUTES[:_ladder_rounds()])
+    print(f"📤 [CASHOUT] {len(CASHOUT_ROUTES)} route(s), group reminders at "
+          f"{ladder}"
+          + (f", crew DM at {CASHOUT_CREW_DM_MINUTES}m"
+             if CASHOUT_CREW_DM_MINUTES > 0 else ", no crew DM"), flush=True)
 
     while True:
         await asyncio.sleep(20)
@@ -1986,24 +2309,19 @@ async def cashout_watchdog():
 
         for handling, queue in list(_pending_cashouts.items()):
             for request in list(queue):
+                # Before the exhausted guard: a problem raised while the chase
+                # was still running must still be reported after it stops.
+                await flush_pending_issue(handling, request)
+
                 if request['exhausted']:
                     continue
 
-                # Two different clocks. Silence gets chased quickly and in the
-                # open; an acknowledged request gets a longer, quieter run,
-                # because they have already said they are on it.
-                window = (CASHOUT_SEEN_MINUTES if request['seen']
-                          else CASHOUT_TIMEOUT_MINUTES)
-                quiet = (now - request['last_seen']).total_seconds() / 60.0
-                if quiet < window:
-                    continue
-
-                request['last_seen'] = now
+                # One clock, running from when the request was posted. Which
+                # rung is due is a function of that elapsed time alone, so
+                # replaying a pass cannot double-post and a reaction cannot
+                # push the ladder out.
                 waited = (now - request['opened']).total_seconds() / 60.0
-                if request['seen']:
-                    await escalate_acknowledged(handling, request, waited)
-                else:
-                    await nudge_unacknowledged(handling, request, waited)
+                await chase_cashout(handling, request, waited)
 
 
 async def process_incoming(chat_id, text, origin, from_bot=False, sent_at=None,
@@ -2438,9 +2756,20 @@ async def help_command(message):
         "\n"
         f"A \"{CASHOUT_KEYWORD}\" in CHIME PICCASO or CHIME GAFFER is\n"
         "posted to its group with the crew tagged.\n"
-        f"No answer in {_humanise(CASHOUT_TIMEOUT_MINUTES)} — tagged again, and\n"
-        "Ethan, Larry and the crew each get a private\n"
-        "warning from the bot.\n"
+        f"No /out and the crew are tagged again at\n"
+        f"{_ladder_text()} min, with Ethan and Larry getting a\n"
+        "private warning on the first one.\n"
+        f"Nobody acknowledges it by {CASHOUT_CREW_DM_MINUTES} min and the crew\n"
+        "get a private warning too — deleted again as\n"
+        "soon as the /out lands. The request stays open.\n"
+        "If the CREW react, the group is not chased\n"
+        f"again — Larry hears {CASHOUT_SEEN_DM_MINUTES} min later if there is\n"
+        "still no /out, and the crew get no DM at all.\n"
+        "A /out paying a different figure than the\n"
+        "request asked for is DMed to Larry at once.\n"
+        "A /out EDITED onto a message counts the same\n"
+        f"as one typed fresh; problems wait {CASHOUT_ISSUE_DELAY_SECONDS}s first,\n"
+        "in case the edit is on its way.\n"
         "Their /out reply goes back to the chime group, its\n"
         "amount is added to that group's Total Out, and the\n"
         "original request there gets a ❤.\n"
@@ -2758,7 +3087,7 @@ async def ledger_set_command(message):
     await check_milestones(chat_id, before, after)
 
 
-async def cashout_from_bot_api(message):
+async def cashout_from_bot_api(message, is_edit=False):
     """Bot API side of observe_cashout.
 
     Telethon normally sees these first and the dedup key discards this copy, but
@@ -2780,7 +3109,8 @@ async def cashout_from_bot_api(message):
                           getattr(sender, 'username', None),
                           getattr(reply, 'message_id', None),
                           full_name or None,
-                          has_media=getattr(message, 'content_type', 'text') != 'text')
+                          has_media=getattr(message, 'content_type', 'text') != 'text',
+                          is_edit=is_edit)
 
     # Every Bot API handler that can carry a mention already routes through
     # here, so this is the one place it has to be called from. Kept after the
@@ -2845,6 +3175,27 @@ async def cashout_caption(message):
     Only the cashout path runs: process_incoming is deliberately NOT called
     here, so a screenshot can never be booked as a payment notification."""
     await cashout_from_bot_api(message)
+
+
+# An edit reaches the CASHOUT path and nothing else.
+#
+# The crew write the message and edit the /out onto it, so without this the
+# answer to a cashout is simply never seen: the request stays open, the ❤ never
+# lands, the money is never booked and the chase runs on. That was live until
+# 2026-08-09 - `edited_message` was not even in allowed_updates.
+#
+# process_incoming() is deliberately NOT called here, and must never be. A
+# payment notification that gets edited would otherwise be forwarded and booked
+# a SECOND time, inventing a deposit. Same reasoning as cashout_caption above.
+@bot.edited_message_handler(content_types=CAPTIONED_TYPES,
+                            func=media_concerns_cashout)
+async def cashout_caption_edited(message):
+    await cashout_from_bot_api(message, is_edit=True)
+
+
+@bot.edited_message_handler(content_types=['text'])
+async def cashout_text_edited(message):
+    await cashout_from_bot_api(message, is_edit=True)
 
 
 @bot.message_handler(content_types=['text'])
@@ -3350,6 +3701,39 @@ async def run_userbot():
                                        from_bot=True, sent_at=event.message.date,
                                        source_msg_id=event.id)
 
+            @client.on(events.MessageEdited(chats=chats))
+            async def on_source_edited(event):
+                """An edit, on the cashout path ONLY.
+
+                The crew write the message and edit the /out onto it, so this is
+                how a great many cashouts are actually answered. The payment path
+                is deliberately not run: re-reading an edited "You received"
+                would forward and book the same deposit twice."""
+                await ready.wait()
+                sender = await event.get_sender()
+                text = event.raw_text or ''
+                plain = _is_plain_text(event.message)
+                in_handling = _canonical(event.chat_id, _CASHOUT_HANDLERS) is not None
+
+                if not plain and not (is_caption_out(text) or in_handling):
+                    return
+                if not text and plain:
+                    return
+                remember_user(sender)
+
+                sender_id = getattr(sender, 'id', None)
+                if BOT_ID is not None and sender_id == BOT_ID:
+                    return
+                full_name = ' '.join(
+                    part for part in (getattr(sender, 'first_name', None),
+                                      getattr(sender, 'last_name', None)) if part)
+                await observe_cashout(event.chat_id, text, event.id,
+                                      event.message.date, sender_id,
+                                      getattr(sender, 'username', None),
+                                      getattr(event.message, 'reply_to_msg_id', None),
+                                      full_name or None,
+                                      has_media=not plain, is_edit=True)
+
             @client.on(events.MessageDeleted)
             async def on_message_deleted(event):
                 await ready.wait()
@@ -3428,7 +3812,8 @@ async def run_bot():
             # message_reaction is NOT included by default and has to be asked
             # for by name, or a crew reaction never reaches on_request_reaction.
             await bot.polling(none_stop=True,
-                              allowed_updates=['message', 'message_reaction'])
+                              allowed_updates=['message', 'edited_message',
+                                               'message_reaction'])
         except Exception as e:
             print(f"Polling Error: {e}", flush=True)
             await asyncio.sleep(5)

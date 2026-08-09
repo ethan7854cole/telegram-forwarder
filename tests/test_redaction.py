@@ -16,7 +16,7 @@ Nothing here touches Telegram or the network.
 import asyncio
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 os.environ['TELEGRAM_BOT_TOKEN'] = '111222:FAKE'
 os.environ.setdefault('CASHOUT_TIMEOUT_MINUTES', '5')
@@ -69,6 +69,15 @@ def check(label, cond, detail=''):
     print(('  ok   ' if cond else '  FAIL ') + label + (f'  <- {detail}' if detail and not cond else ''))
     if not cond:
         failures.append(label)
+
+
+async def _flush_issue(handling):
+    """The "answered without a /out" alert is held for a minute so an edited-in
+    /out can land first. Nothing here is testing the hold, so run it out."""
+    for request in f._pending_cashouts.get(handling, []):
+        if request.get('issue_due'):
+            request['issue_due'] = datetime.now(timezone.utc) - timedelta(seconds=1)
+            await f.flush_pending_issue(handling, request)
 
 
 def reset():
@@ -170,6 +179,7 @@ async def main():
     await f.observe_cashout(CHIMEREV, 'still stuck here', 922, now,
                             user_id=CREW, username='Maynuddin23',
                             full_name='Maynuddin Ahmed')
+    await _flush_issue(CHIMEREV)
     admin = [t for c, t in dms if c in (ETHAN, LARRY)]
     check('Ethan and Larry are told who is stuck',
           admin and not clean(admin[0]), str(admin))
@@ -212,6 +222,7 @@ async def main():
     dms.clear()
     await f.observe_cashout(CHIMEREV, 'stuck, cash app is down', 942, now,
                             user_id=CREW, username='Maynuddin23')
+    await _flush_issue(CHIMEREV)
     check('a stuck crew member is reported to Ethan and Larry',
           any(c in (ETHAN, LARRY) for c, _ in dms), str(dms))
     check('and never to the crew themselves', crew_got() == [], str(crew_got()))

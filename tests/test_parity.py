@@ -12,6 +12,7 @@ import forwarder as f
 PICCASO, GAFFER = -5350880041, -5580596463
 MHLARRY, CHIMEREV = -1003894781195, -1002335630148
 LARRY = 7418675217
+CREW = 555
 sent, dms, reactions, failures = [], [], [], []
 real_sleep = asyncio.sleep
 
@@ -40,6 +41,9 @@ def reset():
     sent.clear(); dms.clear(); reactions.clear(); f._ledger.clear()
     f._seen_messages.clear(); f._pending_cashouts.clear()
     f._user_ids['larryyxx'] = LARRY
+    # A learned crew id, so a crew DM would actually be delivered here. Without
+    # one, "the crew were not DMed" passes for the wrong reason.
+    f._user_ids['maynuddin23'] = CREW
 
 
 async def run_watchdog(seconds=0.2):
@@ -67,9 +71,9 @@ async def full_flow(origin, base):
     r['submitted_dm'] = len([1 for uid, t in dms if uid == LARRY and 'SUBMITTED' in t])
     req = f._pending_cashouts[handling][0]
 
-    # 2. nobody responds
+    # 2. nobody responds. The ladder is measured from 'opened'.
     sent.clear(); dms.clear()
-    req['last_seen'] = now - timedelta(minutes=6)
+    req['opened'] = datetime.now(timezone.utc) - timedelta(minutes=6)
     await run_watchdog()
     r['nudge'] = len([1 for c, _ in sent if c == handling])
     r['nudge_is_reply'] = all('OUT REQUEST HAS CROSSED' in t for c, t in sent if c == handling)
@@ -78,12 +82,24 @@ async def full_flow(origin, base):
     # Larry hears about it on the FIRST round, once, with the routing.
     r['larry_told'] = len([1 for uid, t in dms
                            if uid == LARRY and 'OUT REQUEST HAS CROSSED' in t])
+    # The crew are tagged in the group on this rung, and NOT DMed.
+    r['crew_dm_early'] = len([1 for uid, _ in dms if uid == CREW])
     # ...and it never repeats on the rounds after it.
     dms.clear()
     for _ in range(3):
-        req['last_seen'] = datetime.now(timezone.utc) - timedelta(minutes=6)
+        req['opened'] = datetime.now(timezone.utc) - timedelta(minutes=6)
         await run_watchdog()
     r['no_repeat_dm'] = len(dms)
+
+    # Past the whole group ladder: now, and only now, the crew get one DM.
+    dms.clear()
+    req['opened'] = datetime.now(timezone.utc) - timedelta(minutes=18)
+    await run_watchdog()
+    r['crew_dm_late'] = len([1 for uid, _ in dms if uid == CREW])
+    # Reset for the rest of the walk-through, which expects a live request.
+    req['opened'] = datetime.now(timezone.utc)
+    req['exhausted'] = False
+    req['crew_told'] = False
 
     # 3. a crew reaction
     dms.clear()
@@ -127,6 +143,10 @@ async def main():
         check(f'{name}: Larry told once on the first round', r['larry_told'] == 1)
         check(f'{name}: no DM is repeated on later rounds', r['no_repeat_dm'] == 0,
               str(r['no_repeat_dm']))
+        check(f'{name}: the crew are not DMed while the group ladder runs',
+              r['crew_dm_early'] == 0, str(r['crew_dm_early']))
+        check(f'{name}: the crew get one DM once past 17 min',
+              r['crew_dm_late'] == 1, str(r['crew_dm_late']))
         check(f'{name}: a reaction marks it seen', r['seen'] is True)
         check(f'{name}: Larry told who picked it up', r['picked_up_dm'] == 1)
         check(f'{name}: /out returned to its own chime group', r['out_home'] == 1)

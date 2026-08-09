@@ -17,7 +17,7 @@ python3 tests/run.py            # all suites
 python3 tests/run.py cashout    # only matching suites
 ```
 
-770 checks across 23 suites, all stubbed — nothing touches Telegram, the
+849 checks across 25 suites, all stubbed — nothing touches Telegram, the
 network, or the live groups. They cover the pre-existing behaviour as well as
 the new, so they are the guard against a change quietly altering something that
 already worked.
@@ -118,49 +118,160 @@ nothing.
   respond to into noise they learn to ignore. Pinned by `test_redaction.py`.
 - **A private DM is a one-off, never a recurring chase.** `crew_told` and
   `admin_told` gate each to once per request. The repeating part is the group
-  post, and only while nobody has acknowledged it.
+  post, and it runs whether or not anybody has acknowledged it.
+- **The crew get no timer DM until the group ladder has run out** (17 min).
+  Ethan and Larry still get theirs on the first rung.
 
 ## The escalation ladder
 
 The group post is the loud, repeating part; a DM is the quiet, one-off part.
-Which ladder a request climbs depends on whether anyone has acknowledged it —
-a reaction from the crew, or any of them speaking in the handling group.
-
-**Nobody acknowledges it** — `nudge_unacknowledged()`:
+There is **one** ladder, and it runs on absolute minutes since the request was
+posted — `chase_cashout()`, off `request['opened']`.
 
 | Time | What happens |
 |---|---|
-| 5 min | group reminder #1, **plus** one DM to Ethan + Larry and one to the crew |
-| 10 min | group reminder #2 |
-| 15 min | group reminder #3, then reminders **stop** |
+| 5 min | group reminder #1, **plus** one DM to Ethan + Larry |
+| 8 min | group reminder #2 |
+| 10 min | one DM to the crew — **only** for a request nobody has acknowledged |
+| 12 min | group reminder #3 |
 
-**Somebody reacts** — `escalate_acknowledged()`. The reaction resets the clock
-and widens the window to `CASHOUT_SEEN_MINUTES` (7). Nothing further is posted
-in the group: they have acknowledged it there, so re-tagging them is noise.
+The crew's DM is for **silence**, not for lateness: reacting stops it firing at
+all. It deliberately sits *between* two group rungs, which is why chasing ends
+only once **both** channels have run out — `ladder_done and crew_done`. Firing
+one must never cancel the other.
 
-| Time | What happens |
+**It is deleted the moment the `/out` lands** — see below.
+
+**Acknowledging it takes the chase out of the group** — `chase_acknowledged()`.
+A reaction, or any of the crew speaking in the handling group, stops the group
+reminders dead. Larry gets **one** DM instead, `CASHOUT_SEEN_DM_MINUTES` (6)
+after the acknowledgement rather than at the moment of it: "still not processed"
+is not worth saying the instant somebody reacts, and six minutes later it is.
+
+| Acknowledged | What happens |
 |---|---|
-| +7 min | one DM to the crew |
-| +14 min | one DM to Ethan + Larry, then chasing **stops** |
+| at any time | group reminders **stop**; Larry told it was picked up |
+| +6 min | one DM to Larry: acknowledged, still not processed → chasing **stops** |
+| 10 min | **no** crew DM — that one is only ever for silence |
+
+- **Only the crew count** — `_is_responder()`. Ethan and Larry used to
+  (`user_id in LEDGER_ADMINS`) and no longer do: acknowledgement now stops the
+  group chase outright, so an admin reacting would silence the very reminders
+  meant to reach the crew.
+- **Only the first acknowledgement counts** (`_mark_acknowledged()`).
+  Re-stamping on every later reaction would keep pushing Larry's notice out,
+  which is the recurring chase this shape exists to avoid.
+- **An acknowledgement reopens a chase that had already run out.** It is new
+  information: somebody has just picked up a request everything had given up on,
+  and it is still not paid. `chase_acknowledged()` fires once and stops it
+  again, so there is no loop.
+- The six minutes run from the **acknowledgement**, so reacting late does not
+  shorten them.
+
+Rungs are **absolute marks, not gaps**, so replaying a pass cannot double-post
+and nothing that happens in between can push the ladder out. A request that
+comes back from a `/cashout off` pause already past several rungs catches up
+with **one** post, never one per missed rung.
+
+`CASHOUT_NUDGE_MINUTES` (`5,8,12`), `CASHOUT_CREW_DM_MINUTES` (`10`) and
+`CASHOUT_SEEN_DM_MINUTES` (`6`) are the knobs; `CASHOUT_MAX_NUDGES` still caps group rounds on top of the ladder, and
+`CASHOUT_TIMEOUT_MINUTES=0` still disables chasing altogether.
 
 **They answer with something that is not a `/out`** — `flag_cashout_issue()`.
-Not a rung on either ladder: it fires **immediately**, without waiting for a
-window. A crew member who has already acknowledged a request and then sends a
-message or a screenshot with no `/out` is engaged but stuck, which is a
-different problem from silence and needs a person, not another timer.
+Not a rung on either ladder, and on its own short clock: a crew member who has
+already acknowledged a request and then sends a message or a screenshot with no
+`/out` is engaged but stuck, which is a different problem from silence and needs
+a person, not another timer.
 
 | Trigger | What happens |
 |---|---|
-| acknowledged, then any non-`/out` message or media from a responder | one DM to Ethan + Larry, naming the crew member and their numeric id |
+| acknowledged, then any non-`/out` message or media from a responder | **held 60s**, then one DM to Ethan + Larry, naming the crew member and their numeric id |
+
+**The alert is held, not sent.** The crew routinely post the message and *edit*
+the `/out` onto it seconds later, so firing on the first version makes an alert
+out of the ordinary way they work. `flag_cashout_issue()` arms it;
+`flush_pending_issue()` sends it once `CASHOUT_ISSUE_DELAY_SECONDS` (60) is up.
+An edit carrying a `/out` settles the request, which drops it from the queue —
+so the alert is never sent at all, rather than being cancelled.
+
+- **Armed once.** A second message during the hold does *not* push the deadline
+  out, or somebody typing steadily would defer it forever.
+- **Flushed before the `exhausted` guard** in the watchdog: a problem raised
+  while the chase was running must still be reported after chasing stops.
+- `CASHOUT_ISSUE_DELAY_SECONDS=0` restores the old immediate behaviour.
 
 The crew are **not** told — they are the ones being asked about. Nothing is
 posted in the group. Once per request (`issue_told`), and the ladder it was
 already on carries on underneath. The *first* thing anyone says is an
 acknowledgement, not a problem, so the alert needs a prior acknowledgement.
 
+## Edited messages
+
+**A `/out` edited onto a message the crew already sent is how a great deal of
+real traffic answers a cashout.** Until 2026-08-09 the bot could not see it:
+`edited_message` was not in `allowed_updates` and neither listener registered an
+edit handler. The request stayed open, the ❤ never landed, the money was never
+booked, and the chase ran on against a cashout that had actually been paid —
+silently, every time.
+
+- **Edits reach the cashout path ONLY.** `process_incoming()` is never called
+  from an edit handler and must never be: an edited `You received` would be
+  forwarded and booked a **second** time, inventing a deposit. Same reasoning as
+  `cashout_caption()`.
+- **An edit needs its own dedup key.** The original message already registered
+  `('cashout-reply', handling, id)`, so reusing it drops every edit as a replay
+  — which is exactly the bug. The edited **text** is part of the key, so one
+  edit arriving down both input paths is still one event, while a second,
+  different edit (fixing the figure) gets its turn.
+- **A `/out` is acted on once per message** (`('out-done', handling, id)`),
+  however often it is edited afterwards. Without this, editing the cashtag on an
+  already-paid `/out` books it twice — and with the request settled and gone,
+  Ethan's or Larry's edit reaches `force_complete_cashout()`, which takes a
+  `/out` at face value. Reproduced by `tests/test_edits.py`.
+- **Editing a `CASHOUT REQUEST` opens nothing.** The request-opening branch
+  keeps its original key, so edits there are ignored rather than posting a
+  second request.
+
 A `/out` at any point completes it. Stopping is not giving up — the request
 stays **open**, so a late `/out` is still forwarded, booked and hearted, and
 deleting either copy still settles it.
+
+**A late `/out` takes back the crew's 10-minute chase** — `delete_crew_notice()`.
+That DM says the request is "still waiting on a `/out`". The moment one arrives
+it is untrue, and a chase left sitting in their inbox reads as work still
+outstanding — which on this flow means somebody paying a second time. Telegram
+has no edit that unsends a delivered notification, so it is deleted outright.
+`dm_handles(..., receipts=…)` is what records where each copy landed; the client
+that sent it travels with the id, because an id only means anything alongside
+the chat it went through. **Only the crew's copy** — Ethan's and Larry's notices
+are a record rather than an instruction and stay put. A delete that fails is not
+cosmetic (the stale instruction is still live), so Ethan is told, and told the
+money is already booked so nobody pays it again.
+
+## Paying the wrong figure
+
+**A `/out` that does not pay what was asked for DMs Larry immediately** —
+`flag_amount_mismatch()`. A request for `$200` answered with `/out 150` settles
+and hearts exactly like any other: the money really did move, and pretending
+otherwise would strand a real payment. But nothing else in the flow would ever
+mention the gap.
+
+- **Immediate, not on a timer.** An underpayment is only cheap to fix while
+  somebody still remembers the cashout.
+- **Larry only, once** (`mismatch_told`). The crew are not told — see the
+  invariant above; they are the ones being asked about.
+- **The books follow what was actually sent**, never what was asked for. The
+  alert says so explicitly, so nobody "corrects" the ledger to the request.
+- **Both figures must be readable or nothing fires.** `request_amount()` and
+  `out_amount()` both return `None` rather than guessing, and a `None` on either
+  side is silence — never a comparison against a default. Same rule as
+  [the empty ledger](#): a missing figure is "unknown", not zero.
+- Overpayment is flagged the same way, worded `OVER BY`.
+
+**This compares the `/out` against the REQUEST, not against the screenshot.**
+Reading a figure off the Cash App image would need OCR or a vision model; the
+bot never downloads media and has no such capability. It catches the same error
+one step earlier, from text it already parses.
 
 ## The emergency stop
 
@@ -476,6 +587,8 @@ cashout requests.
 | `tests/test_redaction.py` | No crew name reaches a target group; every other route keeps them |
 | `tests/test_matching.py` | A `/out` settles the request it paid, not the oldest |
 | `tests/test_manual.py` | Ethan and Larry can finish a cashout with nothing open |
+| `tests/test_amounts.py` | A /out paying the wrong figure; taking back the chase DM |
+| `tests/test_edits.py` | A /out edited onto a message, and the double-book guard |
 | `backfill.py` | Manual one-off backfill, separate from the boot sweep |
 | `telethon_login.py` | Generates a `TELETHON_SESSION`; `--deploy` for Railway |
 
