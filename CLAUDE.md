@@ -370,6 +370,32 @@ screenshot proving the money went. Both travel to the chime group that asked, as
   is the crew signalling they are stuck — it raises the alarm through
   `flag_cashout_issue()` and is not relayed anywhere.
 
+**Every picture in the album travels, not just the captioned one.** The crew
+routinely send several screenshots at once — the payment and the history behind
+it. Telegram sends an album as **separate messages that merely share a
+`media_group_id`**, and only one of them carries the caption, so copying "the
+message the `/out` was on" relayed one picture and silently dropped the rest.
+Seen live in `Chime Rev & out no-7` on 2026-08-09: two screenshots sent, one
+arrived in `CHIME GAFFER`.
+
+- **Both orderings have to work.** The caption normally sits on the *first* of
+  the album, so the siblings arrive *after* the `/out` has already been dealt
+  with — `note_album_part()` copies those on sight. Parts seen *before* the
+  caption are buffered and flushed by `relay_album_siblings()`.
+- **The siblings go after the `/out` has landed**, never before, so an extra
+  screenshot failing can never cost the instruction itself. Same reasoning as
+  the plain-text fallback above.
+- **Each sibling is copied with `caption=''`.** Telegram allows one caption per
+  album so a sibling normally has none, but `copy_message` keeps whatever *is*
+  there, and anything a crew member typed could carry a name into a group that
+  must never see one. The captioned copy is still redacted by
+  `clean_out_for_relay()` as before.
+- **`copyMessages` (plural) is deliberately not used.** It would preserve the
+  album as an album, but it cannot replace the caption — only keep or drop it —
+  and keeping it would put an unredacted crew name in a chime group.
+- Bounded by `ALBUM_MEMORY` (40 albums) and `ALBUM_RELAY_SECONDS` (180).
+  Reproduced by `tests/test_album.py`.
+
 ## No crew name ever reaches a target group
 
 `copy_message` strips what *Telegram* attaches. It cannot strip what a person
@@ -589,6 +615,7 @@ cashout requests.
 | `tests/test_manual.py` | Ethan and Larry can finish a cashout with nothing open |
 | `tests/test_amounts.py` | A /out paying the wrong figure; taking back the chase DM |
 | `tests/test_edits.py` | A /out edited onto a message, and the double-book guard |
+| `tests/test_album.py` | Every screenshot in an album reaches the group that asked |
 | `backfill.py` | Manual one-off backfill, separate from the boot sweep |
 | `telethon_login.py` | Generates a `TELETHON_SESSION`; `--deploy` for Railway |
 

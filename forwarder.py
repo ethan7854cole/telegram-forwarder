@@ -1733,8 +1733,97 @@ def _match_request(queue, reply_to, text=None):
     return queue[0]
 
 
+# ---------------------------------------------------------------------------
+# Albums
+#
+# The crew habitually answer with SEVERAL screenshots at once - the payment and
+# the history behind it - and Telegram sends an album as separate messages that
+# merely share a media_group_id. Only ONE of them carries the caption, so
+# copying "the message the /out was on" relayed one picture and silently
+# dropped the rest. Seen live in Chime Rev on 2026-08-09: two screenshots sent,
+# one arrived in CHIME GAFFER.
+#
+# The parts arrive either side of the captioned one, so both directions have to
+# work: siblings already seen are flushed when the /out lands, and siblings
+# arriving afterwards are copied on sight.
+
+_album_parts = OrderedDict()          # (chat, group_id) -> {'ids', 'to', 'sent'}
+ALBUM_MEMORY = 40                     # albums remembered at once
+ALBUM_RELAY_SECONDS = int(os.getenv('ALBUM_RELAY_SECONDS', '180'))
+
+
+def _album_slot(handling, group_id):
+    key = (handling, str(group_id))
+    slot = _album_parts.get(key)
+    if slot is None:
+        slot = {'ids': [], 'to': None, 'sent': set(),
+                'at': datetime.now(timezone.utc)}
+        _album_parts[key] = slot
+        while len(_album_parts) > ALBUM_MEMORY:
+            _album_parts.popitem(last=False)
+    return slot
+
+
+async def _copy_album_part(handling, out_to, message_id):
+    """One extra picture, on its own, carrying no words.
+
+    caption='' is deliberate rather than left alone: Telegram allows only one
+    caption per album so a sibling normally has none, but copy_message keeps
+    whatever is there, and anything a crew member typed could carry a name into
+    a group that must never see one."""
+    try:
+        await bot.copy_message(out_to, handling, message_id, caption='')
+        print(f"🖼️ [CASHOUT] extra screenshot copied to {chat_name(out_to)}",
+              flush=True)
+        return True
+    except Exception as e:
+        print(f"⚠️ [CASHOUT] could not copy an extra screenshot to "
+              f"{chat_name(out_to)}: {e}", flush=True)
+        return False
+
+
+async def note_album_part(handling, group_id, message_id):
+    """A picture that belongs to an album, seen in a handling group.
+
+    If the /out has already been dealt with, this one is late and goes across
+    immediately. Otherwise it is remembered until the /out arrives - which is
+    the ordinary case, since the caption sits on the first of the album."""
+    if not group_id or message_id is None:
+        return
+    slot = _album_slot(handling, group_id)
+    if message_id not in slot['ids']:
+        slot['ids'].append(message_id)
+
+    if slot['to'] is None or message_id in slot['sent']:
+        return
+    if (datetime.now(timezone.utc) - slot['at']).total_seconds() > ALBUM_RELAY_SECONDS:
+        return
+    slot['sent'].add(message_id)
+    await _copy_album_part(handling, slot['to'], message_id)
+
+
+async def relay_album_siblings(handling, group_id, out_to, captioned_id):
+    """The /out has gone across. Send the rest of its album after it.
+
+    Registered rather than done once and forgotten: the parts that have not
+    arrived yet are the common case, and note_album_part() carries them over as
+    they land."""
+    if not group_id:
+        return
+    slot = _album_slot(handling, group_id)
+    slot['to'] = out_to
+    slot['at'] = datetime.now(timezone.utc)
+    slot['sent'].add(captioned_id)
+
+    for message_id in list(slot['ids']):
+        if message_id in slot['sent']:
+            continue
+        slot['sent'].add(message_id)
+        await _copy_album_part(handling, out_to, message_id)
+
+
 async def _deliver_out(out_to, handling, text, username=None, full_name=None,
-                       message_id=None, has_media=False):
+                       message_id=None, has_media=False, media_group_id=None):
     """Put the /out in front of the group that asked. True if it landed.
 
     Shared by the ordinary completion and the manual one below, so the two
@@ -1753,6 +1842,10 @@ async def _deliver_out(out_to, handling, text, username=None, full_name=None,
             await bot.copy_message(out_to, handling, message_id, caption=relay)
             print(f"🖼️ [CASHOUT] screenshot + /out copied to {chat_name(out_to)}",
                   flush=True)
+            # One picture is often only part of the proof. Send the rest of the
+            # album after it - AFTER the /out has landed, so an extra screenshot
+            # failing can never cost the instruction itself.
+            await relay_album_siblings(handling, media_group_id, out_to, message_id)
             return True
         except Exception as e:
             # Losing the picture is a nuisance; losing the /out strands the
@@ -1771,7 +1864,8 @@ async def _deliver_out(out_to, handling, text, username=None, full_name=None,
 
 
 async def force_complete_cashout(handling, text, user_id, username,
-                                 full_name=None, message_id=None, has_media=False):
+                                 full_name=None, message_id=None, has_media=False,
+                                 media_group_id=None):
     """Ethan or Larry finishing a cashout by hand, with nothing open here.
 
     The standing rule is that a /out with no request pending is ordinary traffic
@@ -1797,7 +1891,7 @@ async def force_complete_cashout(handling, text, user_id, username,
           f"by hand for {username or user_id}", flush=True)
 
     if not await _deliver_out(out_to, handling, text, username, full_name,
-                              message_id, has_media):
+                              message_id, has_media, media_group_id):
         return                          # nothing landed, so nothing is booked
 
     booked = await book_cashout_out(out_to, text)
@@ -1814,7 +1908,8 @@ async def force_complete_cashout(handling, text, user_id, username,
 
 
 async def handle_cashout_reply(handling, text, user_id, username, reply_to,
-                               full_name=None, message_id=None, has_media=False):
+                               full_name=None, message_id=None, has_media=False,
+                               media_group_id=None):
     """A message in a handling group.
 
     Ordinary traffic is never touched - including an ordinary /out - unless a
@@ -1829,7 +1924,8 @@ async def handle_cashout_reply(handling, text, user_id, username, reply_to,
     if not queue:
         if user_id in LEDGER_ADMINS and _OUT_CMD_RE.search(text):
             await force_complete_cashout(handling, text, user_id, username,
-                                         full_name, message_id, has_media)
+                                         full_name, message_id, has_media,
+                                         media_group_id)
         return
     responder = _is_responder(user_id, username)
     target = _match_request(queue, reply_to, text)
@@ -1872,7 +1968,7 @@ async def handle_cashout_reply(handling, text, user_id, username, reply_to,
     # kept for book_cashout_out() below, so the redaction inside _deliver_out()
     # can never change the figure that reaches the ledger.
     if not await _deliver_out(out_to, handling, text, username, full_name,
-                              message_id, has_media):
+                              message_id, has_media, media_group_id):
         return
 
     queue.remove(request)
@@ -1915,7 +2011,8 @@ async def handle_cashout_reply(handling, text, user_id, username, reply_to,
 
 async def observe_cashout(chat_id, text, message_id, sent_at,
                           user_id=None, username=None, reply_to=None,
-                          full_name=None, has_media=False, is_edit=False):
+                          full_name=None, has_media=False, is_edit=False,
+                          media_group_id=None):
     """Single entry point for both input paths.
 
     Called for every message in a watched chat that the gates upstream let
@@ -1968,9 +2065,17 @@ async def observe_cashout(chat_id, text, message_id, sent_at,
                 ('out-done', handling, message_id)):
             return
 
+        # Remembered before anything else: an album part that is not the
+        # captioned one carries no /out and would otherwise be dropped here as
+        # ordinary media, which is exactly how the extra screenshots went
+        # missing.
+        if has_media:
+            await note_album_part(handling, media_group_id, message_id)
+
         await handle_cashout_reply(handling, text, user_id, username, reply_to,
                                    full_name, message_id=message_id,
-                                   has_media=has_media)
+                                   has_media=has_media,
+                                   media_group_id=media_group_id)
 
 
 async def _confirm_gone(client, chat, msg_id):
@@ -3110,7 +3215,8 @@ async def cashout_from_bot_api(message, is_edit=False):
                           getattr(reply, 'message_id', None),
                           full_name or None,
                           has_media=getattr(message, 'content_type', 'text') != 'text',
-                          is_edit=is_edit)
+                          is_edit=is_edit,
+                          media_group_id=getattr(message, 'media_group_id', None))
 
     # Every Bot API handler that can carry a mention already routes through
     # here, so this is the one place it has to be called from. Kept after the
@@ -3684,7 +3790,9 @@ async def run_userbot():
                                       getattr(sender, 'username', None),
                                       getattr(event.message, 'reply_to_msg_id', None),
                                       full_name or None,
-                                      has_media=not plain)
+                                      has_media=not plain,
+                                      media_group_id=getattr(event.message,
+                                                             'grouped_id', None))
                 await observe_mentions(event.chat_id, text, event.id,
                                        event.message.date, sender_id,
                                        getattr(sender, 'username', None),
@@ -3732,7 +3840,9 @@ async def run_userbot():
                                       getattr(sender, 'username', None),
                                       getattr(event.message, 'reply_to_msg_id', None),
                                       full_name or None,
-                                      has_media=not plain, is_edit=True)
+                                      has_media=not plain, is_edit=True,
+                                      media_group_id=getattr(event.message,
+                                                             'grouped_id', None))
 
             @client.on(events.MessageDeleted)
             async def on_message_deleted(event):
