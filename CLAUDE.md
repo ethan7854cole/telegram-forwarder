@@ -17,7 +17,7 @@ python3 tests/run.py            # all suites
 python3 tests/run.py cashout    # only matching suites
 ```
 
-900 checks across 26 suites, all stubbed — nothing touches Telegram, the
+974 checks across 27 suites, all stubbed — nothing touches Telegram, the
 network, or the live groups. They cover the pre-existing behaviour as well as
 the new, so they are the guard against a change quietly altering something that
 already worked.
@@ -572,6 +572,99 @@ deliberately out. Both id spellings are matched.
   caption in a chime group is missed. Mentions are plain text in practice, and
   widening the media gates for this would put the payment path at risk.
 
+## The daily report
+
+A workbook every day at `REPORT_AT` (00:00 Nepal), covering the whole day just
+finished, DMed to Ethan and Larry. `/report` rebuilds any day on demand.
+
+**Rebuilt from the groups, never accumulated.** Railway wipes the disk on every
+deploy and there were two deploys inside one hour on 2026-08-10, so rows kept in
+memory or on disk would report a fraction of the day and never say which
+fraction. The messages are the durable record here exactly as they are for the
+ledger — which also means any past day can still be produced.
+
+**This half of the file only reads.** It never posts into a group except the one
+in-group report below, never moves a ledger, never touches an open request. A
+reporting bug must not be able to cost money, and `test_report.py` pins that the
+ledger is untouched by a build.
+
+### The gap — the point of the whole thing
+
+Each route is **two groups**: `Chime Rev & out no-7` with `CHIME GAFFER`, and
+`MH X LARRY GROUP 2` with `CHIME PICCASO`. Payments travel one way and cashouts
+the other **between the same two groups**, so both ends should account for the
+same money.
+
+```
+gap in  = what the chime group BOOKED  −  what the other end SAW
+gap out = what the chime group BOOKED OUT  −  the /out figures posted there
+```
+
+- **Positive** — the books moved more than the money that really arrived: a
+  payment booked twice, or resurrected by a deploy. Today's incident reads
+  `+10.00$`.
+- **Negative** — something the source saw never reached the books at all.
+- **Adjustments are deliberately not in it.** A retraction is somebody choosing
+  to take money off the books, not a disagreement between two groups; folding it
+  in would make every honest retraction read as a hole. They get their own line
+  in Exceptions.
+- Both pairs are reconciled, and both should read `0.00`.
+
+### Two reports, and where you type it decides which
+
+| Typed in | What happens |
+|---|---|
+| A DM | The full workbook: every group, cashout turnarounds, who paid them, the gap |
+| `CHIME PICCASO` / `CHIME GAFFER` | **That group's own figures, posted in the group** — `/report 24h`, `6h`, `3d` |
+| A handling group | Still private. The crew are in there |
+
+The in-group report is **two figures and nothing else** — what moved in and what
+moved out over the window, in the same shape the group already sees on every
+payment. No net, no counts, no list of who paid what, no running books: it is
+read at a glance in a busy group, and every extra line is something to read
+past. A retraction is folded into the figures rather than given its own line,
+because it really did take money off this group's books and the number has to
+agree with the group's own ledger.
+
+It is also **narrow by construction, not by filtering**:
+`send_group_report()` is handed nothing but that one group's own messages, so
+there is nothing else in the room to leak. No gap, no other group named, nobody
+named — a chime group is never told who handles its cashouts or that a handling
+group exists, and a summary posted in the open is the last place to break it.
+It also goes out through `send_group()`, so the identity stripping applies as it
+does to everything else.
+
+Ethan and Larry only, in both shapes. A refusal is silent, like the others.
+
+### Waiting for a late /out
+
+**Midnight waits for an unanswered cashout** — `_wait_for_pending_cashouts()`.
+The day is not finished while somebody still owes a `/out`: the request was asked
+today and the money is today's, even if the answer lands after midnight. The day
+being reported is read *before* the wait, so holding cannot roll the report onto
+the next day. Capped at `REPORT_WAIT_MINUTES` (180) — a request nobody ever
+answers must not hold the report for ever, and what was still open goes into
+Exceptions instead.
+
+### Reading the groups back
+
+- **A day is a NEPAL day.** `LOCAL_TZ` is +05:45, so a UTC day would put a whole
+  evening of payments in the wrong report.
+- **Only what the bot posted counts as booked** — `_report_is_ours()`.
+  `deliver_to_target()` books an amount only `if from_bot`, so counting a human
+  paste would invent money and report a gap that is not there. **Unknown
+  authorship counts as ours**: Telegram credits a channel post to the channel and
+  an anonymous admin's to the group, so demanding a positive `BOT_ID` match can
+  exclude the bot's own messages entirely — and a report that silently counted
+  nothing looks exactly like a quiet day. Only a different, identifiable sender
+  is dropped. Same reasoning as `_delivered_signatures()`.
+- **An unreadable group is unknown, never zero.** It is named in the summary and
+  in Exceptions, because an empty sheet and a silent failure look identical.
+- **A `/out` is matched to the request it PAID** — `_pair_cashouts()`, the same
+  rule as `_match_request()`: explicit reply wins, then the figure, then oldest.
+- `openpyxl` is the only new dependency, and a **missing** one degrades to CSV
+  rather than losing the report.
+
 ## The deploy changeover
 
 Railway boots the replacement container before the outgoing one has gone, so
@@ -659,6 +752,7 @@ cashout requests.
 | `tests/test_amounts.py` | A /out paying the wrong figure; taking back the chase, DM and group |
 | `tests/test_edits.py` | A /out edited onto a message, and the double-book guard |
 | `tests/test_album.py` | Every screenshot in an album reaches the group that asked |
+| `tests/test_report.py` | The daily workbook, the gap, and the narrow in-group report |
 | `backfill.py` | Manual one-off backfill, separate from the boot sweep |
 | `telethon_login.py` | Generates a `TELETHON_SESSION`; `--deploy` for Railway |
 

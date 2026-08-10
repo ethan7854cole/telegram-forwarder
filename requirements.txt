@@ -1,3 +1,4 @@
 pyTelegramBotAPI
 aiohttp
 telethon
+openpyxl

@@ -1,4 +1,5 @@
 import asyncio
+import io
 import os
 import re
 import signal
@@ -6,7 +7,7 @@ from collections import Counter, OrderedDict
 from datetime import datetime, timedelta, timezone
 
 from telebot.async_telebot import AsyncTeleBot
-from telebot.types import ReactionTypeEmoji
+from telebot.types import InputFile, ReactionTypeEmoji
 
 from telethon import TelegramClient, events, utils
 from telethon.errors import (AuthKeyDuplicatedError, AuthKeyUnregisteredError,
@@ -2897,6 +2898,21 @@ async def help_command(message):
         "/pause piccaso — stops them in CHIME PICCASO only\n"
         "/resume — starts them again, same three forms\n"
         "\n"
+        "REPORTS\n"
+        "\n"
+        f"A workbook lands here every day at {REPORT_AT} Nepal\n"
+        "time, covering the whole day just finished. If a\n"
+        "cashout is still unanswered it waits for the /out,\n"
+        f"up to {REPORT_WAIT_MINUTES} min.\n"
+        "/report — today so far, as a workbook, privately\n"
+        "/report yesterday — the day before\n"
+        "/report 2026-08-05 — any past day\n"
+        "/report 24h — typed in CHIME PICCASO or CHIME\n"
+        "GAFFER, posts THAT group's own figures in the\n"
+        "group for everyone there to read. 6h, 3d, any\n"
+        "span. It shows that group's money only — never\n"
+        "the other group, the crew, or the gap.\n"
+        "\n"
         "EMERGENCY STOP — from here, or from any cashout group\n"
         "\n"
         "/cashout off — stops the whole cashout flow: nothing\n"
@@ -3304,6 +3320,648 @@ async def on_request_reaction(reaction):
     # retract_payment only at RETRACT_SOURCES, and no chat is both.
     await retract_payment(reaction.chat.id, reaction.message_id,
                           getattr(user, 'id', None))
+
+
+# ══════════════════════════ THE DAILY REPORT ══════════════════════════
+#
+# One workbook a day, built by READING THE GROUPS BACK - never by accumulating
+# rows as events happen. Railway wipes the disk on every deploy and there were
+# two deploys inside one hour on 2026-08-10, so anything kept in memory or on
+# disk would report a fraction of the day and never say which fraction. The
+# messages are the durable record here exactly as they are for the ledger, and
+# rebuilding from them means any past day can still be produced on demand.
+#
+# This half of the file READS. It never posts into a group, never moves a
+# ledger and never touches an open request: a reporting bug must not be able to
+# cost money.
+
+REPORT_ENABLED = os.getenv('REPORT_ENABLED', '1') not in ('0', 'false', 'False')
+# Local time. Midnight, so a report covers one whole calendar day.
+REPORT_AT = os.getenv('REPORT_AT', '00:00')
+# How long midnight will wait for a cashout that is still unanswered. The day is
+# not really finished while one is outstanding - the /out belongs to it - but a
+# request nobody ever answers must not hold the report for ever.
+REPORT_WAIT_MINUTES = int(os.getenv('REPORT_WAIT_MINUTES', '180'))
+REPORT_SCAN_LIMIT = int(os.getenv('REPORT_SCAN_LIMIT', '3000'))
+
+# 📤 Out = -200.00$ - what book_cashout_out() posts when it moves Total Out.
+_REPORT_OUT_RE = re.compile(r'Out\s*=\s*-?\s*([\d,]+(?:\.\d+)?)\s*\$', re.I)
+# ✏️ Total In adjusted by -5.00$ - a retraction, or /add -N by hand.
+_REPORT_ADJ_RE = re.compile(
+    r'Total\s+(In|Out)\s+adjusted\s+by\s+(-?[\d,]+(?:\.\d+)?)\s*\$', re.I)
+# The payer's name off the notification itself.
+_REPORT_FROM_RE = re.compile(
+    r'You\s+received\s+\$?\s*[\d,]+(?:\.\d+)?\s+from\s+([^\n]+)', re.I)
+
+
+def report_pairs():
+    """The two ends of each route, as one pair.
+
+    A pair is one handling/source group and the chime group it serves - MH X
+    LARRY GROUP 2 with CHIME PICCASO, Chime Rev & out no-7 with CHIME GAFFER.
+    Payments travel one way and cashouts the other BETWEEN THE SAME TWO GROUPS,
+    which is what makes a gap between them meaningful.
+
+    Derived from the live tables rather than written out, so re-pointing a route
+    in Railway cannot leave the report reconciling groups that no longer talk to
+    each other."""
+    pairs = []
+    for chime, route in CASHOUT_ROUTES.items():
+        handling = route['handling']
+        source = _canonical(handling, FORWARD_RULES)
+        targets = FORWARD_RULES.get(source, []) if source is not None else []
+        # 'paired' says the two really are two ends of one route: payments come
+        # this way and cashouts go back. Only then does a gap between them mean
+        # anything - reconciling groups that do not talk would invent one.
+        pairs.append({'chime': chime, 'handling': handling,
+                      'paired': _canonical(chime, {t: None for t in targets})
+                      is not None})
+    return pairs
+
+
+def _report_window(day):
+    """The UTC window covering one LOCAL calendar day.
+
+    Nepal is +05:45, so a 'day' is nothing like a UTC day and the difference is
+    a whole evening of payments landing in the wrong report."""
+    start_local = datetime(day.year, day.month, day.day, tzinfo=LOCAL_TZ)
+    return start_local.astimezone(timezone.utc), \
+        (start_local + timedelta(days=1)).astimezone(timezone.utc)
+
+
+async def _report_scan(client, chat_id, start, end):
+    """Every message one group saw inside the window, oldest first.
+
+    None means the group could not be read at all, which the caller reports as
+    unknown rather than as an empty day - an empty sheet and a silent failure
+    look identical otherwise, and one of them means the books are unwatched."""
+    entity = await _resolve_one(client, chat_id)
+    if entity is None:
+        return None
+    rows = []
+    try:
+        async for msg in client.iter_messages(entity, limit=REPORT_SCAN_LIMIT):
+            if msg.date < start:
+                break
+            if msg.date >= end:
+                continue
+            rows.append(msg)
+    except Exception as e:
+        print(f"⚠️ [REPORT] could not read {chat_name(chat_id)}: {e}", flush=True)
+        return None
+    rows.reverse()
+    return rows
+
+
+def _hhmm(when):
+    return when.astimezone(LOCAL_TZ).strftime('%H:%M')
+
+
+def _report_is_ours(msg):
+    """Did the BOT post this, as far as Telegram will say?
+
+    Only what the bot posted moved the books. A human pasting a notification
+    into a chime group never moved the ledger - deliver_to_target() books an
+    amount only `if from_bot` - so counting it would invent money that was
+    never on the books and report a gap that is not there.
+
+    UNKNOWN authorship counts as ours, deliberately. Telegram credits a channel
+    post to the channel rather than to the bot that sent it, and an anonymous
+    admin's post to the group, so demanding a positive match on BOT_ID can
+    exclude the bot's own messages entirely - and a report that silently
+    counted nothing would look exactly like a quiet day. Only a different,
+    identifiable sender is dropped. Same reasoning as _delivered_signatures()."""
+    sender_id = getattr(msg, 'sender_id', None)
+    if sender_id is None:
+        sender_id = getattr(getattr(msg, 'sender', None), 'id', None)
+    return sender_id is None or BOT_ID is None or sender_id == BOT_ID
+
+
+def _read_chime_side(messages):
+    """What the chime group's own books did today."""
+    payments, booked_out, adjustments = [], [], []
+    closing = None
+    for msg in messages:
+        text = msg.raw_text or ''
+        if not text or not _report_is_ours(msg):
+            continue
+        amount = parse_received_amount(text)
+        if amount is not None and 'received' in text.lower():
+            name = _REPORT_FROM_RE.search(text)
+            payments.append({'at': msg.date, 'amount': amount,
+                             'name': (name.group(1).strip() if name else '?')})
+        out = _REPORT_OUT_RE.search(text)
+        if out and 'total' not in text.split('\n')[0].lower():
+            booked_out.append({'at': msg.date, 'amount': _to_float(out.group(1))})
+        adj = _REPORT_ADJ_RE.search(text)
+        if adj:
+            adjustments.append({'at': msg.date, 'column': adj.group(1).title(),
+                                'amount': _to_float(adj.group(2))})
+        totals = parse_totals(text)
+        if totals[0] is not None and totals[1] is not None:
+            closing = totals            # newest wins: the day's closing books
+    return {'payments': payments, 'booked_out': booked_out,
+            'adjustments': adjustments, 'closing': closing}
+
+
+def _read_handling_side(messages):
+    """What the other end of the pair actually saw.
+
+    The notifications as they arrived, the cashout requests the bot posted, and
+    the crew's /out answers. This is the independent side of the reconciliation:
+    it is read from a different group than the books it is compared against."""
+    received, requests, outs = [], [], []
+    for msg in messages:
+        text = msg.raw_text or getattr(msg, 'message', '') or ''
+        caption = getattr(msg, 'caption', None)
+        text = text or caption or ''
+        if not text:
+            continue
+        amount = parse_received_amount(text)
+        if amount is not None and 'received' in text.lower():
+            received.append({'at': msg.date, 'amount': amount})
+        if CASHOUT_KEYWORD.lower() in text.lower():
+            requests.append({'at': msg.date, 'id': msg.id,
+                             'asked': request_amount(text),
+                             'text': ' '.join(text.split())[:120],
+                             'chases': 0, 'paid_at': None, 'paid': None,
+                             'by': None})
+        elif _OUT_CMD_RE.search(text):
+            outs.append({'at': msg.date, 'amount': out_amount(text),
+                         'reply_to': getattr(msg, 'reply_to_msg_id', None)
+                         or getattr(getattr(msg, 'reply_to', None),
+                                    'reply_to_msg_id', None),
+                         'by': _report_sender(msg)})
+        elif 'OUT REQUEST HAS CROSSED' in text:
+            requests_by_id = {r['id']: r for r in requests}
+            replied = (getattr(msg, 'reply_to_msg_id', None)
+                       or getattr(getattr(msg, 'reply_to', None),
+                                  'reply_to_msg_id', None))
+            if replied in requests_by_id:
+                requests_by_id[replied]['chases'] += 1
+    return {'received': received, 'requests': requests, 'outs': outs}
+
+
+def _report_sender(msg):
+    """Who posted it, in whatever form Telegram cached.
+
+    The numeric id is the fallback rather than '?': it is the one thing that is
+    always there, and the escalation DMs already carry ids for the same reason -
+    a name nobody recognises is worse than a number that can be looked up."""
+    sender = getattr(msg, 'sender', None)
+    handle = getattr(sender, 'username', None)
+    if handle:
+        return '@' + handle
+    name = ' '.join(part for part in (getattr(sender, 'first_name', None),
+                                      getattr(sender, 'last_name', None)) if part)
+    if name:
+        return name
+    sender_id = getattr(msg, 'sender_id', None) or getattr(sender, 'id', None)
+    return f"id:{sender_id}" if sender_id else '?'
+
+
+def _pair_cashouts(requests, outs):
+    """Match each /out to the request it paid - the report's version of
+    _match_request(), and deliberately the same rule.
+
+    An explicit reply wins outright. Otherwise the figure decides, because a
+    /out settles the request it PAID and not the oldest one; taking queue[0]
+    blindly is what mis-marked a live cashout on 2026-08-04. The oldest open
+    request is still the fallback for a /out with no figure."""
+    for out in sorted(outs, key=lambda o: o['at']):
+        open_now = [r for r in requests if r['paid_at'] is None
+                    and r['at'] <= out['at']]
+        if not open_now:
+            continue
+        match = next((r for r in open_now if r['id'] == out['reply_to']), None)
+        if match is None and out['amount'] is not None:
+            match = next((r for r in open_now if r['asked'] == out['amount']), None)
+        if match is None:
+            match = open_now[0]
+        match['paid_at'] = out['at']
+        match['paid'] = out['amount']
+        match['by'] = out['by']
+    return requests
+
+
+async def build_day_report(client, day):
+    """One whole local day. The scheduled report, and /report <date>."""
+    start, end = _report_window(day)
+    return await build_report(client, start, end, day)
+
+
+async def build_report(client, start, end, day):
+    """Everything both ends of every pair did in the window. Reads only."""
+    report = {'day': day, 'pairs': [], 'unreadable': []}
+
+    for pair in report_pairs():
+        chime, handling = pair['chime'], pair['handling']
+        chime_msgs = await _report_scan(client, chime, start, end)
+        handling_msgs = await _report_scan(client, handling, start, end)
+        if chime_msgs is None:
+            report['unreadable'].append(chat_name(chime))
+        if handling_msgs is None:
+            report['unreadable'].append(chat_name(handling))
+
+        books = _read_chime_side(chime_msgs or [])
+        floor = _read_handling_side(handling_msgs or [])
+        cashouts = _pair_cashouts(floor['requests'], floor['outs'])
+
+        booked_in = sum(p['amount'] for p in books['payments'])
+        booked_out = sum(o['amount'] for o in books['booked_out'])
+        seen_in = sum(r['amount'] for r in floor['received'])
+        seen_out = sum(o['amount'] for o in floor['outs']
+                       if o['amount'] is not None)
+
+        # THE GAP: what the chime group's books DID, minus what the other end
+        # of the pair actually saw. Positive means the books moved more than
+        # the money that really arrived - a payment booked twice, or one
+        # brought back from the dead by a deploy, which is exactly what
+        # happened to CHIME GAFFER on 2026-08-10 (+10.00$). Negative means
+        # something the source saw never reached the books at all.
+        #
+        # Adjustments are deliberately NOT part of this. A retraction is
+        # somebody choosing to take money off the books; it is not a
+        # disagreement between the two groups, and folding it in here would
+        # make every honest retraction read as a hole. They are listed on
+        # their own in the Exceptions sheet instead.
+        report['pairs'].append({
+            'chime': chime, 'handling': handling,
+            'payments': books['payments'], 'adjustments': books['adjustments'],
+            'cashouts': cashouts, 'closing': books['closing'],
+            'booked_in': booked_in, 'booked_out': booked_out,
+            'seen_in': seen_in, 'seen_out': seen_out,
+            'gap_in': round(booked_in - seen_in, 2),
+            'gap_out': round(booked_out - seen_out, 2),
+            'readable': chime_msgs is not None and handling_msgs is not None,
+        })
+    return report
+
+
+def report_summary_text(report):
+    """The same figures as the workbook, for anyone reading on a phone."""
+    lines = [f"📊 DAILY REPORT — {report['day']:%d %b %Y}", '']
+    for pair in report['pairs']:
+        paid = [c for c in pair['cashouts'] if c['paid_at'] is not None]
+        open_still = [c for c in pair['cashouts'] if c['paid_at'] is None]
+        lines.append(f"{chat_name(pair['chime'])}")
+        lines.append(f"  In  {pair['booked_in']:,.2f}$ over {len(pair['payments'])} "
+                     f"payment(s)")
+        lines.append(f"  Out {pair['booked_out']:,.2f}$ over {len(paid)} cashout(s)")
+        if pair['closing']:
+            lines.append(f"  Books {pair['closing'][0]:,.2f}$ in / "
+                         f"{pair['closing'][1]:,.2f}$ out")
+        gap = 'clean' if not (pair['gap_in'] or pair['gap_out']) else (
+            f"⚠️ in {pair['gap_in']:+,.2f}$  out {pair['gap_out']:+,.2f}$")
+        lines.append(f"  Gap vs {chat_name(pair['handling'])}: {gap}")
+        if open_still:
+            lines.append(f"  ⏳ {len(open_still)} cashout(s) still unanswered")
+        lines.append('')
+    if report['unreadable']:
+        lines.append("⚠️ Could not read: " + ', '.join(sorted(set(report['unreadable'])))
+                     + " — those figures are missing, not zero.")
+    return '\n'.join(lines).strip()
+
+
+def _report_rows(report):
+    """The workbook as plain data, so the sheet layout is testable without a
+    spreadsheet library in the room."""
+    summary = [('Group', 'Paired with', 'In', 'Out', 'Payments', 'Cashouts paid',
+                'Cashouts open', 'Closing In', 'Closing Out', 'Gap In', 'Gap Out')]
+    payments = [('Day', 'Time', 'Group', 'From', 'Amount')]
+    cashouts = [('Day', 'Asked at', 'Paid at', 'Group', 'Asked', 'Paid',
+                 'Waited (min)', 'Chases', 'Paid by', 'Request')]
+    exceptions = [('Day', 'Time', 'Group', 'What')]
+    stamp = f"{report['day']:%Y-%m-%d}"
+
+    for pair in report['pairs']:
+        paid = [c for c in pair['cashouts'] if c['paid_at'] is not None]
+        open_still = [c for c in pair['cashouts'] if c['paid_at'] is None]
+        closing = pair['closing'] or (None, None)
+        summary.append((chat_name(pair['chime']), chat_name(pair['handling']),
+                        float(pair['booked_in']), float(pair['booked_out']),
+                        len(pair['payments']), len(paid), len(open_still),
+                        closing[0], closing[1],
+                        float(pair['gap_in']), float(pair['gap_out'])))
+
+        for row in pair['payments']:
+            payments.append((stamp, _hhmm(row['at']), chat_name(pair['chime']),
+                             row['name'], row['amount']))
+
+        for row in pair['cashouts']:
+            waited = (round((row['paid_at'] - row['at']).total_seconds() / 60.0, 1)
+                      if row['paid_at'] else None)
+            cashouts.append((stamp, _hhmm(row['at']),
+                             _hhmm(row['paid_at']) if row['paid_at'] else 'UNPAID',
+                             chat_name(pair['handling']), row['asked'], row['paid'],
+                             waited, row['chases'], row['by'] or '', row['text']))
+            if row['paid_at'] is None:
+                asked = (f"{row['asked']:,.2f}$" if row['asked'] is not None
+                         else 'an unreadable figure')
+                exceptions.append((stamp, _hhmm(row['at']),
+                                   chat_name(pair['handling']),
+                                   f"Cashout never answered — asked {asked}"))
+            elif (row['asked'] is not None and row['paid'] is not None
+                    and row['asked'] != row['paid']):
+                exceptions.append((stamp, _hhmm(row['paid_at']),
+                                   chat_name(pair['handling']),
+                                   f"Paid {row['paid']:,.2f} against a request for "
+                                   f"{row['asked']:,.2f}"))
+
+        for row in pair['adjustments']:
+            exceptions.append((stamp, _hhmm(row['at']), chat_name(pair['chime']),
+                               f"{row['column']} adjusted by {row['amount']:,.2f}$ "
+                               "(retraction or manual correction)"))
+
+        if pair['gap_in'] or pair['gap_out']:
+            exceptions.append((stamp, '', chat_name(pair['chime']),
+                               f"GAP against {chat_name(pair['handling'])}: "
+                               f"in {pair['gap_in']:+,.2f}$, out {pair['gap_out']:+,.2f}$ "
+                               "— the two groups do not agree"))
+        if not pair['readable']:
+            exceptions.append((stamp, '', chat_name(pair['chime']),
+                               "One end of this pair could not be read — these "
+                               "figures are incomplete, not zero"))
+
+    # Chronological, not grouped by kind: reading down the sheet should read
+    # the day in the order it happened. The header stays put.
+    exceptions[1:] = sorted(exceptions[1:], key=lambda row: (row[0], row[1]))
+    return {'Summary': summary, 'Payments': payments,
+            'Cashouts': cashouts, 'Exceptions': exceptions}
+
+
+def render_report_file(report):
+    """(filename, bytes). A real .xlsx when openpyxl is installed, a CSV when it
+    is not - a missing spreadsheet library must not cost the whole report."""
+    sheets = _report_rows(report)
+    stamp = f"{report['day']:%Y-%m-%d}"
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font
+    except ImportError:
+        print("⚠️ [REPORT] openpyxl missing - sending CSV instead", flush=True)
+        lines = []
+        for name, rows in sheets.items():
+            lines.append(f"# {name}")
+            for row in rows:
+                lines.append(','.join(
+                    '' if cell is None else f'"{cell}"' if isinstance(cell, str)
+                    else str(cell) for cell in row))
+            lines.append('')
+        return f"report-{stamp}.csv", '\n'.join(lines).encode('utf-8')
+
+    book = Workbook()
+    book.remove(book.active)
+    for name, rows in sheets.items():
+        sheet = book.create_sheet(name)
+        for row in rows:
+            sheet.append(list(row))
+        for cell in sheet[1]:
+            cell.font = Font(bold=True)
+        # Money reads as money. Counts are ints and stay plain, so this needs
+        # no column map that could drift as sheets change.
+        for row in sheet.iter_rows(min_row=2):
+            for cell in row:
+                if isinstance(cell.value, float):
+                    cell.number_format = '#,##0.00'
+        for column in sheet.columns:
+            longest = max((len(str(c.value)) for c in column if c.value is not None),
+                          default=8)
+            sheet.column_dimensions[column[0].column_letter].width = min(longest + 2, 60)
+        sheet.freeze_panes = 'A2'
+
+    buffer = io.BytesIO()
+    book.save(buffer)
+    return f"report-{stamp}.xlsx", buffer.getvalue()
+
+
+async def send_day_report(client, day, to=None):
+    """Build one day and deliver it privately. Never posted in a group."""
+    report = await build_day_report(client, day)
+    filename, blob = render_report_file(report)
+    caption = report_summary_text(report)
+
+    delivered = []
+    for chat_id in (to if to is not None else sorted(LEDGER_ADMINS)):
+        try:
+            await bot.send_document(chat_id, InputFile(io.BytesIO(blob), filename),
+                                    caption=caption, visible_file_name=filename)
+            delivered.append(chat_id)
+        except Exception as e:
+            print(f"⚠️ [REPORT] could not send to {chat_id}: {e}", flush=True)
+            try:
+                await bot.send_message(chat_id, caption)
+                delivered.append(chat_id)
+            except Exception as inner:
+                print(f"❌ [REPORT] {chat_id} got nothing at all: {inner}", flush=True)
+    print(f"📊 [REPORT] {day} delivered to {len(delivered)} recipient(s)", flush=True)
+    return report, delivered
+
+
+_REPORT_SPAN_RE = re.compile(r'^(\d+)\s*(h|hr|hrs|hour|hours|d|day|days)$', re.I)
+
+
+def parse_report_span(argument):
+    """'6h', '24h', '3d' -> a timedelta. None when it is not a span at all."""
+    match = _REPORT_SPAN_RE.match((argument or '').strip())
+    if not match:
+        return None
+    size = int(match.group(1))
+    if size <= 0:
+        return None
+    unit = match.group(2).lower()
+    span = timedelta(days=size) if unit.startswith('d') else timedelta(hours=size)
+    # A window nobody can read back is not worth building.
+    return span if span <= timedelta(days=31) else None
+
+
+def group_report_text(books, span_label):
+    """Two figures, and nothing else.
+
+    What moved in and what moved out over the window, in the same shape the
+    group already sees on every payment. No net, no counts, no list of who
+    paid what, no running books - asked for explicitly on 2026-08-10, and the
+    reason is sound: this is read at a glance in a busy group, and every extra
+    line is something to read past.
+
+    Deliberately NARROW, and narrow by construction rather than by filtering:
+    it is handed nothing but this group's own messages, so there is nothing
+    else in the room to leak. A chime group is never told who handles its
+    cashouts or that a handling group exists at all - that is the oldest rule
+    in the flow, and a summary posted in the open is the last place to break
+    it. The private workbook is where the routing, the crew and the
+    reconciliation live.
+
+    Adjustments are folded into the figures rather than shown on their own
+    line. A retraction really did take money back off this group's books, so
+    leaving it out would print a Total In the group's own ledger disagrees
+    with - and reconciling the two would then need the very detail this shape
+    exists to leave out."""
+    adjust_in = sum(row['amount'] for row in books['adjustments']
+                    if row['column'] == 'In')
+    adjust_out = sum(row['amount'] for row in books['adjustments']
+                     if row['column'] == 'Out')
+    total_in = sum(row['amount'] for row in books['payments']) + adjust_in
+    total_out = sum(row['amount'] for row in books['booked_out']) + adjust_out
+    return (f"📊 REPORT — last {span_label}\n\n"
+            f"➕ Total In : {total_in:,.2f}$\n"
+            f"➖ Total Out: {total_out:,.2f}$")
+
+
+async def send_group_report(client, chime, span, span_label):
+    """Post one chime group's own report into that group.
+
+    Only this group is read. Not the handling group, not the other route, not
+    the ledger of anywhere else - so what goes out cannot contain them."""
+    end = datetime.now(timezone.utc)
+    messages = await _report_scan(client, chime, end - span, end)
+    if messages is None:
+        return None
+    books = _read_chime_side(messages)
+    await send_group(chime, group_report_text(books, span_label))
+    print(f"📊 [REPORT] posted a {span_label} report in {chat_name(chime)}",
+          flush=True)
+    return books
+
+
+def _seconds_until_report(now=None):
+    """Seconds to the next REPORT_AT in LOCAL time."""
+    now = now or datetime.now(timezone.utc)
+    local = now.astimezone(LOCAL_TZ)
+    try:
+        hour, minute = (int(part) for part in REPORT_AT.split(':'))
+    except ValueError:
+        hour, minute = 0, 0
+    target = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= local:
+        target += timedelta(days=1)
+    return (target - local).total_seconds()
+
+
+async def _wait_for_pending_cashouts():
+    """Hold the report while a cashout is still unanswered.
+
+    A day is not finished while somebody still owes a /out: the request was
+    asked today and the money is today's, even if the answer lands after
+    midnight. So midnight waits for it - but a request nobody EVER answers must
+    not hold the report for ever, so the wait is capped and what was still open
+    goes into the sheet as an exception rather than delaying it further."""
+    waited = 0
+    while REPORT_WAIT_MINUTES > 0 and waited < REPORT_WAIT_MINUTES:
+        open_now = sum(len(queue) for queue in _pending_cashouts.values())
+        if not open_now:
+            return waited
+        if waited == 0:
+            print(f"📊 [REPORT] holding: {open_now} cashout(s) still unanswered "
+                  f"(up to {REPORT_WAIT_MINUTES}m)", flush=True)
+        await asyncio.sleep(60)
+        waited += 1
+    return waited
+
+
+async def daily_report_loop():
+    """One workbook a day, at REPORT_AT local time."""
+    if not REPORT_ENABLED:
+        print("📊 [REPORT] disabled", flush=True)
+        return
+    print(f"📊 [REPORT] daily workbook at {REPORT_AT} Nepal time, waiting up to "
+          f"{REPORT_WAIT_MINUTES}m for an unanswered /out", flush=True)
+    while True:
+        await asyncio.sleep(_seconds_until_report())
+        # The day that has just ENDED. Read before the wait below, so holding
+        # for a late /out cannot roll the report onto the next day.
+        day = (datetime.now(timezone.utc).astimezone(LOCAL_TZ) - timedelta(minutes=5)).date()
+        try:
+            await _wait_for_pending_cashouts()
+            if _active_client is None:
+                print("⚠️ [REPORT] no user account connected - cannot read the "
+                      "groups, skipping today", flush=True)
+                await notify_admin("⚠️ The daily report could not be built: the user "
+                                   "account is not connected, so the groups cannot "
+                                   "be read. Use /report once it is back.")
+            else:
+                await send_day_report(_active_client, day)
+        except Exception as e:
+            print(f"❌ [REPORT] {day} failed: {e}", flush=True)
+            await notify_admin(f"⚠️ The daily report for {day} failed to build: {e}\n\n"
+                               "Nothing else is affected — this half of the bot only "
+                               "reads. Try /report to rebuild it by hand.")
+        await asyncio.sleep(90)         # never fire twice for one midnight
+
+
+@bot.message_handler(commands=['report'])
+async def report_command(message):
+    """Two reports, and WHERE it is typed decides which.
+
+    In CHIME PICCASO or CHIME GAFFER, `/report 24h` posts that group's own
+    figures into the group, for everyone there to read. It covers a rolling
+    window because that is what a group asks - "what have we done today" - and
+    it contains nothing but that group's own money.
+
+    Anywhere else it is private, whole days, and the full workbook: every
+    group, the cashout turnarounds, who paid them, and the gap between each
+    pair. That version names the handling groups and the crew, so it goes to
+    Ethan and Larry and never into a chat anyone else can read.
+
+    Ethan and Larry only, in both shapes - the same rule every command that
+    shows figures already keeps."""
+    chat_id = message.chat.id
+    user_id = getattr(message.from_user, 'id', None)
+    if user_id not in LEDGER_ADMINS:
+        # Silent, like the other refusals: in a group, an explanation would
+        # advertise a command to people who cannot use it.
+        print(f"⛔ [REPORT] /report by {user_id} in {chat_id} denied", flush=True)
+        return
+
+    parts = (message.text or '').split()
+    argument = parts[1].lower() if len(parts) > 1 else ''
+
+    if _active_client is None:
+        await send_group(user_id, "⚠️ The user account is not connected, so the "
+                                  "groups cannot be read right now.")
+        return
+
+    # In a chime group: that group's own report, posted right there.
+    chime = _canonical(chat_id, CASHOUT_ROUTES)
+    if chime is not None:
+        span = parse_report_span(argument) or timedelta(hours=24)
+        label = argument if parse_report_span(argument) else '24h'
+        try:
+            if await send_group_report(_active_client, chime, span, label) is None:
+                await send_group(user_id, f"⚠️ Could not read "
+                                          f"{chat_name(chime)} to build that report.")
+        except Exception as e:
+            print(f"❌ [REPORT] group report in {chat_id} failed: {e}", flush=True)
+            # Privately: a failure notice in the group would tell the room the
+            # bot is having trouble, which is Ethan's business and nobody else's.
+            await send_group(user_id, f"⚠️ Could not post the report in "
+                                      f"{chat_name(chime)}: {e}")
+        return
+
+    # Anywhere else: the private workbook.
+    today = datetime.now(timezone.utc).astimezone(LOCAL_TZ).date()
+    span = parse_report_span(argument)
+    if argument in ('yesterday', 'y'):
+        day = today - timedelta(days=1)
+    elif span is not None:
+        day = today          # a span in a DM still reports whole days
+    elif argument:
+        try:
+            day = datetime.strptime(argument, '%Y-%m-%d').date()
+        except ValueError:
+            await send_group(user_id, "Use /report, /report yesterday, "
+                                      "/report 2026-08-05, or /report 24h in a "
+                                      "chime group.")
+            return
+    else:
+        day = today
+
+    await send_group(user_id, f"📊 Building the report for {day:%d %b %Y}…")
+    try:
+        await send_day_report(_active_client, day, to=[user_id])
+    except Exception as e:
+        print(f"❌ [REPORT] /report {day} failed: {e}", flush=True)
+        await send_group(user_id, f"⚠️ Could not build that report: {e}")
 
 
 # Everything the Bot API can hang a caption on. Kept explicit rather than
@@ -4110,7 +4768,8 @@ async def main():
     _install_shutdown_handler(asyncio.get_running_loop())
     await notify_admin('Bot is ONLINE. Use /help to see all commands.')
     await asyncio.gather(run_bot(), run_userbot(), idle_watchdog(),
-                         cashout_watchdog(), return_exceptions=True)
+                         cashout_watchdog(), daily_report_loop(),
+                         return_exceptions=True)
 
 
 if __name__ == '__main__':
