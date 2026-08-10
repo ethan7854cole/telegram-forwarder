@@ -317,6 +317,29 @@ async def main():
         check('and nothing is DMed for it',
               [c for c, _ in sent if c > 0] == [], str(sent))
 
+        # -- BOTH chime groups behave identically ---------------------------
+        # test_parity.py's rule: a route that is only tested on one side is
+        # not tested. CHIME PICCASO must answer in CHIME PICCASO, with its own
+        # figures and nothing from the other route.
+        piccaso_books = [Msg(921, payment(120.0, 'Marcus T.', 4200.0, 1100.0),
+                             now - timedelta(hours=3)),
+                         Msg(922, booked_out(150.0, 4200.0, 1250.0),
+                             now - timedelta(hours=1))]
+        both = FakeClient({GAFFER: recent, PICCASO: piccaso_books,
+                           CHIMEREV: chimerev, MHLARRY: []})
+        f._active_client = both
+        for group, other, expect_in in ((PICCASO, GAFFER, '120.00$'),
+                                        (GAFFER, PICCASO, '5.00$')):
+            reset()
+            await f.report_command(fake_message(group, ETHAN, '/report 24h'))
+            here = [t for c, t in sent if c == group]
+            check(f'/report answers in {f.chat_name(group)}', len(here) == 1, str(sent))
+            check(f'{f.chat_name(group)} gets its OWN figure',
+                  here and expect_in in here[0], str(here))
+            check(f'and nothing reaches {f.chat_name(other)}',
+                  [c for c, _ in sent if c == other] == [], str(sent))
+        f._active_client = client
+
         # -- a crew member cannot run it ------------------------------------
         reset()
         await f.report_command(fake_message(GAFFER, CREW, '/report 6h'))
