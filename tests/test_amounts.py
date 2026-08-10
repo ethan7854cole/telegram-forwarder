@@ -1,5 +1,6 @@
 """What happens around the /out itself: paying a figure that is not the one
-asked for, and taking back the chase DM once the money has actually moved.
+asked for, and taking back the chase once the money has actually moved - the
+crew's private DM and the reminders in the handling group alike.
 
 Stubbed bot and Telethon client - nothing here touches Telegram or the network.
 """
@@ -78,10 +79,10 @@ async def run_watchdog(seconds=0.2):
     f.asyncio.sleep = real_sleep
 
 
-async def open_request(text='CASHOUT REQUEST $200 for Gabriel W.'):
-    await f.observe_cashout(PICCASO, text, 901, datetime.now(timezone.utc),
+async def open_request(text='CASHOUT REQUEST $200 for Gabriel W.', msg_id=901):
+    await f.observe_cashout(PICCASO, text, msg_id, datetime.now(timezone.utc),
                             user_id=42)
-    return f._pending_cashouts[MHLARRY][0]
+    return f._pending_cashouts[MHLARRY][-1]
 
 
 def larry_dms(marker):
@@ -180,7 +181,7 @@ async def main():
     await f.observe_cashout(MHLARRY, '/out 200', 908, datetime.now(timezone.utc),
                             user_id=77, username='Maynuddin23')
     check('the crew chase DM is deleted once the /out arrives',
-          deleted == [(CREW, notice_id)], str(deleted))
+          [d for d in deleted if d[0] > 0] == [(CREW, notice_id)], str(deleted))
     check('the request is settled as normal', MHLARRY not in f._pending_cashouts)
 
     # -- nothing else is ever deleted ---------------------------------------
@@ -254,13 +255,131 @@ async def main():
                             user_id=77, username='Maynuddin23')
     f.bot.delete_message = FakeBot.delete_message.__get__(f.bot)
 
-    warned = [t for uid, t, _ in dms if uid == ETHAN and 'could not be deleted' in t]
+    warned = [t for uid, t, _ in dms
+              if uid == ETHAN and 'chase DM to the crew could not be deleted' in t]
     check('Ethan is told when the chase DM cannot be taken back',
           len(warned) == 1, str(dms))
     check('and told the money side is already done',
           warned and 'already done' in warned[0], str(warned))
     check('the crew are not told about the failure',
           [t for uid, t, _ in dms if uid == CREW] == [], str(dms))
+
+    # -- the GROUP reminders are taken back the same way ---------------------
+    # They read "still waiting on a /out" and end in the crew tag, so one left
+    # behind is a live chase for a cashout that has already been paid.
+    reset()
+    req = await open_request()
+    req['opened'] = datetime.now(timezone.utc) - timedelta(minutes=6)
+    await run_watchdog()
+    posted = [(c, mid) for c, t, mid in sent if c == MHLARRY and 'TIMEFRAME' in t]
+    check('a reminder went into the handling group', len(posted) == 1, str(sent))
+    check('and where it landed was recorded on the request',
+          req['group_notice'] == [posted[0][1]], str(req['group_notice']))
+
+    forwarded_copy = req['message_id']
+    deleted.clear()
+    await f.observe_cashout(MHLARRY, '/out 200', 911, datetime.now(timezone.utc),
+                            user_id=77, username='Maynuddin23')
+    check('the group reminder is deleted once the /out arrives',
+          deleted == [(MHLARRY, posted[0][1])], str(deleted))
+    check('the forwarded request itself is left alone',
+          (MHLARRY, forwarded_copy) not in deleted, str(deleted))
+    check('nothing was left on the request', req['group_notice'] == [],
+          str(req['group_notice']))
+    check('the request is settled as normal', MHLARRY not in f._pending_cashouts)
+
+    # Every round the ladder posted goes, not just the last one.
+    reset()
+    req = await open_request()
+    for minutes in (6, 9, 13):
+        req['opened'] = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+        await run_watchdog()
+    check('all three rungs were recorded', len(req['group_notice']) == 3,
+          str(req['group_notice']))
+    rungs = list(req['group_notice'])
+    deleted.clear()
+    await f.observe_cashout(MHLARRY, '/out 200', 912, datetime.now(timezone.utc),
+                            user_id=77, username='Maynuddin23')
+    check('every reminder is taken back, not only the last',
+          [d for d in deleted if d[0] == MHLARRY] == [(MHLARRY, mid) for mid in rungs],
+          str(deleted))
+
+    # -- one cashout's reminders, not the group's ---------------------------
+    # Two requests open in one handling group: paying one must not clear the
+    # reminders still chasing the other.
+    reset()
+    first = await open_request('CASHOUT REQUEST $200 for Gabriel W.', msg_id=920)
+    second = await open_request('CASHOUT REQUEST $75 for Priya N.', msg_id=921)
+    check('both requests are open', len(f._pending_cashouts[MHLARRY]) == 2)
+    for request in (first, second):
+        request['opened'] = datetime.now(timezone.utc) - timedelta(minutes=6)
+    await run_watchdog()
+    check('each request got its own reminder',
+          len(first['group_notice']) == 1 and len(second['group_notice']) == 1,
+          f"{first['group_notice']} {second['group_notice']}")
+    first_reminder, second_reminder = first['group_notice'][0], second['group_notice'][0]
+
+    deleted.clear()
+    await f.observe_cashout(MHLARRY, '/out 200', 913, datetime.now(timezone.utc),
+                            user_id=77, username='Maynuddin23')
+    check('only the paid request had its reminder deleted',
+          deleted == [(MHLARRY, first_reminder)], str(deleted))
+    check("the other request's reminder is left standing",
+          second['group_notice'] == [second_reminder], str(second['group_notice']))
+    check('and that request is still open',
+          f._pending_cashouts.get(MHLARRY) == [second], str(f._pending_cashouts))
+
+    # -- a request nobody chased deletes nothing ----------------------------
+    reset()
+    await open_request()
+    deleted.clear()
+    await f.observe_cashout(MHLARRY, '/out 200', 914, datetime.now(timezone.utc),
+                            user_id=77, username='Maynuddin23')
+    check('a cashout that was never chased deletes nothing in the group',
+          deleted == [], str(deleted))
+
+    # -- a reminder somebody already deleted by hand is not a failure -------
+    reset()
+    req = await open_request()
+    req['opened'] = datetime.now(timezone.utc) - timedelta(minutes=6)
+    await run_watchdog()
+
+    async def already_gone(chat_id, message_id):
+        raise RuntimeError('Bad Request: message to delete not found')
+    f.bot.delete_message = already_gone
+    dms.clear()
+    await f.observe_cashout(MHLARRY, '/out 200', 915, datetime.now(timezone.utc),
+                            user_id=77, username='Maynuddin23')
+    f.bot.delete_message = FakeBot.delete_message.__get__(f.bot)
+    check('a reminder already deleted by hand raises nothing',
+          [t for uid, t, _ in dms if uid == ETHAN and 'reminder' in t] == [],
+          str(dms))
+
+    # -- a delete that really fails is not silent ---------------------------
+    reset()
+    req = await open_request()
+    req['opened'] = datetime.now(timezone.utc) - timedelta(minutes=6)
+    await run_watchdog()
+
+    async def refuse_group(chat_id, message_id):
+        raise RuntimeError("message can't be deleted")
+    f.bot.delete_message = refuse_group
+    dms.clear()
+    await f.observe_cashout(MHLARRY, '/out 200', 916, datetime.now(timezone.utc),
+                            user_id=77, username='Maynuddin23')
+    f.bot.delete_message = FakeBot.delete_message.__get__(f.bot)
+
+    stuck = [t for uid, t, _ in dms
+             if uid == ETHAN and 'could not be deleted from the group' in t]
+    check('Ethan is told when a reminder cannot be taken back',
+          len(stuck) == 1, str(dms))
+    check('and told the money side is already done',
+          stuck and 'already done' in stuck[0], str(stuck))
+    check('the crew are not told about it',
+          [t for uid, t, _ in dms if uid == CREW] == [], str(dms))
+    check('nothing about the failure is posted in the group',
+          [t for c, t, _ in sent if c == MHLARRY and 'could not' in t] == [],
+          str(sent))
 
     print()
     if failures:

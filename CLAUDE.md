@@ -17,7 +17,7 @@ python3 tests/run.py            # all suites
 python3 tests/run.py cashout    # only matching suites
 ```
 
-849 checks across 25 suites, all stubbed — nothing touches Telegram, the
+891 checks across 26 suites, all stubbed — nothing touches Telegram, the
 network, or the live groups. They cover the pre-existing behaviour as well as
 the new, so they are the guard against a change quietly altering something that
 already worked.
@@ -140,7 +140,8 @@ all. It deliberately sits *between* two group rungs, which is why chasing ends
 only once **both** channels have run out — `ladder_done and crew_done`. Firing
 one must never cancel the other.
 
-**It is deleted the moment the `/out` lands** — see below.
+**Both the crew's DM and every group reminder are deleted the moment the `/out`
+lands** — see below.
 
 **Acknowledging it takes the chase out of the group** — `chase_acknowledged()`.
 A reaction, or any of the crew speaking in the handling group, stops the group
@@ -247,6 +248,25 @@ the chat it went through. **Only the crew's copy** — Ethan's and Larry's notic
 are a record rather than an instruction and stay put. A delete that fails is not
 cosmetic (the stale instruction is still live), so Ethan is told, and told the
 money is already booked so nobody pays it again.
+
+**And it takes back the group reminders** — `delete_group_notice()`. Same
+reasoning, in the open: every rung reads "this cashout request is still waiting
+on a `/out`" and ends in `CASHOUT_MENTIONS`, so one left behind is not a stale
+note but a **live tag on the crew** for a cashout that has already been paid.
+`post_group_nudge()` records each rung's message id on the request
+(`group_notice`), and they all go once the `/out` has landed and been booked.
+
+- **Per request, not per group.** Two cashouts open in one handling group each
+  carry their own ids; paying one must not clear the reminders still chasing the
+  other. Tested with both open at once.
+- **Only the reminders.** The forwarded request, the `/out` under it and the ❤
+  in the chime group are the record and are never touched.
+- **A reminder already deleted by hand is not a failure** — `_looks_deleted()`
+  covers `message to delete not found`. Anything else is, so Ethan is told,
+  again with "already booked". Nothing is ever posted in the group about it, and
+  the crew are not told: they are the ones being chased.
+- Bounded by Telegram's 48-hour limit on a bot deleting a group message, which
+  a ladder measured in minutes never reaches.
 
 ## Paying the wrong figure
 
@@ -613,7 +633,7 @@ cashout requests.
 | `tests/test_redaction.py` | No crew name reaches a target group; every other route keeps them |
 | `tests/test_matching.py` | A `/out` settles the request it paid, not the oldest |
 | `tests/test_manual.py` | Ethan and Larry can finish a cashout with nothing open |
-| `tests/test_amounts.py` | A /out paying the wrong figure; taking back the chase DM |
+| `tests/test_amounts.py` | A /out paying the wrong figure; taking back the chase, DM and group |
 | `tests/test_edits.py` | A /out edited onto a message, and the double-book guard |
 | `tests/test_album.py` | Every screenshot in an album reaches the group that asked |
 | `backfill.py` | Manual one-off backfill, separate from the boot sweep |

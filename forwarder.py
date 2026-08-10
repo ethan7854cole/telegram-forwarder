@@ -1293,7 +1293,8 @@ async def warn_unreachable(unreachable):
 
 # Telegram's various ways of saying "that message is not there any more".
 _GONE_MARKERS = ('message to react not found', 'message_id_invalid',
-                 'message not found', 'message to reply not found')
+                 'message not found', 'message to reply not found',
+                 'message to delete not found')
 
 
 def _looks_deleted(error):
@@ -1433,6 +1434,12 @@ async def open_cashout_request(source, text, sent_at, origin_msg_id):
         # Where the crew's 17-minute chase landed, so it can be taken back once
         # the /out arrives - see delete_crew_notice().
         'crew_notice': [],
+        # ...and the same for the loud half of the ladder: every group reminder
+        # posted for THIS request, so they go with it - see
+        # delete_group_notice(). Per request, not per group: two cashouts open
+        # in one handling group each have their own, and paying one must not
+        # clear the reminders still chasing the other.
+        'group_notice': [],
         # Each private escalation fires at most ONCE per request. Repeating them
         # every round is what made the chase unreadable, so the group post is
         # the recurring part and a DM is a one-off "this one needs you".
@@ -1990,10 +1997,12 @@ async def handle_cashout_reply(handling, text, user_id, username, reply_to,
     # glance, which of its requests have been dealt with.
     await heart_request(request['origin'], request['origin_msg_id'])
 
-    # ...and the chase that went to the crew is unsaid, now that it is wrong.
+    # ...and the chase is unsaid, now that it is wrong - privately to the crew,
+    # and in the handling group where the same words are still tagging them.
     # After the booking, deliberately: the books moving is what makes it wrong,
     # and deleting first would leave the instruction gone if the booking failed.
     await delete_crew_notice(request)
+    await delete_group_notice(handling, request)
 
     # Paying 150 against a request for 200 settles the request like any other
     # /out - the money really did move - but it is not what was asked for, and
@@ -2251,8 +2260,13 @@ async def post_group_nudge(handling, request, waited, round_no):
     dm_crew_last_resort()."""
     request['nudges'] = round_no
     try:
-        await send_group(handling, cashout_nudge_text(waited),
+        # Remembered for the same reason the crew's DM is: a late /out makes
+        # this post untrue, and it is taken back rather than left tagging the
+        # crew about a cashout that is already paid.
+        sent = await send_group(handling, cashout_nudge_text(waited),
                                reply_to_message_id=request['message_id'])
+        if getattr(sent, 'message_id', None):
+            request['group_notice'].append(sent.message_id)
         print(f"⏰ [CASHOUT] reminder #{round_no} in {chat_name(handling)} "
               f"after {_humanise(waited)}", flush=True)
     except Exception as e:
@@ -2319,6 +2333,44 @@ async def delete_crew_notice(request):
             f"be deleted ({', '.join(failed)}).\n\n"
             "It still reads as waiting on a /out. The money side is already done "
             "and booked — ask them not to send it again.")
+
+
+async def delete_group_notice(handling, request):
+    """Take back the group reminders once the /out has landed.
+
+    Same reasoning as delete_crew_notice(), in the open. Every reminder reads
+    "this cashout request is still waiting on a /out" and ends in
+    CASHOUT_MENTIONS, so what is left behind is not a stale note but a live tag
+    on the crew about a cashout that has already been paid - and on this flow a
+    chase somebody acts on twice is somebody paying twice. The request itself
+    stays exactly where it is: the forwarded copy, the /out under it and the ❤
+    in the chime group are the record, and none of them is touched.
+
+    A reminder that has already been deleted by hand is not a failure. Anything
+    else is - the tag is still live - so Ethan is told, with the figure already
+    booked so nobody sends it again. The crew are never told: they are the ones
+    being chased, and the group is where they can already see the /out."""
+    notices, request['group_notice'] = request['group_notice'], []
+    failed = []
+    for msg_id in notices:
+        try:
+            await bot.delete_message(handling, msg_id)
+            print(f"🗑️ [CASHOUT] took back reminder {msg_id} in "
+                  f"{chat_name(handling)}", flush=True)
+        except Exception as e:
+            if _looks_deleted(e):
+                continue
+            print(f"⚠️ [CASHOUT] could not take back reminder {msg_id} in "
+                  f"{chat_name(handling)}: {e}", flush=True)
+            failed.append(str(msg_id))
+
+    if failed:
+        await notify_admin(
+            f"⚠️ A cashout in {chat_name(handling)} was completed, but "
+            f"{len(failed)} earlier reminder(s) could not be deleted from the "
+            f"group ({', '.join(failed)}).\n\n"
+            "They still tag the crew saying it is waiting on a /out. The money "
+            "side is already done and booked — ask them not to send it again.")
 
 
 async def chase_acknowledged(handling, request, waited):
