@@ -20,11 +20,24 @@ class Sender:
     def __init__(self, uid, is_bot=True): self.id, self.bot = uid, is_bot
 
 
+class Peer:
+    def __init__(self, uid): self.user_id = uid
+
+
+class Reaction:
+    """What Telethon hands back on a message somebody has reacted to."""
+    def __init__(self, peers, results=('👍',)):
+        self.results = list(results)
+        self.recent_reactions = [type('R', (), {'peer_id': Peer(uid)})()
+                                 for uid in peers]
+
+
 class Msg:
-    def __init__(self, mid, text, minutes_ago, sender):
+    def __init__(self, mid, text, minutes_ago, sender, reactions=None):
         self.id, self.raw_text = mid, text
         self.date = NOW - timedelta(minutes=minutes_ago)
         self.media, self._sender = None, sender
+        self.reactions = reactions
     async def get_sender(self): return self._sender
 
 
@@ -74,19 +87,19 @@ def delivered_copy(src_text, ledger_in, ledger_out):
     return f.rewrite_totals(src_text, ledger_in, ledger_out)
 
 
-async def run(source_msgs, target_msgs, ledger=None):
+async def run(source_msgs, target_msgs, ledger=None, source=MHLARRY, target=PICCASO):
     sent.clear(); f._ledger.clear(); f._seen_messages.clear()
     if ledger:
-        f._ledger[PICCASO] = ledger
-    client = FakeClient({MHLARRY: source_msgs, PICCASO: target_msgs})
+        f._ledger[target] = ledger
+    client = FakeClient({source: source_msgs, target: target_msgs})
     # only the one rule under test, so other routes cannot add noise
     original = dict(f.FORWARD_RULES)
-    f.FORWARD_RULES.clear(); f.FORWARD_RULES[MHLARRY] = [PICCASO]
+    f.FORWARD_RULES.clear(); f.FORWARD_RULES[source] = [target]
     try:
         await f.catch_up(client)
     finally:
         f.FORWARD_RULES.clear(); f.FORWARD_RULES.update(original)
-    return [t for c, t in sent if c == PICCASO]
+    return [t for c, t in sent if c == target]
 
 
 async def main():
@@ -177,6 +190,71 @@ async def main():
                     filler + buried, ledger={'in': 1250.0, 'out': 340.0})
     check('a recent missing payment is still delivered',
           len(out) == 1 and 'Person6' in out[0], str(len(out)))
+
+    # -- a retracted payment must NOT come back on the next deploy ----------
+    # Live incident, CHIME GAFFER, 2026-08-10. Two $5 payments were retracted
+    # by reacting on the originals; retract_payment() deleted both copies out
+    # of the target. Ten minutes later a deploy ran the sweep, found no copies,
+    # and re-sent AND re-booked both - +10.00$ onto a ledger that was correct.
+    # The reaction still on the original is what says it was taken back.
+    CHIMEREV, GAFFER = -1002335630148, -5580596463
+    check('the live route is a retract source', CHIMEREV in f.RETRACT_SOURCES)
+    ETHAN = 7578145913
+
+    twin5 = payment(5, 100.0, 20.0)
+    retracted = [Msg(451, twin5, 12, src_bot, Reaction([ETHAN])),
+                 Msg(450, twin5, 40, src_bot, Reaction([ETHAN]))]
+    # All the target has left is the two corrections retract_payment() posted.
+    corrections = [Msg(951, "✏️ Total In adjusted by -5.00$\n\n"
+                            "📊 Group Total:\n➕ Total In : 12,146.64$\n"
+                            "➖ Total Out: 7,026.00$", 10, bot_sender),
+                   Msg(950, "✏️ Total In adjusted by -5.00$\n\n"
+                            "📊 Group Total:\n➕ Total In : 12,151.64$\n"
+                            "➖ Total Out: 7,026.00$", 11, bot_sender)]
+    out = await run(retracted, corrections, ledger={'in': 12146.64, 'out': 7026.0},
+                    source=CHIMEREV, target=GAFFER)
+    check('a retracted payment is not re-sent after a deploy', out == [],
+          f"{len(out)} re-sent")
+
+    # -- ...and a live payment beside it still goes, exactly once -----------
+    live = payment(6, 100.0, 20.0)
+    out = await run([Msg(452, live, 5, src_bot)] + retracted, corrections,
+                    ledger={'in': 12146.64, 'out': 7026.0},
+                    source=CHIMEREV, target=GAFFER)
+    check('a genuinely missed payment beside it is still delivered',
+          len(out) == 1 and 'Person6' in out[0], str(out))
+
+    # -- a reaction from somebody who cannot retract is not a retraction ----
+    out = await run([Msg(453, twin5, 5, src_bot, Reaction([424242]))], [],
+                    ledger={'in': 12146.64, 'out': 7026.0},
+                    source=CHIMEREV, target=GAFFER)
+    check("a stranger's reaction does not hold a payment back", len(out) == 1,
+          f"{len(out)} sent")
+
+    # -- a reaction where reacting does NOT retract changes nothing ---------
+    # MH X LARRY GROUP 2 is not a retract source; a reaction there is somebody
+    # acknowledging a payment, and it must still be forwarded.
+    out = await run([Msg(454, twin5, 5, src_bot, Reaction([ETHAN]))], [],
+                    ledger={'in': 1250.0, 'out': 340.0})
+    check('a reaction outside RETRACT_SOURCES is ignored', len(out) == 1,
+          f"{len(out)} sent")
+
+    # -- Telegram not saying who reacted errs towards holding back ----------
+    out = await run([Msg(455, twin5, 5, src_bot, Reaction([]))], [],
+                    ledger={'in': 12146.64, 'out': 7026.0},
+                    source=CHIMEREV, target=GAFFER)
+    check('an unattributed reaction is treated as a retraction', out == [],
+          f"{len(out)} sent")
+    told = [t for c, t in sent if c == f.ADMIN_ID and 'did not say whose' in t]
+    check('and Ethan is told a payment was left alone', len(told) == 1, str(sent))
+    check('the alert says how to send it if that was wrong',
+          told and 'backfill.py' in told[0], str(told))
+
+    # -- an ordinary retraction is quiet ------------------------------------
+    await run(retracted, corrections, ledger={'in': 12146.64, 'out': 7026.0},
+              source=CHIMEREV, target=GAFFER)
+    check('a confirmed retraction raises no alert',
+          [t for c, t in sent if c == f.ADMIN_ID] == [], str(sent))
 
     print()
     if failures:

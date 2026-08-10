@@ -17,7 +17,7 @@ python3 tests/run.py            # all suites
 python3 tests/run.py cashout    # only matching suites
 ```
 
-891 checks across 26 suites, all stubbed — nothing touches Telegram, the
+900 checks across 26 suites, all stubbed — nothing touches Telegram, the
 network, or the live groups. They cover the pre-existing behaviour as well as
 the new, so they are the guard against a change quietly altering something that
 already worked.
@@ -500,6 +500,28 @@ and takes the amount back off that group's Total In.
   corrected figures as the newest ones, and Ethan is told to remove the stray
   copy by hand.
 - **Once.** The delivery record is popped, so a second reaction does nothing.
+- **The catch-up sweep must not bring it back** — `_retraction_mark()`. This is
+  the sharp edge of the whole feature. Retracting DELETES the copy out of the
+  target, and a missing copy is the only evidence `catch_up()` has, so a
+  retracted payment looks exactly like one that was never delivered: the next
+  deploy re-sent it and re-booked it. **This happened live in CHIME GAFFER on
+  2026-08-10** — two retracted `$5` payments both back on the books within a
+  minute of a restart, `+10.00$` against a ledger that had been correct.
+  The reaction is still sitting on the original, and that is what the sweep now
+  reads — the same role the ❤ plays for a cashout. Reproduced by
+  `tests/test_catchup.py`.
+  - **Only in `RETRACT_SOURCES`.** Elsewhere a reaction is somebody
+    acknowledging a payment, and holding that back would lose a real one.
+  - **Only Ethan's and Larry's reactions**, matching who may actually retract.
+    A stranger's reaction does not hold a payment back.
+  - **Checked at the source scan, before the copies are counted.** Two
+    identical payments — one retracted, one live — are indistinguishable once
+    both are in the list: whichever came first would consume the single
+    remaining copy and the other would be re-sent.
+  - **Telegram not saying who reacted counts as a retraction**, and Ethan is
+    told so it can be backfilled. A payment held back can be sent by hand; a
+    double-booking cannot be taken back. Same direction as
+    `_delivered_signatures()`.
 - **Memory first, then the groups.** The delivery record is in memory, so a
   redeploy wipes it — which made the feature work only for payments forwarded
   since the last restart, and deploys are frequent. `retract_from_history()` is
@@ -626,6 +648,7 @@ cashout requests.
 | `tests/test_startup.py` | Polling waits out the changeover; the conflict watcher |
 | `tests/test_mentions.py` | An `@` in a muted group arrives as a DM |
 | `tests/test_retract.py` | Reacting to a payment undoes it in the target |
+| `tests/test_catchup.py` | The sweep re-sends nothing — including a retracted payment |
 | `tests/test_race.py` | Two copies of one request arriving at the same moment |
 | `tests/test_screenshot.py` | The screenshot travels with the `/out`, carrying no identity |
 | `tests/test_heart.py` | A cashout that cannot be marked done is not silent |

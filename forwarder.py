@@ -3461,6 +3461,42 @@ def _catchup_signature(text):
     return ' '.join(stripped.split())
 
 
+def _retraction_mark(msg):
+    """Was this payment taken back by a reaction on it?
+
+    retract_payment() DELETES the forwarded copy out of the target group, and
+    the copy being absent is the only thing catch_up() has to go on. A retracted
+    payment therefore reads exactly like one that was never delivered, so the
+    next deploy re-sent it and re-booked the money - undoing the retraction and
+    putting a payment the group had taken back into its books a second time.
+
+    Seen live in CHIME GAFFER on 2026-08-10: two retracted $5 payments both back
+    on the books within a minute of a restart, +10.00$ against a ledger that was
+    correct before the deploy.
+
+    The reaction that retracted it is still sitting on the original, and that is
+    the durable record - the same role the ❤ plays for a cashout request.
+    Returns 'admin' when somebody who can retract reacted, 'unconfirmed' when
+    Telegram will not say who did, and None when this is not a retraction.
+
+    Only Ethan and Larry can retract, so a stranger's reaction is not one and
+    must not hold a real payment back. When Telegram gives no peers at all the
+    reaction IS treated as a retraction: a payment held back can be sent by hand
+    afterwards, and a double-booking cannot be taken back. Same direction as
+    _delivered_signatures()."""
+    reactions = getattr(msg, 'reactions', None)
+    if reactions is None or not getattr(reactions, 'results', None):
+        return None
+    peers = []
+    for recent in (getattr(reactions, 'recent_reactions', None) or []):
+        user_id = getattr(getattr(recent, 'peer_id', None), 'user_id', None)
+        if user_id is not None:
+            peers.append(user_id)
+    if not peers:
+        return 'unconfirmed'
+    return 'admin' if any(uid in LEDGER_ADMINS for uid in peers) else None
+
+
 async def _delivered_signatures(client, target):
     """What is already sitting in a target group, and how far back that is known.
 
@@ -3538,7 +3574,12 @@ async def catch_up(client):
         # canonical form here or the two would not recognise each other.
         source_id = utils.get_peer_id(source)
 
-        pending = []
+        # A reaction only means "retracted" where a reaction retracts. Elsewhere
+        # it is somebody acknowledging a payment, and holding that back would
+        # lose a real notification.
+        retract_here = (rule_key in RETRACT_SOURCES or source_id in RETRACT_SOURCES)
+
+        pending, retracted, unconfirmed = [], 0, 0
         async for msg in client.iter_messages(source, limit=CATCHUP_SCAN_LIMIT):
             if msg.date < cutoff:
                 break
@@ -3549,7 +3590,30 @@ async def catch_up(client):
             sender = await msg.get_sender()
             if not bool(getattr(sender, 'bot', False)):
                 continue        # the live path forwards bot notifications only
+            # Checked BEFORE the copies are counted, not after. With the
+            # signature counting, a retracted payment and an identical live one
+            # are indistinguishable once both are in the list - whichever came
+            # first would consume the single remaining copy and the other would
+            # be re-sent. Dropping it at the source keeps the count honest.
+            mark = _retraction_mark(msg) if retract_here else None
+            if mark:
+                retracted += 1
+                unconfirmed += (mark == 'unconfirmed')
+                continue
             pending.append(msg)
+
+        if retracted:
+            print(f"↩️ [CATCHUP] {retracted} payment(s) in {chat_name(rule_key)} carry "
+                  "a reaction - already retracted, not re-sending them", flush=True)
+        if unconfirmed:
+            # Telegram would not say who reacted, so this was assumed to be a
+            # retraction. If it was not, a real payment is sitting unforwarded.
+            await notify_admin(
+                f"⚠️ Catch-up left {unconfirmed} payment(s) in {chat_name(rule_key)} "
+                "alone: they carry a reaction, but Telegram did not say whose.\n\n"
+                "Treated as retracted rather than risk booking them twice. If one "
+                "of them was NOT retracted it has not been forwarded — backfill.py "
+                "can send it.")
         if not pending:
             continue
         pending.reverse()                       # oldest first, so groups read in order
