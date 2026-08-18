@@ -31,8 +31,12 @@ FORWARD_RULES = {
     -1003894781195: [-5350880041],
     # Chime Rev & out no-7 -> CHIME GAFFER
     -1002335630148: [-5580596463],
-    # MH x LARRY VENMO -> GAFFER VENMO, PICCASO VENMO
-    -5339749243: [-5100231154, -5306739731],
+    # MH x LARRY VENMO -> GAFFER VENMO
+    #
+    # GAFFER VENMO only, as of 2026-08-18. It used to fan out to PICCASO VENMO
+    # as well, which meant one payment moved two sets of books - the venmo side
+    # now matches the chime side, where each source feeds exactly one target.
+    -5339749243: [-5100231154],
 }
 
 # Sources where ONLY bot messages may be forwarded, never humans. Messages from
@@ -310,6 +314,18 @@ LEDGER_ADMINS = {7418675217, 7578145913}
 
 # Every chat that receives forwards.
 TARGET_CHATS = {t for targets in FORWARD_RULES.values() for t in targets}
+
+# Groups that must never see a crew name even though nothing is routed to them
+# any more. PICCASO VENMO stopped being fed on 2026-08-18, but it is still a
+# live group with the same people reading it - and redaction is about who is
+# reading, not about which table an id happens to be in today. Nothing sends
+# there now, so this guards a path that does not exist; that is the point, and
+# it costs one set lookup. A group put back into FORWARD_RULES is covered by
+# TARGET_CHATS again automatically, so nothing here needs undoing.
+FORMER_TARGETS = {-5306739731}                      # PICCASO VENMO
+
+# What send_group() scrubs on the way out - see strip_identities().
+REDACTED_CHATS = TARGET_CHATS | FORMER_TARGETS
 
 BOT_ID = int(BOT_TOKEN.split(':')[0]) if BOT_TOKEN and ':' in BOT_TOKEN else None
 
@@ -1668,7 +1684,7 @@ async def send_group(chat_id, text, **kwargs):
               f"{' '.join((text or '').split())[:80]}", flush=True)
         return None
 
-    if chat_id in TARGET_CHATS:
+    if chat_id in REDACTED_CHATS:
         text = strip_identities(text)
     return await bot.send_message(chat_id, text, **kwargs)
 

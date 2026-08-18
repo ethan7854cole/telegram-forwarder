@@ -35,6 +35,7 @@ Payments travel outward. Cashout requests travel back.
 ```
 MH X LARRY GROUP 2   --"You received"------>  CHIME PICCASO      (Total In  ↑)
 Chime Rev & out no-7 --"You received"------>  CHIME GAFFER       (Total In  ↑)
+MH x LARRY VENMO     --"You received"------>  GAFFER VENMO       (Total In  ↑)
 
 CHIME PICCASO  --"CASHOUT REQUEST"-------->  MH X LARRY GROUP 2
 CHIME GAFFER   --"CASHOUT REQUEST"-------->  Chime Rev & out no-7
@@ -47,6 +48,12 @@ whole route, both directions. The tables above still describe it exactly; the
 bot is simply deaf and mute in those two chats. `/group on piccaso` from a
 private chat puts it back, `/group off piccaso` takes it out again; see "Taking
 a group out of service" below.
+
+**MH x LARRY VENMO feeds GAFFER VENMO only**, as of 2026-08-18. It fanned out
+to PICCASO VENMO as well until then, so one payment moved two groups' books;
+the venmo side now matches the chime side, where each source feeds exactly one
+target. PICCASO VENMO is not fed, swept, recovered or ledger-commandable any
+more — it is still redacted, see `FORMER_TARGETS`.
 
 `FORWARD_RULES` drives the first. `CASHOUT_ROUTES` drives the second, and is
 deliberately a **separate table** — putting the pairs in `FORWARD_RULES` would
@@ -560,7 +567,12 @@ typed, and the crew do write "sent by @Maynuddin23" on their own screenshots.
 The chime and VENMO groups are told figures, never who moved them.
 
 - **Guarded at the door, not at each caller.** `send_group()` is the single
-  outbound function; it redacts whenever the destination is in `TARGET_CHATS`.
+  outbound function; it redacts whenever the destination is in `REDACTED_CHATS`
+  — every target, **plus** `FORMER_TARGETS`, groups nothing is routed to any
+  more. Redaction is about who is reading, not about which table an id is in
+  today: PICCASO VENMO stopped being fed on 2026-08-18 and is still full of the
+  same people. A group put back into `FORWARD_RULES` is covered again on its
+  own, so `FORMER_TARGETS` never needs undoing.
   That is what makes "never" true for messages that do not exist yet — a new
   milestone, a new correction, anything added later.
 - **`strip_identities()` takes out ANY `@mention`**, not only the configured

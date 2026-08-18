@@ -55,12 +55,19 @@ class M:
 async def main():
     now = datetime.now(timezone.utc)
 
-    # -- VENMO route still fans out to BOTH targets --------------------------
+    # -- VENMO goes to GAFFER VENMO and nowhere else -------------------------
+    # It fanned out to PICCASO VENMO as well until 2026-08-18. One payment
+    # moving two groups' books was the thing being corrected, so the second
+    # check is the point of this one: not just that GAFFER VENMO gets it, but
+    # that PICCASO VENMO no longer does.
     reset()
     await f.process_incoming(VENMO, 'You received $10.00\nTotal In: 50\nTotal Out: 5',
                              'test', from_bot=True, sent_at=now)
-    check('VENMO fans out to both targets',
-          sorted(c for c, _ in sent) == sorted([GVENMO, PVENMO]), str(sent))
+    check('VENMO forwards to GAFFER VENMO',
+          [c for c, _ in sent] == [GVENMO], str(sent))
+    check('and PICCASO VENMO is not fed at all',
+          not any(c == PVENMO for c, _ in sent), str(sent))
+    check('so one payment moves one set of books', len(sent) == 1, str(sent))
 
     # -- IN milestone still fires -------------------------------------------
     reset()
