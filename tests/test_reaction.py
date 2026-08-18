@@ -206,7 +206,7 @@ async def main():
     check('a reaction with nothing pending is ignored',
           await f.note_cashout_seen(MHLARRY, 12345, 77, 'Maynuddin23') is False)
     check('a reaction in a non-cashout chat is ignored',
-          await f.note_cashout_seen(-5339749243, 12345, 77, 'Maynuddin23') is False)
+          await f.note_cashout_seen(-1004298140797, 12345, 77, 'Maynuddin23') is False)
 
     # -- the handler: removals and anonymous admins are not answers ----------
     reset()

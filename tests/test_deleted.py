@@ -161,7 +161,7 @@ async def main():
     # -- a deletion in a chat with no cashout role is ignored ---------------
     reset()
     await open_one(PICCASO, 901)
-    await f.close_deleted_cashouts(FakeClient(alive=[]), -5339749243, [901])
+    await f.close_deleted_cashouts(FakeClient(alive=[]), -1004298140797, [901])
     check('a deletion in an unrelated chat is ignored',
           len(f._pending_cashouts.get(MHLARRY, [])) == 1, str(f._pending_cashouts))
 

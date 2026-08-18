@@ -36,7 +36,13 @@ FORWARD_RULES = {
     # GAFFER VENMO only, as of 2026-08-18. It used to fan out to PICCASO VENMO
     # as well, which meant one payment moved two sets of books - the venmo side
     # now matches the chime side, where each source feeds exactly one target.
-    -5339749243: [-5100231154],
+    #
+    # The source was -5339749243 until 2026-08-18. That group was RE-CREATED,
+    # and a new group gets a new id even under the same name with the same
+    # people in it, so the old id resolved to nothing and every venmo payment
+    # went unforwarded for half an hour with only a console line to show for
+    # it. warn_missing_sources() now says so out loud.
+    -1004298140797: [-5100231154],
 }
 
 # Sources where ONLY bot messages may be forwarded, never humans. Messages from
@@ -695,6 +701,13 @@ CHAT_NAMES = {
     -5580596463: 'CHIME GAFFER',
     -1003894781195: 'MH X LARRY GROUP 2',
     -1002335630148: 'Chime Rev & out no-7',
+    # The venmo groups were never named here, so every log line and every alert
+    # about them read as a bare number - which is part of why a dead source id
+    # sat there unnoticed on 2026-08-18.
+    -1004298140797: 'MH x LARRY VENMO',
+    -5100231154: 'GAFFER VENMO',
+    -5306739731: 'PICCASO VENMO',
+    -5339749243: 'MH x LARRY VENMO (old, re-created 2026-08-18)',
 }
 
 # Labels for any group added later, so the logs and the admin alerts stay
@@ -4786,18 +4799,62 @@ async def _resolve_one(client, chat_id):
     return None
 
 
+# Told about once per process, not once per reconnect. The userbot reconnects
+# on a loop, and an alert that repeats every few seconds is one nobody reads.
+_missing_sources_told = set()
+
+
+async def warn_missing_sources(missing):
+    """A source group in the table that cannot be seen is a silent hole.
+
+    This was a real incident on 2026-08-18: MH x LARRY VENMO was re-created,
+    which gives it a NEW id even under the same name, and the old id sat in
+    FORWARD_RULES resolving to nothing. Payments went on arriving in the group
+    for half an hour and none of them were forwarded. The only trace was one
+    console line nobody was watching - the exact silent failure this bot
+    exists to remove everywhere else.
+
+    Ethan and Larry, never the crew: there is nothing here they can act on."""
+    fresh = [c for c in missing if c not in _missing_sources_told]
+    if not fresh:
+        return
+    _missing_sources_told.update(fresh)
+    names = '\n'.join(f"• {chat_name(c)} ({c})" for c in fresh)
+    print(f"🚨 [TELETHON] unreachable source chat(s): {fresh}", flush=True)
+    await warn_unreachable(await dm_handles(
+        CASHOUT_ADMIN_HANDLES,
+        "🚨 A group in the forwarding table cannot be seen:\n\n"
+        f"{names}\n\n"
+        "NOTHING posted there is being forwarded, and no payment from it is "
+        "reaching its group or its books.\n\n"
+        "Usually one of three things: the group was deleted, the account was "
+        "removed from it, or it was RE-CREATED - a new group has a new id even "
+        "with the same name and the same people.\n\n"
+        "Everything else is still running normally."))
+
+
 async def _resolve_source_chats(client, wanted):
     """Resolve each configured chat separately so one bad id cannot stop the
     listener from starting on the good ones."""
-    resolved = []
+    resolved, missing = [], []
     for chat_id in wanted:
         entity = await _resolve_one(client, chat_id)
         if entity is None:
             print(f"⚠️ [TELETHON] Could not resolve source chat {chat_id} - skipping it.", flush=True)
+            missing.append(chat_id)
             continue
         title = getattr(entity, 'title', None) or getattr(entity, 'username', '')
         print(f"👁️ [TELETHON] Watching {chat_id} ({title})", flush=True)
         resolved.append(entity)
+
+    # Never at the cost of the listener: a failed alert must not stop the good
+    # chats being watched, which is the same rule the loop above follows.
+    if missing:
+        try:
+            await warn_missing_sources(missing)
+        except Exception as e:
+            print(f"⚠️ [TELETHON] could not report the missing source(s): {e}",
+                  flush=True)
     return resolved
 
 

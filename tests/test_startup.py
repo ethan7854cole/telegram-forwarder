@@ -144,6 +144,61 @@ async def main():
     finally:
         f.notify_admin = real_notify
 
+    # -- a source group that cannot be seen is NOT a silent hole -------------
+    # 2026-08-18: MH x LARRY VENMO was re-created, which gives it a new id, and
+    # the old one sat in FORWARD_RULES resolving to nothing. Payments arrived
+    # in the group for half an hour and none were forwarded. The only trace was
+    # a console line, so nobody knew until somebody happened to look.
+    dms = []
+
+    async def spy_dm(handles, text, receipts=None):
+        dms.append((list(handles), text))
+        return []
+
+    class Client:
+        """Resolves the second chat and nothing else."""
+        def __init__(self, known):
+            self.known = known
+
+        async def get_entity(self, cid):
+            if cid in self.known:
+                return type('E', (), {'id': cid, 'title': f'group {cid}'})()
+            raise ValueError('no entity')
+
+    real_dm = f.dm_handles
+    f.dm_handles = spy_dm
+    f._missing_sources_told.clear()
+    try:
+        watched = await f._resolve_source_chats(Client({-2222}), [-1111, -2222])
+        check('the chats that DO resolve are still watched',
+              [getattr(e, 'id', None) for e in watched] == [-2222], str(watched))
+        check('a missing source group raises a private alarm', len(dms) == 1, str(dms))
+        check('it names the group that cannot be seen',
+              dms and '-1111' in dms[0][1], str(dms))
+        check('it says plainly that nothing from it is forwarded',
+              dms and 'NOTHING posted there is being forwarded' in dms[0][1], str(dms))
+        check('it names the cause that actually bit us',
+              dms and 'RE-CREATED' in dms[0][1], str(dms))
+        check('and it goes to Ethan and Larry, never the crew',
+              dms and dms[0][0] == f.CASHOUT_ADMIN_HANDLES, str(dms))
+
+        await f._resolve_source_chats(Client({-2222}), [-1111, -2222])
+        check('the userbot reconnecting does not re-alarm',
+              len(dms) == 1, str(len(dms)))
+
+        # A failure to report must never cost the listener the good chats.
+        async def explode(*a, **k):
+            raise RuntimeError('DM failed')
+
+        f.dm_handles = explode
+        f._missing_sources_told.clear()
+        watched = await f._resolve_source_chats(Client({-2222}), [-3333, -2222])
+        check('a failed alarm still leaves the listener watching',
+              [getattr(e, 'id', None) for e in watched] == [-2222], str(watched))
+    finally:
+        f.dm_handles = real_dm
+        f._missing_sources_told.clear()
+
     print()
     if failures:
         print(f"{len(failures)} FAILED: " + '; '.join(failures))
