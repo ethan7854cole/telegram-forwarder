@@ -539,7 +539,7 @@ async def note_payment(target):
 
     A payment also lifts a pause - if money is moving again, whatever was wrong
     has cleared, and a pause nobody remembers would silently kill the watchdog."""
-    if target not in IDLE_ALERT_CHATS:
+    if target not in IDLE_ALERT_CHATS or chat_paused(target):
         return
     slot = _idle_slot(target)
     now = datetime.now(timezone.utc)
@@ -586,6 +586,8 @@ async def idle_watchdog():
         await asyncio.sleep(60)
         now = datetime.now(timezone.utc)
         for target in sorted(IDLE_ALERT_CHATS):
+            if chat_paused(target):
+                continue            # out of service: no prompt, no clock
             slot = _idle_slot(target)
             if slot['paused']:
                 continue
@@ -699,6 +701,33 @@ def _handle_list(raw):
     return [h.strip().lstrip('@') for h in raw.split(',') if h.strip()]
 
 
+def _parse_group_crew(raw):
+    """chat_id=handle handle,chat_id=handle - crew for ONE group only.
+
+    Keyed by the HANDLING group, because that is the side crew work on: the
+    group a request is posted into and the group the /out comes back from.
+
+    A malformed entry is dropped with a warning rather than taking the bot
+    down with it - one unreadable id must not cost the other routes their
+    crew, exactly as _parse_cashout_routes decided."""
+    groups = {}
+    for item in raw.split(','):
+        item = item.strip()
+        if not item:
+            continue
+        cid, _, handles = item.partition('=')
+        try:
+            chat_id = int(cid.strip())
+        except ValueError:
+            print(f"⚠️ [CASHOUT] ignoring group crew {item!r} - expected "
+                  "chat_id=handle", flush=True)
+            continue
+        names = [h.strip().lstrip('@') for h in handles.split() if h.strip()]
+        if names:
+            groups.setdefault(chat_id, []).extend(names)
+    return groups
+
+
 # Two audiences, two different messages.
 #
 # Ethan and Larry are told WHERE a request came from and where it is stuck,
@@ -713,6 +742,22 @@ CASHOUT_ADMIN_HANDLES = _handle_list(
 # what to do about it, nothing more.
 CASHOUT_CREW_HANDLES = _handle_list(
     os.getenv('CASHOUT_CREW_DM_HANDLES', 'Maynuddin23,MHSUPPORTZONE,maynuddin233'))
+
+# Crew who work ONE handling group rather than both.
+#
+# The three above are crew everywhere. Somebody taken on for one side is not
+# crew on the other, and that difference is not cosmetic: tagging them in the
+# other group asks them to pay a cashout that was never theirs, and counting a
+# reaction of theirs there would stop the chase for the people who actually
+# have to do it.
+#
+# Everything else about them is identical to the three above - tagged on the
+# request and on every reminder, their reaction acknowledges it, their /out is
+# relayed, booked and hearted, they get the last-resort DM, and their name is
+# stripped out of anything bound for a chime group.
+CASHOUT_GROUP_CREW = _parse_group_crew(os.getenv(
+    'CASHOUT_GROUP_CREW',
+    '-1002335630148=NPR_CA'))        # prutok sha - Chime Rev & out no-7 only
 
 # Told how a request is progressing rather than that it is stuck: picked up,
 # then completed. Larry sends the screenshot afterwards, so he is the one who
@@ -831,6 +876,353 @@ MENTION_ALERT_HANDLES = _handle_list(
 _MENTION_RE = (re.compile(
     r'(?<![\w@])@(' + '|'.join(re.escape(h) for h in MENTION_WATCH_HANDLES) + r')\b',
     re.I) if MENTION_WATCH_HANDLES else None)
+
+# ---------------------------------------------------------------------------
+# Taking a group out of service
+#
+# A PAUSE, not an unwiring. Deleting a group from FORWARD_RULES and
+# CASHOUT_ROUTES would stop it too, but putting it back means rebuilding those
+# tables by hand and hoping the rebuild is exact - and they are what the
+# report, the mention watch, the idle watchdog and the ledger all derive
+# themselves from. The routes stay exactly as they are. One gate makes the bot
+# deaf and mute in the listed chats, and taking an id back out of the list is
+# the whole of turning it on again, with every rule it had before still
+# written down where it always was.
+#
+# Paused means paused: nothing forwarded, no cashout opened, answered, hearted
+# or chased, no ledger moved, no milestone, no idle prompt, no mention DM, no
+# retraction, no report, and no reply to a command typed there.
+#
+# It is also SILENT, and that is the one place it differs from the emergency
+# stop. The stop reports what it swallowed, because it is an incident and
+# somebody has to pick the money up by hand. A pause is a decision that those
+# groups are not the bot's business for now, so it reads as absent: nothing in
+# the groups, nothing to the crew, and nothing to Ethan and Larry beyond the
+# console and the line /status leads with.
+# ---------------------------------------------------------------------------
+
+# Worked from a private chat with /group off and /group on, and the state
+# SURVIVES A REDEPLOY - the same way the emergency stop does, by living in a
+# message the bot posted to Ethan and Larry rather than in memory. See
+# set_groups_paused() and recover_group_switch() below.
+#
+# This default is only what is true before the first marker exists. Once
+# somebody has worked the switch, the marker is the authority and this line
+# stops mattering - it is kept as the state the bot boots into while the
+# private chat is being read back, which is deliberately the SILENT one.
+PAUSED_CHATS_DEFAULT = os.getenv('PAUSED_CHATS', '-1003894781195,-5350880041')
+
+
+def _parse_chat_list(raw):
+    ids = []
+    for item in raw.split(','):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            ids.append(int(item))
+        except ValueError:
+            print(f"⚠️ [PAUSED] ignoring {item!r} - chat ids must be numbers",
+                  flush=True)
+    return ids
+
+
+# As configured, for anything a person reads; with both id spellings, for
+# anything the code tests membership against - see _id_variants.
+PAUSED_CHAT_IDS = _parse_chat_list(PAUSED_CHATS_DEFAULT)
+PAUSED_CHATS = _with_variants(PAUSED_CHAT_IDS)
+
+
+def set_paused_chats(chat_ids):
+    """Replace the out-of-service set, keeping both spellings in step.
+
+    One function rather than two assignments: the readable list and the
+    membership set have to move together, and a gate testing a set that no
+    longer matches the list somebody was shown is the worst of both."""
+    global PAUSED_CHAT_IDS, PAUSED_CHATS
+    PAUSED_CHAT_IDS = sorted(set(chat_ids), key=lambda c: (chat_name(c), c))
+    PAUSED_CHATS = _with_variants(PAUSED_CHAT_IDS)
+
+
+def _parse_resume_marks(raw):
+    """chat_id@2026-08-18T14:30 - when a group came back, UTC.
+
+    Set this in the same change that takes an id out of PAUSED_CHATS. It is
+    what stops the boot sweep handing a resumed group the history it
+    deliberately missed; see catch_up(). Self-expiring - once the resume is
+    further back than CATCHUP_LOOKBACK_MINUTES it does nothing at all, and the
+    entry can be deleted whenever anyone next passes it."""
+    marks = {}
+    for item in raw.split(','):
+        item = item.strip()
+        if not item:
+            continue
+        cid, _, stamp = item.partition('@')
+        try:
+            chat_id = int(cid.strip())
+            when = datetime.fromisoformat(stamp.strip())
+        except ValueError:
+            print(f"⚠️ [PAUSED] ignoring resume mark {item!r} - expected "
+                  "chat_id@YYYY-MM-DDTHH:MM", flush=True)
+            continue
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        marks[chat_id] = when
+        for variant in _id_variants(chat_id):
+            marks[variant] = when
+    return marks
+
+
+RESUMED_CHATS = _parse_resume_marks(os.getenv('RESUMED_CHATS', ''))
+
+
+def note_resumed(chat_ids, when):
+    """Remember that these chats came back at this moment."""
+    for chat_id in chat_ids:
+        RESUMED_CHATS[chat_id] = when
+        for variant in _id_variants(chat_id):
+            RESUMED_CHATS[variant] = when
+
+
+def _live_resume_marks():
+    """The resume marks that still matter, one entry per chat.
+
+    A mark older than the boot sweep's own window cannot change what that
+    sweep does, so it is dropped rather than carried in the marker for ever.
+    Variants are collapsed out: this is what gets written down, and writing
+    each chat twice would make the record harder to read than the thing it
+    records."""
+    horizon = datetime.now(timezone.utc) - timedelta(minutes=CATCHUP_LOOKBACK_MINUTES)
+    live = {}
+    for chat_id, when in RESUMED_CHATS.items():
+        if when < horizon:
+            continue
+        if any(variant in live for variant in _id_variants(chat_id)):
+            continue
+        live[chat_id] = when
+    return live
+
+
+def chat_paused(chat_id):
+    """Is this exact chat out of service?"""
+    return chat_id in PAUSED_CHATS
+
+
+def resumed_at(chat_id):
+    """When this chat came back, or None."""
+    return RESUMED_CHATS.get(chat_id)
+
+
+def route_paused(chat_id):
+    """Is this chat, or the group at the other end of its route, out of service?
+
+    Half a route running is worse than none of it. A request forwarded into a
+    group nobody is reading is a cashout nobody will pay; a payment booked in
+    a chime group whose source has been silenced leaves the books telling a
+    story the groups cannot see. So pausing either end stops the pair."""
+    if chat_paused(chat_id):
+        return True
+
+    source = _canonical(chat_id, CASHOUT_ROUTES)
+    if source is not None:
+        route = CASHOUT_ROUTES[source]
+        return chat_paused(route['handling']) or chat_paused(route['out_to'])
+
+    handling = _canonical(chat_id, _CASHOUT_HANDLERS)
+    if handling is not None:
+        origin = _CASHOUT_HANDLERS[handling]
+        return chat_paused(origin) or chat_paused(CASHOUT_ROUTES[origin]['out_to'])
+
+    rule_key = resolve_rule_key(chat_id)
+    if rule_key is not None:
+        return any(chat_paused(target) for target in FORWARD_RULES[rule_key])
+    return False
+
+
+def route_members(chat_id):
+    """Every chat that goes out of service together with this one.
+
+    A route is ONE unit, and naming either end takes the whole of it: the
+    chime group that asks, the handling group that pays it, wherever the /out
+    is sent if that is somewhere else, and the payment direction between the
+    same two groups. Leaving half a route running is the exact shape of
+    trouble route_paused() exists to prevent, and it would be far too easy to
+    create from a phone by naming one group and assuming the other followed."""
+    members = {chat_id}
+
+    source = _canonical(chat_id, CASHOUT_ROUTES)
+    handling = _canonical(chat_id, _CASHOUT_HANDLERS)
+    if handling is not None:
+        source = _CASHOUT_HANDLERS[handling]
+    if source is not None:
+        route = CASHOUT_ROUTES[source]
+        members.update((source, route['handling'], route['out_to']))
+
+    for member in list(members):
+        rule_key = resolve_rule_key(member)
+        if rule_key is not None:
+            members.add(rule_key)
+            members.update(FORWARD_RULES[rule_key])
+    return members
+
+
+# What a group may be called when working the switch by hand. Short, because
+# these get typed on a phone, and every group answers to something obvious.
+GROUP_ALIASES = {
+    'piccaso': -5350880041,
+    'gaffer': -5580596463,
+    'larry2': -1003894781195,
+    'mhlarry': -1003894781195,
+    'rev': -1002335630148,
+    'chimerev': -1002335630148,
+}
+
+for _item in os.getenv('GROUP_ALIASES', '').split(','):
+    if '=' in _item:
+        _alias, _, _cid = _item.partition('=')
+        try:
+            GROUP_ALIASES[_alias.strip().lower()] = int(_cid.strip())
+        except ValueError:
+            print(f"⚠️ [PAUSED] ignoring alias {_item!r} - id must be a number",
+                  flush=True)
+
+
+def resolve_group(argument):
+    """A name or a raw id typed by a person -> the chats it stands for.
+
+    Returns None for anything not recognised. A raw id is accepted because the
+    aliases cannot cover a group added in Railway, and being unable to work
+    the switch is worse than typing a number."""
+    argument = (argument or '').strip().lower().lstrip('@')
+    if not argument:
+        return None
+    named = GROUP_ALIASES.get(argument)
+    if named is None:
+        try:
+            named = int(argument)
+        except ValueError:
+            return None
+        if (_canonical(named, CASHOUT_ROUTES) is None
+                and _canonical(named, _CASHOUT_HANDLERS) is None
+                and resolve_rule_key(named) is None
+                and named not in TARGET_CHATS):
+            return None                 # a number, but not a group we work
+    return route_members(named)
+
+
+def _known_groups():
+    """Every chat on a route this bot works, in a stable, readable order."""
+    known = set()
+    for chat in list(CASHOUT_ROUTES) + list(FORWARD_RULES):
+        known.update(route_members(chat))
+    return sorted(known, key=lambda c: (chat_name(c), c))
+
+
+def group_switch_state_text(state_ids=None):
+    """What is in and out of service, for a person reading it on a phone.
+
+    `state_ids` is passed explicitly while the switch is being worked, because
+    the message has to describe the state it is the record OF - which, on the
+    way back into service, is not yet the state the bot is in."""
+    paused = (set(_with_variants(state_ids)) if state_ids is not None
+              else PAUSED_CHATS)
+    known = _known_groups()
+    out = [chat_name(c) for c in known if c in paused]
+    live = [chat_name(c) for c in known if c not in paused]
+
+    lines = []
+    if out:
+        lines.append('⏸️ OUT OF SERVICE\n' + '\n'.join(f'  • {name}' for name in out))
+    else:
+        lines.append('▶️ Every group is in service.')
+    if live:
+        lines.append('▶️ RUNNING\n' + '\n'.join(f'  • {name}' for name in live))
+    return '\n\n'.join(lines)
+
+
+# The durable record, and the notification, in one message - exactly as the
+# emergency stop does it. Railway wipes the disk on every deploy, so a switch
+# held only in memory would put two groups back into service on the next push
+# with nobody having asked for it.
+GROUP_PAUSE_MARK = '⏸️ GROUPS OUT OF SERVICE'
+GROUP_RESUME_MARK = '▶️ GROUPS BACK IN SERVICE'
+
+# Machine-readable lines at the foot of that message. The marker is read back
+# by a bot that cannot remember what it wrote, so the state has to be IN the
+# text rather than implied by it.
+_GROUP_STATE_RE = re.compile(r'^STATE[ \t]*(.*)$', re.M)
+_GROUP_RESUMED_RE = re.compile(r'^RESUMED[ \t]*(.*)$', re.M)
+
+
+def group_switch_marker(pausing, changed, state_ids, who=None):
+    """The message that is both the record and the notification."""
+    stamp = datetime.now(LOCAL_TZ).strftime('%I:%M %p - %d %b %Y')
+    names = ', '.join(chat_name(c) for c in changed) or 'nothing'
+    state = ','.join(str(c) for c in sorted(state_ids))
+    resumed = ','.join(f"{c}@{when.strftime('%Y-%m-%dT%H:%M')}"
+                       for c, when in sorted(_live_resume_marks().items()))
+
+    if pausing:
+        head = (f"{GROUP_PAUSE_MARK}\n\n{names}\n\n"
+                "Nothing is being forwarded, chased, booked or answered in "
+                "them, and nothing about them is being reported - not to the "
+                "crew, and not to you. Cashout requests already open there are "
+                "kept, not cancelled.\n\n"
+                "Send /group on to put them back.")
+    else:
+        head = (f"{GROUP_RESUME_MARK}\n\n{names}\n\n"
+                "Working again exactly as before. The boot sweep will not go "
+                "back over the time they were out of service, so nothing from "
+                "that window is about to be forwarded or booked.")
+
+    return (f"{head}\n\n"
+            f"{group_switch_state_text(state_ids)}\n\n"
+            f"Changed at {stamp}{f' by {who}' if who else ''}.\n"
+            f"STATE {state}\n"
+            f"RESUMED {resumed}")
+
+
+async def set_groups_paused(chats, pausing, who=None):
+    """Take groups out of service, or put them back. Returns who was not told.
+
+    The order differs by direction and both directions fail safe, exactly as
+    the emergency stop does. TAKING OUT sets the state FIRST: a marker that
+    fails to post must never leave a group being worked when somebody has just
+    said to stop. PUTTING BACK posts the marker first and only then lifts the
+    pause, so a group is never live without a record saying it should be.
+
+    The resume mark is taken at the same moment as the change, and it is what
+    stops the next deploy's sweep replaying the window nobody was working."""
+    changed = sorted(chats, key=lambda c: (chat_name(c), c))
+    now = datetime.now(timezone.utc)
+    after = (set(PAUSED_CHAT_IDS) | set(changed)) if pausing else (
+        set(PAUSED_CHAT_IDS) - set(changed))
+
+    if pausing:
+        # At once. The point of the switch is that it takes effect when it is
+        # pressed, and a marker that fails to post must not leave a group
+        # being worked after somebody has said to stop.
+        set_paused_chats(after)
+    else:
+        # Recorded before the marker is written, so the marker carries it and
+        # the next deploy's sweep knows where the missed window ends.
+        note_resumed(changed, now)
+
+    failed = await dm_handles(CASHOUT_ADMIN_HANDLES,
+                              group_switch_marker(pausing, changed, after, who))
+    await warn_unreachable(failed)
+
+    if not pausing:
+        # The record exists. Only now do the groups go live again.
+        set_paused_chats(after)
+
+    print(f"{'⏸️' if pausing else '▶️'} [PAUSED] "
+          f"{', '.join(chat_name(c) for c in changed)} "
+          f"{'taken out of service' if pausing else 'back in service'}"
+          f"{f' by {who}' if who else ''}"
+          f"{f' - could not reach {failed}' if failed else ''}", flush=True)
+    return failed
+
 
 # ---------------------------------------------------------------------------
 # Payment retraction
@@ -1105,15 +1497,50 @@ def remember_user(sender):
         print(f"👤 [CASHOUT] learned @{username} = {user_id}", flush=True)
 
 
-def _is_responder(user_id, username):
+def group_crew(handling):
+    """The crew who work this handling group only - [] for anywhere else."""
+    if handling is None:
+        return []
+    key = _canonical(handling, CASHOUT_GROUP_CREW)
+    return list(CASHOUT_GROUP_CREW.get(key, [])) if key is not None else []
+
+
+def crew_handles(handling):
+    """Who is DMed about a request waiting in this group: everyone's crew,
+    then this group's own. Order matters only in that it keeps the existing
+    three where they have always been."""
+    known = {h.lower() for h in CASHOUT_CREW_HANDLES}
+    return list(CASHOUT_CREW_HANDLES) + [h for h in group_crew(handling)
+                                         if h.lower() not in known]
+
+
+def crew_mentions(handling):
+    """The tag line posted into this group, on the request and every reminder.
+
+    Falls back to exactly CASHOUT_MENTIONS where a group has nobody of its
+    own, so the groups that had no group crew read byte for byte as before."""
+    tagged = {m.lower().lstrip('@') for m in CASHOUT_MENTIONS.split()}
+    extra = ' '.join('@' + h for h in group_crew(handling)
+                     if h.lower() not in tagged)
+    return f"{CASHOUT_MENTIONS} {extra}".strip() if extra else CASHOUT_MENTIONS
+
+
+def _is_responder(user_id, username, handling=None):
     """Whose engagement counts as the CREW picking a request up.
 
     Ethan and Larry deliberately do NOT count, though they did until
     2026-08-09 (`user_id in LEDGER_ADMINS`). Acknowledgement now stops the
     group chase outright, so an admin reacting would silence the very
     reminders meant to reach the crew - and an admin looking at a request is
-    not the crew acting on it."""
-    return (username or '').lower() in CASHOUT_RESPONDERS
+    not the crew acting on it.
+
+    `handling` says WHERE they spoke, which is what makes a one-group crew
+    member count there and nowhere else. It defaults to None so a caller with
+    no group in hand still gets the everywhere-crew answer."""
+    name = (username or '').lower()
+    if name in CASHOUT_RESPONDERS:
+        return True
+    return name in {h.lower() for h in group_crew(handling)}
 
 
 # A Telegram @username: 5-32 characters, starting with a letter. The lookbehind
@@ -1125,13 +1552,20 @@ def _crew_identifiers():
     """Every handle the config knows the crew by, lowercased and without the @.
 
     Read from the live config rather than hardcoded, so adding somebody to
-    CASHOUT_CREW_HANDLES or CASHOUT_MENTIONS covers this too and there is no
-    second list to forget."""
+    CASHOUT_CREW_HANDLES, CASHOUT_MENTIONS or CASHOUT_GROUP_CREW covers this
+    too and there is no second list to forget.
+
+    EVERY group's crew, not just one group's. Redaction is about what may
+    leave, and a /out written in one handling group is relayed into a chime
+    group - a name is a name wherever it was typed."""
     words = set()
     for handle in list(CASHOUT_CREW_HANDLES) + list(CASHOUT_RESPONDERS):
         words.add(str(handle).lower().lstrip('@'))
     for handle in CASHOUT_MENTIONS.split():
         words.add(handle.strip().lower().lstrip('@'))
+    for handles in CASHOUT_GROUP_CREW.values():
+        for handle in handles:
+            words.add(str(handle).lower().lstrip('@'))
     return {w for w in words if w}
 
 
@@ -1224,6 +1658,16 @@ async def send_group(chat_id, text, **kwargs):
     tagged with those exact handles on every request, which is the whole point
     of CASHOUT_MENTIONS, and the DMs to Ethan and Larry deliberately name the
     crew member who is stuck."""
+    # A paused group hears nothing at all. The feature gates upstream should
+    # mean nothing ever reaches this line, but "should" is not what a live
+    # group deserves: one check at the only door out is what makes the silence
+    # true for code that does not exist yet, exactly as the redaction below
+    # makes "no crew name" true.
+    if chat_paused(chat_id):
+        print(f"⏸️ [PAUSED] not posting into {chat_name(chat_id)}: "
+              f"{' '.join((text or '').split())[:80]}", flush=True)
+        return None
+
     if chat_id in TARGET_CHATS:
         text = strip_identities(text)
     return await bot.send_message(chat_id, text, **kwargs)
@@ -1400,7 +1844,7 @@ async def open_cashout_request(source, text, sent_at, origin_msg_id):
               f"{chat_name(handling)} - not posting a second copy", flush=True)
         return
 
-    body = f"{correct_timestamp(text, sent_at)}\n\n{CASHOUT_MENTIONS}"
+    body = f"{correct_timestamp(text, sent_at)}\n\n{crew_mentions(handling)}"
     try:
         sent = await send_group(handling, body)
     except Exception as e:
@@ -1412,6 +1856,15 @@ async def open_cashout_request(source, text, sent_at, origin_msg_id):
             f"{chat_name(handling)}:\n{e}\n\n"
             "Nobody has been told about it. Check the bot is still a member there "
             "and allowed to post.")
+        return
+
+    if sent is None:
+        # The door refused it - the handling group is out of service. The gate
+        # in observe_cashout() means this should be unreachable; it is handled
+        # rather than left to raise, because a request record with no message
+        # id behind it would strand the claim and take the listener down with
+        # it. Silent, like everything else about a paused group.
+        _release_cashout(handling, fingerprint)
         return
 
     request = {
@@ -1630,7 +2083,7 @@ async def note_cashout_seen(chat_id, message_id, user_id, username, full_name=No
     handling = _canonical(chat_id, _CASHOUT_HANDLERS)
     if handling is None:
         return False
-    if not _is_responder(user_id, username):
+    if not _is_responder(user_id, username, handling):
         return False               # a reaction from anyone else means nothing
     for request in _pending_cashouts.get(handling, []):
         if request['message_id'] != message_id:
@@ -1935,7 +2388,7 @@ async def handle_cashout_reply(handling, text, user_id, username, reply_to,
                                          full_name, message_id, has_media,
                                          media_group_id)
         return
-    responder = _is_responder(user_id, username)
+    responder = _is_responder(user_id, username, handling)
     target = _match_request(queue, reply_to, text)
 
     # Read BEFORE the loop below sets it. The first thing a crew member says is
@@ -2035,6 +2488,18 @@ async def observe_cashout(chat_id, text, message_id, sent_at,
         return
     if BOT_ID is not None and user_id == BOT_ID:
         return                              # never act on our own posts
+
+    # A paused group is not the bot's business at all. This sits ABOVE the
+    # emergency stop deliberately: the stop reports what it swallows, and a
+    # group that has been taken out of service must not be generating those
+    # reports. Logged only when it was something the flow would have acted on,
+    # so the console does not fill with ordinary chatter.
+    if route_paused(chat_id):
+        if text and (CASHOUT_KEYWORD.lower() in text.lower()
+                     or _OUT_CMD_RE.search(text)):
+            print(f"⏸️ [PAUSED] {chat_name(chat_id)} is out of service - that "
+                  "cashout traffic was left alone.", flush=True)
+        return
 
     # The emergency stop sits here, above every branch, so ONE check covers
     # opening a request, answering one and flagging a problem with one. Anything
@@ -2150,7 +2615,7 @@ async def close_deleted_cashouts(client, chat_id, deleted_ids):
             _pending_cashouts.pop(handling, None)
 
 
-def cashout_nudge_text(waited_minutes):
+def cashout_nudge_text(waited_minutes, handling=None):
     """Deliberately unsigned.
 
     This is the one message the bot posts into a handling group, and nothing of
@@ -2162,7 +2627,7 @@ def cashout_nudge_text(waited_minutes):
     silence in the group - only a /out stops this."""
     return (f"⏰ OUT REQUEST HAS CROSSED {_humanise(waited_minutes)} TIMEFRAME\n\n"
             "This cashout request is still waiting on a /out.\n\n"
-            f"{CASHOUT_MENTIONS}")
+            f"{crew_mentions(handling)}")
 
 
 def _cashout_preview(request):
@@ -2177,7 +2642,7 @@ def cashout_admin_dm_text(request, handling, waited_minutes):
             f"{_cashout_preview(request)}\n\n"
             + ("Acknowledged in the group, but still no /out.\n"
                if request.get('seen') else "Nobody has sent a /out for it yet.\n")
-            + f"Tagged in the group: {CASHOUT_MENTIONS}")
+            + f"Tagged in the group: {crew_mentions(handling)}")
 
 
 def cashout_acknowledged_text(request, handling, waited_minutes):
@@ -2264,7 +2729,7 @@ async def post_group_nudge(handling, request, waited, round_no):
         # Remembered for the same reason the crew's DM is: a late /out makes
         # this post untrue, and it is taken back rather than left tagging the
         # crew about a cashout that is already paid.
-        sent = await send_group(handling, cashout_nudge_text(waited),
+        sent = await send_group(handling, cashout_nudge_text(waited, handling),
                                reply_to_message_id=request['message_id'])
         if getattr(sent, 'message_id', None):
             request['group_notice'].append(sent.message_id)
@@ -2291,7 +2756,7 @@ async def dm_crew_last_resort(handling, request, waited):
           f"{chat_name(handling)} - telling the crew privately, once", flush=True)
     # Remember where each copy landed. A late /out makes this message untrue,
     # and it is taken back rather than left sitting in their inbox.
-    await warn_unreachable(await dm_handles(CASHOUT_CREW_HANDLES,
+    await warn_unreachable(await dm_handles(crew_handles(handling),
                                             cashout_crew_dm_text(request, waited),
                                             receipts=request['crew_notice']))
 
@@ -2466,6 +2931,12 @@ async def cashout_watchdog():
             continue
 
         for handling, queue in list(_pending_cashouts.items()):
+            # Nothing is chased into a group that is out of service. The open
+            # requests are KEPT rather than dropped, the same way the
+            # emergency stop keeps them - a pause is a pause, and resuming has
+            # to find them still there.
+            if route_paused(handling):
+                continue
             for request in list(queue):
                 # Before the exhausted guard: a problem raised while the chase
                 # was still running must still be reported after it stops.
@@ -2497,6 +2968,11 @@ async def process_incoming(chat_id, text, origin, from_bot=False, sent_at=None,
         print(f"⚠️ [SKIP] Chat ID {chat_id} is not in FORWARD_RULES.", flush=True)
         return
 
+    if route_paused(rule_key):
+        print(f"⏸️ [PAUSED] {chat_name(rule_key)} is out of service - "
+              "nothing forwarded.", flush=True)
+        return
+
     if rule_key in BOT_ONLY_SOURCES and not from_bot:
         print(f"⚠️ [SKIP] Chat {chat_id} forwards bot messages only.", flush=True)
         return
@@ -2522,6 +2998,14 @@ async def deliver_to_target(target, fixed, text, from_bot, source_key=None):
     `source_key` identifies the message this came from, so a later reaction on
     that original can find this copy again and undo it - see retract_payment."""
     global forwarded_count, today_count
+
+    # Checked here as well as in process_incoming: the boot sweep calls this
+    # one directly, and a group that has just come back must not be handed the
+    # history it deliberately missed.
+    if chat_paused(target):
+        print(f"⏸️ [PAUSED] {chat_name(target)} is out of service - "
+              "not delivering.", flush=True)
+        return False
 
     # Each target keeps its own books, so the totals shown are per target.
     movement = ledger_preview_payment(target, text) if from_bot else None
@@ -2669,6 +3153,10 @@ async def retract_payment(chat_id, message_id, user_id):
     Returns True if anything was retracted."""
     if chat_id not in RETRACT_SOURCES:
         return False
+    if route_paused(chat_id):
+        print(f"⏸️ [PAUSED] {chat_name(chat_id)} is out of service - "
+              "not retracting.", flush=True)
+        return False
     rule_key = resolve_rule_key(chat_id)
     if rule_key is None:
         return False
@@ -2813,7 +3301,7 @@ async def observe_mentions(chat_id, text, message_id, sent_at,
     are separate events rather than repeats of one."""
     if _MENTION_RE is None or not text:
         return
-    if chat_id not in MENTION_CHATS:
+    if chat_id not in MENTION_CHATS or chat_paused(chat_id):
         return
     if BOT_ID is not None and user_id == BOT_ID:
         return
@@ -2861,6 +3349,13 @@ async def status(message):
         # while nothing is actually being forwarded.
         heading = ('⏸️ CASHOUT FORWARDING IS STOPPED - /cashout on to start it\n\n'
                    if _cashout_stopped else '')
+        # Same reasoning as the line above, and the same trap: with a group out
+        # of service every count below still looks perfectly normal while
+        # nothing whatsoever is happening in it.
+        if PAUSED_CHAT_IDS:
+            heading += ('⏸️ OUT OF SERVICE: '
+                        + ', '.join(chat_name(c) for c in PAUSED_CHAT_IDS)
+                        + ' - /group on to put them back\n\n')
         txt = (f"{heading}Bot Online\nGroups: {len(FORWARD_RULES)}\n"
                f"Forwarded: {forwarded_count}\nUptime: {get_uptime()}\n"
                f"Userbot: {userbot_status}\n"
@@ -2897,6 +3392,19 @@ async def help_command(message):
         "/pause gaffer — stops them in CHIME GAFFER only\n"
         "/pause piccaso — stops them in CHIME PICCASO only\n"
         "/resume — starts them again, same three forms\n"
+        "\n"
+        "TAKING A GROUP OUT OF SERVICE — here in private\n"
+        "\n"
+        "/group — what is running and what is not\n"
+        "/group off piccaso — stops EVERYTHING for that route\n"
+        "/group on piccaso — puts it back, working as before\n"
+        "\n"
+        "Out of service means out of service: nothing is\n"
+        "forwarded, chased, booked or answered there, and\n"
+        "nothing about it reaches you or the crew. It lasts\n"
+        "through a redeploy, and coming back never replays\n"
+        "the time it was off. Names: "
+        + ', '.join(sorted(set(GROUP_ALIASES))) + "\n"
         "\n"
         "REPORTS\n"
         "\n"
@@ -2965,7 +3473,12 @@ async def help_command(message):
         f"Prompts ask the group after {_humanise(IDLE_ALERT_MINUTES)} "
         "without a payment.\n"
         "\n"
-        "In a group, /pause and /resume post nothing at all — check /status.")
+        "In a group, /pause and /resume post nothing at all — check /status."
+        + (("\n\nOUT OF SERVICE: "
+            + ', '.join(chat_name(c) for c in PAUSED_CHAT_IDS)
+            + "\nThe bot does nothing at all in those groups —\n"
+              "no forwarding, no cashouts, no prompts, no replies.")
+           if PAUSED_CHAT_IDS else ""))
 
 
 @bot.message_handler(commands=['ping'])
@@ -2979,6 +3492,13 @@ async def ledger_command(message):
     """/add <amount> and /out <amount>, target groups only, Ethan and Larry only."""
     chat_id = message.chat.id
     user_id = getattr(message.from_user, 'id', None)
+
+    # Nothing at all in a paused group, not even a refusal. A refusal is a
+    # reply, and a reply says the bot is still listening in a group it is
+    # meant to read as absent from. Every command still works from a DM and
+    # from the groups that are in service.
+    if chat_paused(chat_id):
+        return
 
     # A /out typed in a handling group may be answering a cashout request, and
     # telebot routes commands here rather than to forward_text. This has to run
@@ -3090,6 +3610,19 @@ async def idle_pause_command(message):
                                f"       /{command} piccaso  (CHIME PICCASO only)")
             return
 
+        # A group that is out of service has no payment prompts to pause or
+        # resume. Saying so is better than appearing to act on it - the reply
+        # is where somebody would otherwise read a silent no-op as a yes.
+        blocked = [t for t in targets if chat_paused(t)]
+        targets = [t for t in targets if not chat_paused(t)]
+        if blocked:
+            await bot.reply_to(message, "⏸️ Out of service: " + ', '.join(
+                IDLE_NAMES.get(t, str(t)) for t in blocked)
+                + "\n\nPayment prompts there are off with everything else "
+                  "until the group is back.")
+        if not targets:
+            return
+
         for target in targets:
             set_idle_paused(target, pausing)
         names = ', '.join(IDLE_NAMES.get(t, str(t)) for t in targets)
@@ -3111,7 +3644,7 @@ async def idle_pause_command(message):
     # ---- inside a target group: deliberately SILENT ----
     # Pausing usually means the hold-up is on our side, and announcing it would
     # be exactly the wrong message. Check the state with /status.
-    if chat_id not in IDLE_ALERT_CHATS:
+    if chat_id not in IDLE_ALERT_CHATS or chat_paused(chat_id):
         return
 
     if user_id not in LEDGER_ADMINS:
@@ -3139,6 +3672,12 @@ async def cashout_switch_command(message):
     in_cashout_chat = (_canonical(chat_id, CASHOUT_ROUTES) is not None
                        or _canonical(chat_id, _CASHOUT_HANDLERS) is not None)
     if not (in_dm or in_cashout_chat):
+        return
+
+    # Silent in a paused group, like every other command there. The switch is
+    # still reachable from a DM and from the cashout groups still in service,
+    # which is what it was written for.
+    if chat_paused(chat_id):
         return
 
     # Every answer this command gives is private. Typed in a group, replying
@@ -3216,6 +3755,123 @@ async def cashout_switch_command(message):
             "Send /cashout off to stop everything.")
 
 
+@bot.message_handler(commands=['group', 'groups'])
+async def group_switch_command(message):
+    """/group off piccaso - take a route out of service. /group on - put it back.
+
+    Bare /group reports what is in service and what is not. Ethan and Larry
+    only, from a private chat or from any group still in service.
+
+    Naming either end takes the WHOLE route: the chime group, the handling
+    group and the payment direction between them. Half a route running is the
+    failure this is meant to prevent, and it would be far too easy to create
+    from a phone by naming one group and assuming the other followed.
+
+    A group that is out of service ignores everything, this command included -
+    so it is put back from a private chat, which is where it is worked from
+    anyway."""
+    chat_id = message.chat.id
+    user_id = getattr(message.from_user, 'id', None)
+
+    in_dm = chat_id in LEDGER_ADMINS
+    if not (in_dm or _canonical(chat_id, CASHOUT_ROUTES) is not None
+            or _canonical(chat_id, _CASHOUT_HANDLERS) is not None):
+        return
+    if chat_paused(chat_id):
+        return
+
+    # Private, for the same reason the kill switch is: which groups the bot is
+    # working is not the crew's business, and a refusal in a group would tell
+    # them the switch exists.
+    async def answer(text):
+        if in_dm:
+            await bot.reply_to(message, text)
+        else:
+            try:
+                await send_group(user_id, text)
+            except Exception as e:
+                print(f"⚠️ [PAUSED] could not confirm privately to {user_id}: {e}",
+                      flush=True)
+
+    if user_id not in LEDGER_ADMINS:
+        print(f"⛔ [PAUSED] /group by {user_id} denied in {chat_id}", flush=True)
+        return
+
+    parts = (message.text or '').split()
+    action = parts[1].lower() if len(parts) > 1 else ''
+    argument = ' '.join(parts[2:]).strip() if len(parts) > 2 else ''
+    who = f"@{getattr(message.from_user, 'username', None) or user_id}"
+
+    if action not in ('off', 'stop', 'on', 'start'):
+        await answer(f"{group_switch_state_text()}\n\n"
+                     "/group off piccaso — take that route out of service\n"
+                     "/group on piccaso — put it back\n"
+                     "/group off — everything currently running\n"
+                     "/group on — everything currently out of service\n\n"
+                     "Names: " + ', '.join(sorted(set(GROUP_ALIASES))) + "\n"
+                     "Naming either end takes the whole route with it.")
+        return
+
+    pausing = action in ('off', 'stop')
+
+    if argument:
+        chats = resolve_group(argument)
+        if chats is None:
+            await answer(f"❓ I do not know a group called {argument!r}.\n\n"
+                         "Try: " + ', '.join(sorted(set(GROUP_ALIASES)))
+                         + "\nOr give the chat id.")
+            return
+    else:
+        # No name given: every group on the other side of the switch. Spelled
+        # out in the confirmation, because "everything" typed on a phone should
+        # never leave somebody guessing which groups just moved.
+        chats = {c for c in _known_groups() if chat_paused(c) is not pausing}
+
+    # The whole route moves, not just the end that was named, and only the
+    # groups this actually changes are reported as changed.
+    changing = {member for c in chats for member in route_members(c)
+                if chat_paused(member) is not pausing}
+    if not changing:
+        await answer("Nothing to do — that is already the state.\n\n"
+                     + group_switch_state_text())
+        return
+
+    touched = _with_variants(changing)
+    open_now = sum(len(queue) for handling, queue in _pending_cashouts.items()
+                   if handling in touched)
+    failed = await set_groups_paused(changing, pausing, who)
+    names = ', '.join(chat_name(c) for c in sorted(changing,
+                                                   key=lambda c: chat_name(c)))
+
+    # The private message IS the durable record, exactly as it is for the kill
+    # switch, so failing to deliver it means this will not survive a redeploy.
+    warning = ('\n\n⚠️ Could not reach ' + ', '.join(f'@{h}' for h in failed)
+               + ', so this will NOT survive a redeploy. Send /group again '
+                 'after the next deploy to check.') if failed else ''
+
+    if pausing:
+        await answer(
+            f"⏸️ OUT OF SERVICE: {names}\n\n"
+            "Nothing forwarded, no cashout opened, answered or chased, no "
+            "totals moved, no prompts, no reply to anything typed there.\n"
+            "Nothing was posted in any group, and nobody else was told.\n"
+            f"{open_now} request(s) already open there are kept, not "
+            "cancelled.\n\n"
+            "Anything that happens there while it is out of service reaches "
+            "NOBODY — that is what being out of service means.\n\n"
+            f"Send /group on {argument or ''}".rstrip() + " to put it back."
+            + warning)
+    else:
+        await answer(
+            f"▶️ BACK IN SERVICE: {names}\n\n"
+            "Working exactly as before — same routes, same crew, same ladder, "
+            "same books.\n"
+            "Nothing was posted in any group.\n\n"
+            "The time they were out of service is NOT replayed: nothing from "
+            "that window will be forwarded or booked, now or on the next "
+            "deploy." + warning)
+
+
 @bot.message_handler(commands=['set'])
 async def ledger_set_command(message):
     """/set in <amount> or /set out <amount> - overwrite a column outright.
@@ -3224,6 +3880,9 @@ async def ledger_set_command(message):
     figure that has gone wrong needs to be set directly."""
     chat_id = message.chat.id
     user_id = getattr(message.from_user, 'id', None)
+
+    if chat_paused(chat_id):
+        return
 
     if chat_id not in TARGET_CHATS:
         return
@@ -3309,6 +3968,8 @@ async def on_request_reaction(reaction):
     user = getattr(reaction, 'user', None)
     if user is None:
         return
+    if route_paused(getattr(reaction.chat, 'id', None)):
+        return                      # out of service: not even a ❤ or a retraction
     remember_user(user)
     full_name = ' '.join(part for part in (getattr(user, 'first_name', None),
                                            getattr(user, 'last_name', None)) if part)
@@ -3368,6 +4029,11 @@ def report_pairs():
     pairs = []
     for chime, route in CASHOUT_ROUTES.items():
         handling = route['handling']
+        # A pair that is out of service has nothing to reconcile, and a row of
+        # zeroes would read as a quiet day rather than as a group the bot is
+        # not working. report_summary_text() names them instead.
+        if chat_paused(chime) or chat_paused(handling):
+            continue
         source = _canonical(handling, FORWARD_RULES)
         targets = FORWARD_RULES.get(source, []) if source is not None else []
         # 'paired' says the two really are two ends of one route: payments come
@@ -3617,6 +4283,9 @@ def report_summary_text(report):
         if open_still:
             lines.append(f"  ⏳ {len(open_still)} cashout(s) still unanswered")
         lines.append('')
+    if PAUSED_CHAT_IDS:
+        lines.append("⏸️ Out of service, not counted here: "
+                     + ', '.join(chat_name(c) for c in PAUSED_CHAT_IDS))
     if report['unreadable']:
         lines.append("⚠️ Could not read: " + ', '.join(sorted(set(report['unreadable'])))
                      + " — those figures are missing, not zero.")
@@ -3848,7 +4517,11 @@ async def _wait_for_pending_cashouts():
     goes into the sheet as an exception rather than delaying it further."""
     waited = 0
     while REPORT_WAIT_MINUTES > 0 and waited < REPORT_WAIT_MINUTES:
-        open_now = sum(len(queue) for queue in _pending_cashouts.values())
+        # A request in a group that is out of service is never going to be
+        # answered, and holding the whole report for it every night would be
+        # the pause quietly costing the groups that ARE being worked.
+        open_now = sum(len(queue) for handling, queue in _pending_cashouts.items()
+                       if not route_paused(handling))
         if not open_now:
             return waited
         if waited == 0:
@@ -3907,6 +4580,8 @@ async def report_command(message):
     shows figures already keeps."""
     chat_id = message.chat.id
     user_id = getattr(message.from_user, 'id', None)
+    if chat_paused(chat_id):
+        return
     if user_id not in LEDGER_ADMINS:
         # Silent, like the other refusals: in a group, an explanation would
         # advertise a command to people who cannot use it.
@@ -4225,9 +4900,24 @@ async def catch_up(client):
     total = 0
 
     for rule_key, targets in FORWARD_RULES.items():
+        if route_paused(rule_key):
+            print(f"⏸️ [CATCHUP] {chat_name(rule_key)} is out of service - "
+                  "not sweeping it.", flush=True)
+            continue
         source = await _resolve_one(client, rule_key)
         if source is None:
             continue
+
+        # A group that has just come back must not be handed the history it
+        # deliberately missed. The paused window is not a deaf window: it is
+        # time somebody decided the bot would not act on, and sweeping it now
+        # would post and BOOK hours of stale payments the moment the group is
+        # turned back on. Self-expiring, so nobody has to remember to undo it.
+        since = resumed_at(rule_key)
+        window_start = max(cutoff, since) if since else cutoff
+        if since and since > cutoff:
+            print(f"⏪ [CATCHUP] {chat_name(rule_key)} came back at "
+                  f"{since:%H:%M} UTC - sweeping only from there.", flush=True)
         # The live handler keys dedup off event.chat_id, so use the same
         # canonical form here or the two would not recognise each other.
         source_id = utils.get_peer_id(source)
@@ -4239,7 +4929,7 @@ async def catch_up(client):
 
         pending, retracted, unconfirmed = [], 0, 0
         async for msg in client.iter_messages(source, limit=CATCHUP_SCAN_LIMIT):
-            if msg.date < cutoff:
+            if msg.date < window_start:
                 break
             if not _is_plain_text(msg) or not msg.raw_text:
                 continue
@@ -4446,6 +5136,89 @@ async def recover_cashout_switch(client):
             "want it back."))
 
 
+async def recover_group_switch(client):
+    """Restore which groups are out of service from the last marker.
+
+    Same principle, same mechanism and same failure rule as
+    recover_cashout_switch(): the disk is wiped on every deploy, so the record
+    is a private message, and only the userbot can read a private chat.
+
+    Without this, a group taken out of service from a phone would quietly come
+    back on the next push - and start forwarding and BOOKING again with nobody
+    having asked for it. That is the whole reason this is not a variable
+    somebody has to remember to edit.
+
+    The marker also carries the resume marks, which is what stops catch_up()
+    below replaying a window nobody was working; see _live_resume_marks()."""
+    marker = None
+    reachable = False
+    # Guarded whole, like the switch above: this runs inside run_userbot()'s
+    # reconnect loop, so an exception escaping it is retried for ever and the
+    # userbot never finishes starting.
+    try:
+        entity = await client.get_entity(BOT_ID)
+        async for message in client.iter_messages(entity, limit=100):
+            sender = await message.get_sender()
+            if BOT_ID is None or getattr(sender, 'id', None) != BOT_ID:
+                continue                       # our own side of the conversation
+            text = message.raw_text or ''
+            if GROUP_PAUSE_MARK not in text and GROUP_RESUME_MARK not in text:
+                continue
+            state = _GROUP_STATE_RE.search(text)
+            if state is None:
+                continue                       # not a marker we can read
+            marker = (message.date, state.group(1),
+                      (_GROUP_RESUMED_RE.search(text) or None))
+            break                              # newest marker wins
+        reachable = True
+    except Exception as e:
+        print(f"⚠️ [PAUSED] could not read the group switch back from the "
+              f"private chat: {e}", flush=True)
+
+    if not reachable:
+        # Neither direction is safe to guess. Assuming "in service" could start
+        # forwarding money into a group somebody deliberately silenced;
+        # assuming "out of service" would silently stop a group that should be
+        # running. Change nothing, and make sure a person is told.
+        current = (', '.join(chat_name(c) for c in PAUSED_CHAT_IDS)
+                   or 'nothing')
+        print("⚠️ [PAUSED] the private chat could not be read - leaving the "
+              f"switch as it is (out of service: {current}).", flush=True)
+        await warn_unreachable(await dm_handles(
+            CASHOUT_ADMIN_HANDLES,
+            "⚠️ On starting up, the bot could not read back which groups are "
+            "out of service.\n\n"
+            f"It is currently working everything except: {current}. That is "
+            "the default and may not be what you left it as.\n\n"
+            "Send /group to check, and /group off to take one out again."))
+        return
+
+    if marker is None:
+        print("▶️ [PAUSED] no group marker found - keeping the boot state "
+              f"({', '.join(chat_name(c) for c in PAUSED_CHAT_IDS) or 'nothing'} "
+              "out of service).", flush=True)
+        return
+
+    when, state, resumed = marker
+    set_paused_chats(_parse_chat_list(state))
+    if resumed is not None:
+        RESUMED_CHATS.update(_parse_resume_marks(resumed.group(1)))
+
+    out = ', '.join(chat_name(c) for c in PAUSED_CHAT_IDS)
+    print(f"{'⏸️' if out else '▶️'} [PAUSED] recovered from the private chat: "
+          f"{out or 'nothing'} out of service (marker from {when:%m-%d %H:%M})",
+          flush=True)
+    if out:
+        await warn_unreachable(await dm_handles(
+            CASHOUT_ADMIN_HANDLES,
+            f"⏸️ This bot has just restarted and {out} "
+            f"{'is' if len(PAUSED_CHAT_IDS) == 1 else 'are'} still out of "
+            "service, as before the restart.\n\n"
+            "Nothing is being forwarded, chased or booked there, and nothing "
+            "from that time will be replayed when it comes back.\n\n"
+            "Send /group on when you want it working again."))
+
+
 async def recover_ledgers(client):
     """Rebuild every target's ledger from the last totals this bot published.
 
@@ -4626,6 +5399,10 @@ async def run_userbot():
             # Before the ledgers: if the flow was stopped, that has to be true
             # again the moment this container starts handling anything.
             await recover_cashout_switch(client)
+            # Before the sweep, and for the same reason twice over: a group
+            # left out of service must not be swept, and one that came back
+            # must not have the window it missed replayed into it.
+            await recover_group_switch(client)
             await recover_ledgers(client)
             try:
                 await catch_up(client)
@@ -4766,6 +5543,14 @@ def _install_shutdown_handler(loop):
 async def main():
     print('Bot running...', flush=True)
     _install_shutdown_handler(asyncio.get_running_loop())
+    # The log only. Which groups are out of service is not settled yet - the
+    # marker in the private chat is, and recover_group_switch() is what reads
+    # it back and tells Ethan and Larry. Saying it here as well would announce
+    # the boot default, which is exactly the thing that may be out of date.
+    out_of_service = ', '.join(chat_name(c) for c in PAUSED_CHAT_IDS)
+    if out_of_service:
+        print(f'⏸️ [PAUSED] booting with {out_of_service} out of service, '
+              'pending the marker', flush=True)
     await notify_admin('Bot is ONLINE. Use /help to see all commands.')
     await asyncio.gather(run_bot(), run_userbot(), idle_watchdog(),
                          cashout_watchdog(), daily_report_loop(),

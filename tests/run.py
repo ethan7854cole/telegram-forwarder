@@ -24,7 +24,13 @@ def main():
         print(f"No suites matching {wanted!r}")
         return 1
 
-    env = dict(os.environ, TELEGRAM_BOT_TOKEN='111222:FAKE')
+    # Every suite below was written against the full two-route bot, so the
+    # group pause is cleared for them: PAUSED_CHATS is what takes a group out
+    # of service, and a paused group is silent by design - it would turn most
+    # of these suites green for the wrong reason. test_paused.py switches it
+    # back on and owns that behaviour, including checking what ships by
+    # default. A suite may still override this itself before importing.
+    env = dict(os.environ, TELEGRAM_BOT_TOKEN='111222:FAKE', PAUSED_CHATS='')
     total = failed = 0
     broken = []
 

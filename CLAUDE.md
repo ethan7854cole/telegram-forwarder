@@ -17,7 +17,7 @@ python3 tests/run.py            # all suites
 python3 tests/run.py cashout    # only matching suites
 ```
 
-980 checks across 27 suites, all stubbed — nothing touches Telegram, the
+1123 checks across 30 suites, all stubbed — nothing touches Telegram, the
 network, or the live groups. They cover the pre-existing behaviour as well as
 the new, so they are the guard against a change quietly altering something that
 already worked.
@@ -41,6 +41,12 @@ CHIME GAFFER   --"CASHOUT REQUEST"-------->  Chime Rev & out no-7
         ^                                            |
         +--------------- /out --------------------- +   (Total Out ↑, ❤ on the request)
 ```
+
+**MH X LARRY GROUP 2 and CHIME PICCASO are currently OUT OF SERVICE** — that
+whole route, both directions. The tables above still describe it exactly; the
+bot is simply deaf and mute in those two chats. `/group on piccaso` from a
+private chat puts it back, `/group off piccaso` takes it out again; see "Taking
+a group out of service" below.
 
 `FORWARD_RULES` drives the first. `CASHOUT_ROUTES` drives the second, and is
 deliberately a **separate table** — putting the pairs in `FORWARD_RULES` would
@@ -121,6 +127,12 @@ nothing.
   post, and it runs whether or not anybody has acknowledged it.
 - **The crew get no timer DM until the group ladder has run out** (17 min).
   Ethan and Larry still get theirs on the first rung.
+- **A paused chat is silent in both directions.** Nothing is posted into it and
+  nothing about it is reported to anyone — see "Taking a group out of service".
+  It is the one deliberate exception to "never a silent hole", and the reason
+  `/status` leads with which groups are out of service.
+- **Crew count only in the group they work.** `_is_responder()` takes the
+  handling group for exactly this reason; see "Who the crew are".
 
 ## The escalation ladder
 
@@ -205,6 +217,40 @@ The crew are **not** told — they are the ones being asked about. Nothing is
 posted in the group. Once per request (`issue_told`), and the ladder it was
 already on carries on underneath. The *first* thing anyone says is an
 acknowledgement, not a problem, so the alert needs a prior acknowledgement.
+
+## Who the crew are
+
+Three handles are crew on **every** route — `CASHOUT_MENTIONS`,
+`CASHOUT_RESPONDERS`, `CASHOUT_CREW_HANDLES`, all pointing at the same people:
+`@Maynuddin23`, `@MHSUPPORTZONE`, `@maynuddin233`.
+
+**`CASHOUT_GROUP_CREW` adds crew to ONE handling group.** Keyed by the handling
+group, because that is the side crew work on: the group a request is posted
+into and the group the `/out` comes back from.
+
+| Who | Where | Config |
+|---|---|---|
+| the standing three | both routes | `CASHOUT_MENTIONS` and friends |
+| `@NPR_CA` (prutok sha) | Chime Rev & out no-7 **only** | `CASHOUT_GROUP_CREW=-1002335630148=NPR_CA` |
+
+Everything that treats crew reads one of three lookups, so there is no second
+list to forget: `crew_mentions(handling)` for the tag line, `crew_handles(
+handling)` for the last-resort DM, and `_is_responder(user_id, username,
+handling)` for whether an acknowledgement counts.
+
+- **A group with nobody of its own reads byte for byte as it always did.**
+  `crew_mentions()` falls back to exactly `CASHOUT_MENTIONS`, and pinning that
+  is what `test_crew.py` does for MH X LARRY GROUP 2.
+- **They count only where they work.** Their reaction in the other handling
+  group acknowledges nothing — that would stop the chase for people who never
+  saw the request — and they are never DMed about it either.
+- **Redaction knows every group's crew, not one group's.** `strip_identities()`
+  reads `CASHOUT_GROUP_CREW` alongside the rest, because a `/out` written in a
+  handling group is relayed into a chime group: a name is a name wherever it
+  was typed. Bare names go too, so `NPR_CA` without the `@` is also stripped.
+- Everything else about them is identical: tagged on the request and on every
+  reminder, named in the admin notice as tagged, their `/out` relayed, booked
+  and hearted.
 
 ## Edited messages
 
@@ -336,6 +382,97 @@ every branch, and `cashout_watchdog()` skips its whole round.
   `run_userbot()`'s reconnect loop, so an exception escaping it is retried
   forever and the userbot never finishes starting. The whole scan is guarded.
   This was a real bug, caught by `test_caption` hanging.
+
+## Taking a group out of service
+
+**`/group off piccaso` from a private chat, `/group on piccaso` to put it back.**
+Bare `/group` reports what is running and what is not. Ethan and Larry only,
+from a DM or from any group still in service. **MH X LARRY GROUP 2
+(`-1003894781195`) and CHIME PICCASO (`-5350880041`) ship out of service.**
+
+It is worked from a phone, so three things follow that would not otherwise:
+
+- **Naming either end takes the whole route** — `route_members()`. The chime
+  group, the handling group and the payment direction between them go together.
+  Half a route running is the failure `route_paused()` exists to prevent, and
+  it would be far too easy to create by naming one group and assuming the other
+  followed.
+- **The state survives a redeploy**, the same way the emergency stop does: it
+  lives in the bot's own DM to Ethan and Larry, and `recover_group_switch()`
+  reads the newest marker back on boot. Without that, a group silenced from a
+  phone would start forwarding real money again on the next push with nobody
+  having asked. The marker carries `STATE <ids>` and `RESUMED <id@when>` lines
+  so a bot that cannot remember what it wrote can still read it.
+- **`PAUSED_CHATS` is only the boot state** — what is true while the private
+  chat is being read back, and deliberately the silent one. Once the switch has
+  been worked, the marker is the authority. Worth clearing the env default
+  eventually if a group is back for good, or every deploy re-pauses it for the
+  few seconds before recovery runs.
+
+A **pause, not an unwiring**. Deleting the pair from `FORWARD_RULES` and
+`CASHOUT_ROUTES` would stop it too, but putting it back means rebuilding those
+tables by hand and hoping the rebuild is exact — and they are what the report,
+the mention watch, the idle watchdog and the ledger all derive themselves from.
+The routes stay written down exactly as they are. One gate makes the bot deaf
+and mute there, and taking an id back out of the list is the whole of turning
+it on again.
+
+**Paused means paused.** Nothing forwarded, no cashout opened, answered,
+hearted or chased, no ledger moved, no milestone, no idle prompt, no mention
+DM, no retraction, no daily-report row, and no reply to a command typed there —
+not even a refusal, because a refusal is a reply and a reply says the bot is
+still listening in a group it is meant to read as absent from.
+
+- **It is silent to everyone, and that is the one place it differs from the
+  emergency stop.** `/cashout off` reports what it swallowed, because that is
+  an incident and somebody has to pick the money up by hand. A pause is a
+  decision that those groups are not the bot's business for now, so nothing
+  goes to the groups, the crew, or Ethan and Larry. What *is* said: the boot
+  log, the `Bot is ONLINE` DM, the first line of `/status`, and a line in the
+  daily report naming what it is not counting.
+- **Guarded at the door as well as at each feature.** `send_group()` refuses a
+  paused chat outright, the same way it redacts crew names, so the silence
+  holds for code that does not exist yet.
+- **Pausing either end pauses the route** — `route_paused()`. Half a route
+  running is worse than none of it: a request forwarded into a group nobody is
+  reading is a cashout nobody will pay.
+- **Open requests are kept, not cancelled**, exactly as the emergency stop
+  keeps them.
+- **Reading is not stopped.** The userbot still watches those chats and
+  `recover_ledgers()` still reads their books back on boot, so a resume is
+  instant and the figures are already right. Nothing is written and nothing is
+  posted.
+
+### Resuming
+
+**The dangerous part of a resume is the boot sweep, not the switch.**
+`catch_up()` reads the source group's history and forwards whatever is missing
+from the target — which, after a pause, is everything that happened during it.
+Turning a group back on without a guard posts and **books** hours of stale
+payments. (This is not hypothetical: an unrelated push on 2026-08-10 resurrected
+two retracted payments the same way.)
+
+`/group on` handles it, and nobody has to remember: the moment a group comes
+back is stamped into `RESUMED_CHATS`, written into the marker, and read back on
+the next boot. `catch_up()` will not look past it, so the window nobody was
+working is never swept. It is **self-expiring** — once the resume is further
+back than `CATCHUP_LOOKBACK_MINUTES` (180) it stops mattering and drops out of
+the marker on its own.
+
+The order of operations differs by direction and both directions fail safe,
+exactly as `set_cashout_stopped()` does it:
+
+| Direction | Order | Why |
+|---|---|---|
+| `/group off` | state first, then the marker | a marker that fails to post must not leave a group being worked after somebody said stop |
+| `/group on` | marker first, then the state | a group must never be live without a record saying it should be |
+
+If the marker cannot be delivered the reply says so plainly — it is the durable
+record, so an undelivered one means the change will not survive a redeploy.
+
+Pinned by `test_paused.py` (the shipped default, and every feature going quiet)
+and `test_groupswitch.py` (the command, the marker, recovery, and the sweep not
+replaying the window).
 
 ## Guarding against a duplicate request
 
@@ -753,6 +890,9 @@ cashout requests.
 | `tests/test_edits.py` | A /out edited onto a message, and the double-book guard |
 | `tests/test_album.py` | Every screenshot in an album reaches the group that asked |
 | `tests/test_report.py` | The daily workbook, the gap, and the narrow in-group report |
+| `tests/test_paused.py` | A group out of service: silent everywhere, and a resume that does not replay the pause |
+| `tests/test_groupswitch.py` | `/group off` and `/group on`: the whole route, durable across a redeploy |
+| `tests/test_crew.py` | Crew who work one handling group and count for nothing in the other |
 | `backfill.py` | Manual one-off backfill, separate from the boot sweep |
 | `telethon_login.py` | Generates a `TELETHON_SESSION`; `--deploy` for Railway |
 
