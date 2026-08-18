@@ -19,6 +19,7 @@ import forwarder as f
 
 PICCASO, GAFFER = -5350880041, -5580596463
 MHLARRY, CHIMEREV = -1003894781195, -1002335630148
+GVENMO, VENMO_SRC = -5100231154, -1004298140797
 LARRY, ETHAN, CREW = 7418675217, 7578145913, 555
 
 sent, documents, failures = [], [], []
@@ -104,11 +105,20 @@ def adjusted(amount, total_in, total_out):
 async def main():
     # -- the pairs come off the live tables --------------------------------
     pairs = {p['chime']: p for p in f.report_pairs()}
-    check('both routes produce a pair', len(pairs) == 2, str(pairs))
+    # Counted off the live table rather than a number written here: a route
+    # added in Railway must show up in the report without anyone remembering
+    # to edit this line. The venmo pair joined on 2026-08-18 and this is the
+    # check that noticed.
+    check('every cashout route produces a pair',
+          len(pairs) == len(f.CASHOUT_ROUTES), str(pairs))
     check('CHIME GAFFER is paired with Chime Rev & out no-7',
           pairs[GAFFER]['handling'] == CHIMEREV, str(pairs.get(GAFFER)))
     check('CHIME PICCASO is paired with MH X LARRY GROUP 2',
           pairs[PICCASO]['handling'] == MHLARRY, str(pairs.get(PICCASO)))
+    check('GAFFER VENMO is paired with MH x LARRY VENMO',
+          pairs[GVENMO]['handling'] == VENMO_SRC, str(pairs.get(GVENMO)))
+    check('and the venmo pair really is two ends of one route',
+          pairs[GVENMO]['paired'] is True, str(pairs.get(GVENMO)))
     check('both pairs really are two ends of one route',
           all(p['paired'] for p in pairs.values()), str(pairs))
 
@@ -383,7 +393,8 @@ async def main():
               book.sheetnames == ['Summary', 'Payments', 'Cashouts', 'Exceptions'],
               str(book.sheetnames))
         check('the summary has a row per group',
-              book['Summary'].max_row == 3, str(book['Summary'].max_row))
+              book['Summary'].max_row == 1 + len(report['pairs']),
+              f"{book['Summary'].max_row} rows for {len(report['pairs'])} pair(s)")
     except ImportError:
         print('  ..   openpyxl not installed here, skipping the workbook read')
 

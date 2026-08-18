@@ -18,7 +18,7 @@ import forwarder as f
 
 PICCASO, GAFFER = -5350880041, -5580596463
 MHLARRY, CHIMEREV = -1003894781195, -1002335630148
-VENMO = -5100231154
+VENMO, VENMO_SRC = -5100231154, -1004298140797
 ETHAN, LARRY = f.ADMIN_ID, 7418675217
 BOTID = 111222
 
@@ -90,16 +90,20 @@ async def main():
     check('it carries the time', 'At: ' in body and '03 Aug 2026' in body, body)
     check('it quotes the message', 'can you check this one' in body, body)
 
-    # -- 2. every one of the four groups is watched --------------------------
-    for chat in (PICCASO, GAFFER, MHLARRY, CHIMEREV):
+    # -- 2. every group on a cashout route is watched ------------------------
+    # Six now, not four: the venmo pair joined the routes on 2026-08-18 and the
+    # watch list is derived from CASHOUT_ROUTES, so it followed on its own.
+    for chat in (PICCASO, GAFFER, MHLARRY, CHIMEREV, VENMO, VENMO_SRC):
         reset()
         await mention(chat, 'ping @ethannxxxx', mid=200 + abs(chat) % 97)
         check(f'{f.chat_name(chat)} is watched', len(alerts()) == 2, str(dms))
 
     # -- 3. ...and nowhere else ----------------------------------------------
+    # PICCASO VENMO is the honest test now: a real group, still redacted, but
+    # on no route at all - so nobody is chased about an @ in it.
     reset()
-    await mention(VENMO, 'ping @ethannxxxx', mid=300)
-    check('a VENMO target is not watched', alerts() == [], str(dms))
+    await mention(-5306739731, 'ping @ethannxxxx', mid=300)
+    check('a group on no route is not watched', alerts() == [], str(dms))
 
     reset()
     await mention(9999, 'ping @ethannxxxx', mid=301)      # a private chat

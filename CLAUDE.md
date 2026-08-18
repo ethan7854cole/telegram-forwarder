@@ -17,7 +17,7 @@ python3 tests/run.py            # all suites
 python3 tests/run.py cashout    # only matching suites
 ```
 
-1147 checks across 30 suites, all stubbed — nothing touches Telegram, the
+1157 checks across 30 suites, all stubbed — nothing touches Telegram, the
 network, or the live groups. They cover the pre-existing behaviour as well as
 the new, so they are the guard against a change quietly altering something that
 already worked.
@@ -39,6 +39,7 @@ MH x LARRY VENMO     --"You received"------>  GAFFER VENMO       (Total In  ↑)
 
 CHIME PICCASO  --"CASHOUT REQUEST"-------->  MH X LARRY GROUP 2
 CHIME GAFFER   --"CASHOUT REQUEST"-------->  Chime Rev & out no-7
+GAFFER VENMO   --"CASHOUT REQUEST"-------->  MH x LARRY VENMO
         ^                                            |
         +--------------- /out --------------------- +   (Total Out ↑, ❤ on the request)
 ```
@@ -48,6 +49,16 @@ whole route, both directions. The tables above still describe it exactly; the
 bot is simply deaf and mute in those two chats. `/group on piccaso` from a
 private chat puts it back, `/group off piccaso` takes it out again; see "Taking
 a group out of service" below.
+
+**The venmo pair now runs the full flow** (2026-08-18): payments out, cashout
+requests back, crew tagged and chased, `/out` relayed and booked, a ❤ on the
+request, a mention watch on both groups and its own row in the daily report —
+the same shape as the chime pair. The standing three are its crew;
+`@NPR_CA` is not, being Chime Rev only. Deliberately NOT the same: no idle
+"no payments here" prompts, because venmo is for payment notifications and
+nothing else. `MH x LARRY VENMO` joined `BOT_ONLY_SOURCES` with the route —
+the moment a group also handles cashouts, people talk in it, and a pasted
+notification must never be booked as a fresh deposit.
 
 **MH x LARRY VENMO feeds GAFFER VENMO only**, as of 2026-08-18. It fanned out
 to PICCASO VENMO as well until then, so one payment moved two groups' books;
@@ -247,7 +258,7 @@ into and the group the `/out` comes back from.
 
 | Who | Where | Config |
 |---|---|---|
-| the standing three | both routes | `CASHOUT_MENTIONS` and friends |
+| the standing three | all three routes | `CASHOUT_MENTIONS` and friends |
 | `@NPR_CA` (prutok sha) | Chime Rev & out no-7 **only** | `CASHOUT_GROUP_CREW=-1002335630148=NPR_CA` |
 
 Everything that treats crew reads one of three lookups, so there is no second
@@ -360,7 +371,7 @@ one step earlier, from text it already parses.
 
 `/cashout off` takes the whole cashout flow out of service; `/cashout on` puts
 it back; bare `/cashout` says which it is. Ethan and Larry only, from a DM or
-from any of the four cashout groups — when this is needed it is needed from
+from any of the six cashout groups — when this is needed it is needed from
 whatever chat is already open.
 
 Stopped means **stopped**: no request forwarded, nothing chased, no ledger
@@ -728,12 +739,12 @@ and takes the amount back off that group's Total In.
 
 ## Mention watch
 
-The four cashout groups are **muted**, so an `@Larryyxx` or `@ethannxxxx` in one
+The six cashout groups are **muted**, so an `@Larryyxx` or `@ethannxxxx` in one
 of them reaches nobody until somebody happens to scroll back. `observe_mentions()`
 turns it into a DM carrying the group, who sent it, their numeric id, the time
 and the message itself — enough not to have to open the group at all.
 
-Watched in `MENTION_CHATS`, which defaults to the four `CASHOUT_ROUTES`
+Watched in `MENTION_CHATS`, which defaults to the six `CASHOUT_ROUTES`
 endpoints (both chime groups, both handling groups). The VENMO targets are
 deliberately out. Both id spellings are matched.
 

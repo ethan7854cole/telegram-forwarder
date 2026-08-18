@@ -49,6 +49,12 @@ FORWARD_RULES = {
 # people in these chats are ignored even if they match a keyword.
 BOT_ONLY_SOURCES = {
     -1002335630148,
+    # Added with the venmo cashout route on 2026-08-18, for the same reason
+    # Chime Rev is here: the moment a group also HANDLES cashouts, people talk
+    # in it. A crew member pasting a payment notification by hand - or quoting
+    # one back while discussing it - would otherwise be forwarded and booked as
+    # a fresh deposit. Only the notification bot's own posts count.
+    -1004298140797,
 }
 
 # ---------------------------------------------------------------------------
@@ -690,7 +696,8 @@ def _parse_cashout_routes(raw):
 CASHOUT_ROUTES = _parse_cashout_routes(os.getenv(
     'CASHOUT_ROUTES',
     '-5350880041:-1003894781195,'        # CHIME PICCASO -> MH X LARRY GROUP 2
-    '-5580596463:-1002335630148'))       # CHIME GAFFER  -> Chime Rev & out no-7
+    '-5580596463:-1002335630148,'        # CHIME GAFFER  -> Chime Rev & out no-7
+    '-5100231154:-1004298140797'))       # GAFFER VENMO  -> MH x LARRY VENMO
 
 # Reverse lookup, for recognising a message posted in a handling group.
 _CASHOUT_HANDLERS = {route['handling']: source
