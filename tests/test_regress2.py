@@ -3,6 +3,7 @@ import asyncio, os, sys
 from datetime import datetime, timedelta, timezone
 
 os.environ['TELEGRAM_BOT_TOKEN'] = '111222:FAKE'
+os.environ.setdefault('PAUSED_CHATS', '')      # both routes live here - see run.py
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import forwarder as f
 
@@ -68,6 +69,54 @@ async def main():
     check('and PICCASO VENMO is not fed at all',
           not any(c == PVENMO for c, _ in sent), str(sent))
     check('so one payment moves one set of books', len(sent) == 1, str(sent))
+
+    # -- ...but PICCASO VENMO keeps its books ---------------------------------
+    # What it stopped getting is FORWARDS. The group is still there, the same
+    # people are in it, and its figures are still Ethan's and Larry's to
+    # correct - exactly as in GAFFER VENMO and CHIME GAFFER.
+    reset()
+    f._ledger[PVENMO] = {'in': 1000.0, 'out': 200.0}
+    await f.ledger_command(M(PVENMO, '/add 500', LARRY))
+    check('/add still works in PICCASO VENMO',
+          f.ledger_snapshot(PVENMO) == (1500.0, 200.0), str(f.ledger_snapshot(PVENMO)))
+    posted = [t for c, t in sent if c == PVENMO]
+    check('and still posts both totals there',
+          posted and 'Total In' in posted[-1] and 'Total Out' in posted[-1], str(sent))
+    check('in the shape a redeploy can read back',
+          posted and f.parse_totals(posted[-1]) == (1500.0, 200.0), str(posted))
+
+    reset()
+    f._ledger[PVENMO] = {'in': 1500.0, 'out': 200.0}
+    await f.ledger_set_command(M(PVENMO, '/set out 900', LARRY))
+    check('/set still works in PICCASO VENMO',
+          f.ledger_snapshot(PVENMO) == (1500.0, 900.0), str(f.ledger_snapshot(PVENMO)))
+
+    # The half that is easy to forget: books that are not read back are books
+    # the next deploy silently reverts. The commands and the recovery have to
+    # cover the same groups or the figures lie until Railway restarts.
+    asked = []
+
+    async def note_recovery(client, target):
+        asked.append(target)
+
+    real_recover = f.recover_one_ledger
+    f.recover_one_ledger = note_recovery
+    try:
+        await f.recover_ledgers(None)
+    finally:
+        f.recover_one_ledger = real_recover
+    check('a redeploy recovers PICCASO VENMO too', PVENMO in asked, str(asked))
+    check('and every group whose books can be moved',
+          set(asked) == set(f.LEDGER_CHATS), f"{sorted(asked)} vs {sorted(f.LEDGER_CHATS)}")
+
+    # -- a source group still cannot reach the books --------------------------
+    # Chime Rev rather than MH X LARRY GROUP 2 on purpose: the latter ships out
+    # of service, so it would pass this for the wrong reason whenever the suite
+    # is run on its own rather than through run.py.
+    reset()
+    await f.ledger_command(M(CHIMEREV, '/add 500', LARRY))
+    check('/add in a source group still does nothing',
+          CHIMEREV not in f._ledger and sent == [], f"{f._ledger} {sent}")
 
     # -- IN milestone still fires -------------------------------------------
     reset()

@@ -17,7 +17,7 @@ python3 tests/run.py            # all suites
 python3 tests/run.py cashout    # only matching suites
 ```
 
-1123 checks across 30 suites, all stubbed — nothing touches Telegram, the
+1132 checks across 30 suites, all stubbed — nothing touches Telegram, the
 network, or the live groups. They cover the pre-existing behaviour as well as
 the new, so they are the guard against a change quietly altering something that
 already worked.
@@ -52,8 +52,14 @@ a group out of service" below.
 **MH x LARRY VENMO feeds GAFFER VENMO only**, as of 2026-08-18. It fanned out
 to PICCASO VENMO as well until then, so one payment moved two groups' books;
 the venmo side now matches the chime side, where each source feeds exactly one
-target. PICCASO VENMO is not fed, swept, recovered or ledger-commandable any
-more — it is still redacted, see `FORMER_TARGETS`.
+target.
+
+What PICCASO VENMO stopped getting is **forwards** — not its books and not its
+rules. It is no longer fed or swept, but `/add`, `/out` and `/set` still work
+there, its confirmations still carry both totals, `recover_ledgers()` still
+reads them back after a deploy, and crew names are still stripped on the way
+in. `FORMER_TARGETS` is what keeps all of that true; see `LEDGER_CHATS` and
+`REDACTED_CHATS`.
 
 `FORWARD_RULES` drives the first. `CASHOUT_ROUTES` drives the second, and is
 deliberately a **separate table** — putting the pairs in `FORWARD_RULES` would
@@ -114,6 +120,10 @@ nothing.
   redeploy reverts it. See `book_cashout_out()` for the pattern.
 - **Never commit the ledger before the message carrying it has been sent.** The
   books must not run ahead of what the group can see.
+- **The ledger commands and `recover_ledgers()` must cover the same groups** —
+  both read `LEDGER_CHATS`. A group where `/add` works but recovery does not
+  would show figures the next redeploy silently reverts, which is the failure
+  every other rule here exists to prevent. Pinned by `test_regress2.py`.
 - **The ledger follows wherever the `/out` was posted**, never the source —
   otherwise one group's books move while another group displays the figures,
   and both end up wrong.

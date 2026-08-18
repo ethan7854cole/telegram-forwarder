@@ -17,6 +17,7 @@ import sys
 from datetime import datetime, timezone
 
 os.environ['TELEGRAM_BOT_TOKEN'] = '111222:FAKE'
+os.environ.setdefault('PAUSED_CHATS', '')      # both routes live here - see run.py
 os.environ['TELEGRAM_API_ID'] = '12345'
 os.environ['TELEGRAM_API_HASH'] = 'fakehash'
 os.environ['TELETHON_START_DELAY'] = '0'

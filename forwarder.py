@@ -315,17 +315,24 @@ LEDGER_ADMINS = {7418675217, 7578145913}
 # Every chat that receives forwards.
 TARGET_CHATS = {t for targets in FORWARD_RULES.values() for t in targets}
 
-# Groups that must never see a crew name even though nothing is routed to them
-# any more. PICCASO VENMO stopped being fed on 2026-08-18, but it is still a
-# live group with the same people reading it - and redaction is about who is
-# reading, not about which table an id happens to be in today. Nothing sends
-# there now, so this guards a path that does not exist; that is the point, and
-# it costs one set lookup. A group put back into FORWARD_RULES is covered by
+# Groups the bot still keeps for, though nothing is routed to them any more.
+# PICCASO VENMO stopped being fed on 2026-08-18 and is still a live group with
+# the same people in it, so what it stops getting is FORWARDS - not its books
+# and not its rules. A group put back into FORWARD_RULES is covered by
 # TARGET_CHATS again automatically, so nothing here needs undoing.
 FORMER_TARGETS = {-5306739731}                      # PICCASO VENMO
 
-# What send_group() scrubs on the way out - see strip_identities().
+# What send_group() scrubs on the way out - see strip_identities(). Redaction
+# follows who is READING a group, not which table its id is in today, and the
+# audience of a group that stopped being fed has not changed at all.
 REDACTED_CHATS = TARGET_CHATS | FORMER_TARGETS
+
+# Whose books the bot keeps: /add, /out and /set, and the recovery that reads
+# them back after a deploy. The two belong together and must never be split -
+# a group where the commands work but recovery does not would show figures the
+# next redeploy silently reverts, which is the one thing the ledger rules exist
+# to prevent. Payments arriving is a separate question from books being kept.
+LEDGER_CHATS = TARGET_CHATS | FORMER_TARGETS
 
 BOT_ID = int(BOT_TOKEN.split(':')[0]) if BOT_TOKEN and ':' in BOT_TOKEN else None
 
@@ -3523,7 +3530,10 @@ async def ledger_command(message):
     await cashout_from_bot_api(message)
 
     # Silent in source groups and DMs, so the source side cannot reach the books.
-    if chat_id not in TARGET_CHATS:
+    # LEDGER_CHATS rather than TARGET_CHATS: a group that stopped receiving
+    # forwards still keeps its books, and they are still Ethan's and Larry's to
+    # correct.
+    if chat_id not in LEDGER_CHATS:
         return
 
     if user_id not in LEDGER_ADMINS:
@@ -3900,7 +3910,7 @@ async def ledger_set_command(message):
     if chat_paused(chat_id):
         return
 
-    if chat_id not in TARGET_CHATS:
+    if chat_id not in LEDGER_CHATS:
         return
 
     if user_id not in LEDGER_ADMINS:
@@ -5240,8 +5250,12 @@ async def recover_ledgers(client):
 
     Railway wipes the filesystem on every deploy, so the books cannot live on
     disk. They live in the messages themselves: the bot's own posts carry the
-    figures, so reading the newest one back restores the running totals."""
-    for target in sorted(TARGET_CHATS):
+    figures, so reading the newest one back restores the running totals.
+
+    LEDGER_CHATS, not TARGET_CHATS: a group that no longer receives forwards
+    keeps its books, and books that are not read back are books that revert on
+    the next deploy."""
+    for target in sorted(LEDGER_CHATS):
         await recover_one_ledger(client, target)
 
 

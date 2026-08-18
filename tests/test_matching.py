@@ -21,6 +21,7 @@ import sys
 from datetime import datetime, timezone
 
 os.environ['TELEGRAM_BOT_TOKEN'] = '111222:FAKE'
+os.environ.setdefault('PAUSED_CHATS', '')      # both routes live here - see run.py
 os.environ.setdefault('CASHOUT_TIMEOUT_MINUTES', '5')
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

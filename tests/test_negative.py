@@ -2,6 +2,7 @@
 import asyncio, os, sys
 
 os.environ['TELEGRAM_BOT_TOKEN'] = '111222:FAKE'
+os.environ.setdefault('PAUSED_CHATS', '')      # both routes live here - see run.py
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import forwarder as f
 
