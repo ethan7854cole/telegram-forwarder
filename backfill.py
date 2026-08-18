@@ -143,6 +143,33 @@ async def resolve_chat(client, ref, label):
                      f"   Re-run with --{label.lower()} and an exact numeric id.")
 
 
+def load_guards():
+    """Borrow forwarder.py's own redaction rather than keeping a second copy.
+
+    A backfill posts into the same groups the live path does, so it has to obey
+    the same rule: no crew handle, and no @username of any kind, reaches a
+    chime or VENMO group. Writing that logic out again here would be the second
+    list somebody forgets to update - so the real one is imported.
+
+    forwarder.py cannot be imported without a bot token, which a dry run does
+    not need. That is fine: a dry run posts nothing, and the only mode that
+    does need this is --send, which requires the token anyway. The fallback
+    still strips every @handle, so the worst case is losing the bare-name half
+    of the rule on a run that sends nothing."""
+    try:
+        from forwarder import strip_identities, chat_paused
+        return strip_identities, chat_paused
+    except Exception as e:
+        print(f"   ⚠️  using the simple redactor ({type(e).__name__}) - "
+              "@handles only")
+        return (lambda text: _HANDLE_RE.sub('', text or '').strip() or text,
+                lambda chat_id: False)
+
+
+# Same shape as forwarder's, for the fallback above only.
+_HANDLE_RE = re.compile(r'(?<![\w@])@[A-Za-z][A-Za-z0-9_]{3,31}')
+
+
 async def send_with_retry(bot, chat_id, text, attempts=4):
     for attempt in range(attempts):
         try:
@@ -251,11 +278,24 @@ async def main():
         return
 
     print(f"\nSending {len(picked)} message(s) via bot token...")
+    redact, paused = load_guards()
+
+    # A group taken out of service is silent, and a backfill is not an
+    # exception to that - it is exactly the kind of thing somebody would run
+    # without remembering the group is paused.
+    if paused(dst_id):
+        raise SystemExit(f"❌ {getattr(dst, 'title', dst_id)} is OUT OF SERVICE. "
+                         "Put it back with /group on before backfilling into it.")
+
     bot = AsyncTeleBot(bot_token)
     ok = 0
     for i, (_, _, out) in enumerate(picked, 1):
-        print(f"   {i}/{len(picked)}")
-        if await send_with_retry(bot, dst_id, out):
+        clean = redact(out)
+        if clean != out:
+            print(f"   {i}/{len(picked)}  (a name was taken out)")
+        else:
+            print(f"   {i}/{len(picked)}")
+        if await send_with_retry(bot, dst_id, clean):
             ok += 1
         await asyncio.sleep(args.delay)
 

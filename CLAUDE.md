@@ -17,7 +17,7 @@ python3 tests/run.py            # all suites
 python3 tests/run.py cashout    # only matching suites
 ```
 
-1132 checks across 30 suites, all stubbed — nothing touches Telegram, the
+1147 checks across 30 suites, all stubbed — nothing touches Telegram, the
 network, or the live groups. They cover the pre-existing behaviour as well as
 the new, so they are the guard against a change quietly altering something that
 already worked.
@@ -570,7 +570,7 @@ arrived in `CHIME GAFFER`.
 - Bounded by `ALBUM_MEMORY` (40 albums) and `ALBUM_RELAY_SECONDS` (180).
   Reproduced by `tests/test_album.py`.
 
-## No crew name ever reaches a target group
+## Neither side ever learns the other's people
 
 `copy_message` strips what *Telegram* attaches. It cannot strip what a person
 typed, and the crew do write "sent by @Maynuddin23" on their own screenshots.
@@ -602,6 +602,25 @@ The chime and VENMO groups are told figures, never who moved them.
   handling groups are tagged with those exact handles on every request, and the
   DM naming who is stuck would be worthless redacted. Both are pass-throughs
   and both are tested.
+
+**The rule runs BOTH ways** (2026-08-18). Everything above keeps crew names out
+of the chime groups; `strip_foreign_handles()` keeps chime names away from the
+crew. That half had no guard at all: a `CASHOUT REQUEST` is written on the chime
+side and forwarded **verbatim**, so `asked by @gaffer_boss` typed there landed
+in front of the crew, and again in their 10-minute chase DM.
+
+- **Cleaned on the way IN, not at the door.** `open_cashout_request()` and
+  `cashout_crew_dm_text()`. It cannot live at `send_group()` like the other
+  direction, because the crew tag line the bot adds itself is made of the very
+  @handles that must survive.
+- **Only `@handles` go on this side.** The figure, the cashtag and the
+  customer's name are the whole of what the crew are being asked to act on — a
+  request stripped of those is a cashout nobody can pay.
+- **Ethan and Larry are the exception in both directions.** Their notices keep
+  every name and all the routing, which is what makes them the ones who can
+  chase anything.
+- Any new path carrying text between the two sides needs this considered again:
+  the door only guards what leaves, never what arrives.
 
 ## Marking a cashout done
 

@@ -1648,6 +1648,35 @@ def strip_identities(text, username=None, full_name=None):
     return cleaned or '/out'
 
 
+def strip_foreign_handles(text):
+    """Take every @username out of something crossing INTO a handling group.
+
+    The other half of the rule above, and the half that had no guard until
+    2026-08-18. `strip_identities()` stops a crew handle reaching a chime
+    group; this stops a chime handle reaching the crew. The two sides never
+    learn each other's people, in either direction.
+
+    The leak was the request itself. A CASHOUT REQUEST is written in a chime
+    group and forwarded verbatim, so "asked by @gaffer_boss" typed there put
+    that name straight in front of the crew - and the same text goes out again
+    in their chase DM.
+
+    ONLY @handles go. The figure, the cashtag and the customer's name are the
+    whole of what the crew are being asked to act on, and a request stripped of
+    those is a cashout nobody can pay. That is also why this cannot live at the
+    outbound door the way redaction does: the crew tag line the bot adds itself
+    is made of the very @handles that must survive, so the cleaning belongs to
+    the text coming IN, not to the message going out."""
+    if not text:
+        return text
+
+    cleaned = _HANDLE_RE.sub('', text)
+    cleaned = re.sub(r'[ \t]{2,}', ' ', cleaned)
+    cleaned = re.sub(r'[ \t]+(\r?\n)', r'\1', cleaned)
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    return cleaned.strip() or text
+
+
 # A cashtag, never an amount: $jenny-buhr and $Hawkins-Floral-Decor match,
 # $500 does not, because the character after the $ must be a letter.
 _CASHTAG_RE = re.compile(r'\$[A-Za-z][\w.\-]*')
@@ -1880,7 +1909,11 @@ async def open_cashout_request(source, text, sent_at, origin_msg_id):
               f"{chat_name(handling)} - not posting a second copy", flush=True)
         return
 
-    body = f"{correct_timestamp(text, sent_at)}\n\n{crew_mentions(handling)}"
+    # The request is written on the chime side and travels verbatim, so it is
+    # cleaned on the way in - see strip_foreign_handles(). The tag line is
+    # added AFTER, because those handles are the point of the message.
+    body = (f"{strip_foreign_handles(correct_timestamp(text, sent_at))}"
+            f"\n\n{crew_mentions(handling)}")
     try:
         sent = await send_group(handling, body)
     except Exception as e:
@@ -2703,9 +2736,14 @@ def cashout_crew_dm_text(request, waited_minutes):
 
     No group names and no 'waiting in' line - which groups a request moved
     between is not something they need, and the handling group is where they are
-    already being tagged anyway."""
+    already being tagged anyway.
+
+    Cleaned like the group post, and for the same reason: this carries the
+    request text, so an @ typed on the chime side would reach the crew here
+    even though it was taken out of the group copy. The admins' notices keep
+    it - names and routing are theirs."""
     return (f"⏰ OUT REQUEST HAS CROSSED {_humanise(waited_minutes)} TIMEFRAME\n\n"
-            f"{_cashout_preview(request)}\n\n"
+            f"{strip_foreign_handles(_cashout_preview(request))}\n\n"
             "This is still waiting on a /out. Please action it.")
 
 

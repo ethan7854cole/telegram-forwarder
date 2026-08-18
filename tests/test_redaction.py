@@ -138,6 +138,75 @@ async def main():
     check('the request forward still tags the crew',
           posted and '@Maynuddin23' in posted[0], str(posted))
 
+    # -- 5. the OTHER direction: no chime handle reaches the crew -----------
+    # The rule runs both ways. Sections 1-3 keep crew names out of the chime
+    # groups; this keeps chime names away from the crew. The request is written
+    # on the chime side and travels verbatim, so an @ typed there used to land
+    # in front of the crew - and again in their chase DM.
+    reset()
+    await f.observe_cashout(
+        GAFFER, 'CASHOUT REQUEST $500 for Gabriel W.\n'
+                'asked by @gaffer_boss pay to $jenny-buhr', 902, now, user_id=42)
+    posted = [t for c, t in sent if c == CHIMEREV]
+    check('a chime handle never reaches the handling group',
+          posted and '@gaffer_boss' not in posted[0], str(posted))
+    check('while the crew tag line survives untouched',
+          posted and '@Maynuddin23' in posted[0] and '@NPR_CA' in posted[0],
+          str(posted))
+    check('and everything needed to pay it survives',
+          posted and '$500' in posted[0] and '$jenny-buhr' in posted[0]
+          and 'Gabriel W.' in posted[0], str(posted))
+
+    # The same text goes out again in the crew's chase DM.
+    request = f._pending_cashouts[CHIMEREV][0]
+    crew_dm = f.cashout_crew_dm_text(request, 10)
+    check('nor reaches them in the chase DM', '@gaffer_boss' not in crew_dm, crew_dm)
+    check('which still says what is owed', '$500' in crew_dm, crew_dm)
+
+    # Ethan and Larry are the exception, exactly as everywhere else.
+    admin_dm = f.cashout_admin_dm_text(request, CHIMEREV, 5)
+    check('but the admins still see who asked',
+          '@gaffer_boss' in admin_dm, admin_dm)
+
+    # A request that is nothing BUT a handle must not be emptied to nothing.
+    check('a request stripped to nothing keeps its original text',
+          f.strip_foreign_handles('@someone') == '@someone',
+          f.strip_foreign_handles('@someone'))
+
+    # -- 6. a username inside a "You received" is ignored -------------------
+    # A payment notification is forwarded on the same path as everything else,
+    # so the door cleans it - but the payment itself must still land and still
+    # book. Dropping the message would lose real money over a name.
+    reset()
+    f._ledger[GAFFER] = {'in': 100.0, 'out': 20.0}
+    await f.process_incoming(
+        CHIMEREV,
+        'You received $38.0 from @maynuddin233\n'
+        'Total In : 6947.82$\nTotal Out: 195.00$',
+        'test', from_bot=True, source_msg_id=77)
+    landed = [t for c, t in sent if c == GAFFER]
+    check('a handle inside a payment never reaches the chime group',
+          landed and '@maynuddin233' not in landed[0], str(landed))
+    check('but the payment is still delivered',
+          landed and 'You received $38.0' in landed[0], str(landed))
+    check('and still booked', f.ledger_snapshot(GAFFER)[0] == 138.0,
+          str(f.ledger_snapshot(GAFFER)))
+
+    # -- 7. the manual backfill obeys the same rules -----------------------
+    # It posts into the same groups with the same token, and it is exactly the
+    # tool somebody reaches for in a hurry. It borrows forwarder's own
+    # redaction rather than keeping a second copy that can drift.
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import backfill
+    redact, paused = backfill.load_guards()
+    check('backfill uses the real redactor, not a copy',
+          redact is f.strip_identities, str(redact))
+    check('so a handle cannot ride a backfill into a group',
+          '@maynuddin233' not in redact('You received $38.0 from @maynuddin233'),
+          redact('You received $38.0 from @maynuddin233'))
+    check('and it knows which groups are out of service',
+          paused is f.chat_paused, str(paused))
+
     # -- 5. through the REAL payment path ----------------------------------
     # A payment notification is rewritten and forwarded to a target group. If a
     # handle is anywhere in it, it must not survive the trip.
