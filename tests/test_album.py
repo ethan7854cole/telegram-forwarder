@@ -23,7 +23,7 @@ import forwarder as f
 
 PICCASO, GAFFER = -5350880041, -5580596463
 MHLARRY, CHIMEREV = -1003894781195, -1002335630148
-CREW, LARRY, ETHAN = 77, 7418675217, 7578145913
+CREW, LARRY, ETHAN = 77, f.LARRY_ID, f.ETHAN_ID
 
 sent, copies, dms, reactions = [], [], [], []
 _next_id = [8000]
@@ -172,7 +172,7 @@ async def main():
 
     # -- the parity route behaves the same ------------------------------------
     reset()
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $75', 906,
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 75', 906,
                             datetime.now(timezone.utc), user_id=42)
     await f.observe_cashout(MHLARRY, '/out 75', 970, datetime.now(timezone.utc),
                             user_id=CREW, username='Maynuddin23',

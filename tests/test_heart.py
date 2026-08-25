@@ -8,7 +8,7 @@ that already went.
 
 Placing it can fail for reasons that have nothing to do with this bot's logic:
 the bot not being an administrator in the group, or the group restricting which
-reactions may be used. This suite pins what happens then - Ethan is told, with
+reactions may be used. This suite pins what happens then - the admin account is told, with
 the error, and the money side is reported as already done so nobody pays twice.
 
 Nothing here touches Telegram or the network.
@@ -26,7 +26,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import forwarder as f
 
 PICCASO, MHLARRY = -5350880041, -1003894781195
-ETHAN = f.ADMIN_ID
+# notify_admin() goes to the bot-owner account (Larry's), not to
+# @ethannxxxx. Both belong to the same person; ADMIN_ID is the authority.
+ADMIN = f.ADMIN_ID
 
 sent, dms, reactions, user_reactions = [], [], [], []
 
@@ -108,7 +110,7 @@ f._resolve_one = _resolve_ok
 
 
 def admin_alerts():
-    return [t for c, t in dms if c == ETHAN and 'could NOT be marked' in t]
+    return [t for c, t in dms if c == ADMIN and 'could NOT be marked' in t]
 
 
 async def main():
@@ -118,7 +120,7 @@ async def main():
     reset()
     ok = await f.heart_request(PICCASO, 901)
     check('the heart is placed', ok is True and reactions == [(PICCASO, 901)], str(reactions))
-    check('and Ethan is not told about a success', admin_alerts() == [], str(dms))
+    check('and the admin account is not told about a success', admin_alerts() == [], str(dms))
 
     # -- 2. the request was deleted - benign, and still no alert ------------
     # Nothing left to mark is not a failure. Alerting here would page Ethan
@@ -133,7 +135,7 @@ async def main():
     ok = await f.heart_request(PICCASO, 903)
     check('a rights failure reports failure', ok is False)
     alerts = admin_alerts()
-    check('Ethan is told exactly once', len(alerts) == 1, str(dms))
+    check('the admin account is told exactly once', len(alerts) == 1, str(dms))
     if alerts:
         body = alerts[0]
         check('the alert names the group', f.chat_name(PICCASO) in body, body)
@@ -153,15 +155,15 @@ async def main():
     ok = await f.heart_request(PICCASO, 904)
     check('the user account places it instead', ok is True)
     check('and it really went through the account', len(user_reactions) == 1)
-    check('so Ethan is not told', admin_alerts() == [], str(dms))
+    check('so the admin account is not told', admin_alerts() == [], str(dms))
 
-    # -- 5. both routes fail - Ethan is told, naming both -------------------
+    # -- 5. both routes fail - the admin account is told, naming both -------------------
     reset(react_error='Bad Request: not enough rights to manage reactions',
           userbot=True, userbot_fails=True)
     ok = await f.heart_request(PICCASO, 905)
     check('both failing reports failure', ok is False)
     alerts = admin_alerts()
-    check('Ethan is told', len(alerts) == 1, str(dms))
+    check('the admin account is told', len(alerts) == 1, str(dms))
     if alerts:
         check('the alert reports the bot error',
               'not enough rights' in alerts[0], alerts[0])
@@ -173,7 +175,7 @@ async def main():
     # booked whatever the reaction does; the mark is the last step and the least
     # important one. Failing it must not strand a real cashout.
     reset(react_error='Bad Request: not enough rights to manage reactions')
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $25 $jenny-buhr', 910, now,
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 25', 910, now,
                             user_id=42)
     sent.clear()
     await f.observe_cashout(MHLARRY, '/out 25', 911, now,
@@ -183,7 +185,7 @@ async def main():
     check('the request is still closed', MHLARRY not in f._pending_cashouts)
     check('Total Out is still booked', f.ledger_snapshot(PICCASO)[1] == 25.0,
           str(f.ledger_snapshot(PICCASO)))
-    check('and Ethan is told the mark is missing', len(admin_alerts()) == 1, str(dms))
+    check('and the admin account is told the mark is missing', len(admin_alerts()) == 1, str(dms))
 
     # -- 7. the heart does not depend on userbot MESSAGING ------------------
     # Reacting is not sending. USERBOT_SEND=0 keeps the account from posting
@@ -195,7 +197,7 @@ async def main():
     ok = await f.heart_request(PICCASO, 906)
     check('the heart still lands with userbot messaging off', ok is True)
     check('placed through the account', len(user_reactions) == 1)
-    check('and Ethan is not troubled about it', admin_alerts() == [], str(dms))
+    check('and the admin account is not troubled about it', admin_alerts() == [], str(dms))
     f.USERBOT_SEND = False
 
     # ...and USERBOT_REACT=0 is the way to genuinely turn it off.

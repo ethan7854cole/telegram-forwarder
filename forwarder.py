@@ -23,7 +23,35 @@ from telethon.tl.types import MessageMediaWebPage, ReactionEmoji
 # Read token directly from Railway variables
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 
-ADMIN_ID = 7578145913
+# VERIFIED against Telegram's getChat on 2026-08-25, because the labels on
+# these two numbers were the wrong way round everywhere - in the code, in the
+# tests and in CLAUDE.md - and nothing had ever checked them:
+#
+#   7578145913  first_name 'Larry'  @Larryyxx
+#   7418675217  first_name 'Ethan'  @ethannxxxx
+#
+# Both accounts belong to the SAME person, so nothing ever reached a stranger.
+# It still mattered: _user_ids below seeded each handle with the OTHER one's
+# id, so on every fresh boot - and Railway wipes memory on every deploy - a DM
+# addressed to @larryyxx arrived on the @ethannxxxx account and vice versa.
+# The Larry account is the one that is actually IN the handling groups, so the
+# "send the screenshot" notices were landing on the account that cannot see the
+# group they are about. It self-healed once either account spoke in a watched
+# chat (remember_user), which is exactly the window after a deploy.
+#
+# Named constants, so a future reader never has to hold the numbers in their
+# head. Do not re-inline them.
+LARRY_ID = 7578145913        # @Larryyxx - the bot owner account
+ETHAN_ID = 7418675217        # @ethannxxxx - the personal account
+
+# Who notify_admin() reaches: the operational alerts - forwarding is down, a
+# send failed, a ❤ could not be placed, catch-up left something behind.
+#
+# LARRY, deliberately, confirmed 2026-08-25: both accounts belong to the same
+# person, and the bot owner is the Larry one. The comments throughout this file
+# that say "Ethan is told" are loose shorthand for "the admin account" - they
+# do not mean @ethannxxxx, and this line is the authority, not them.
+ADMIN_ID = int(os.getenv('ADMIN_ID') or LARRY_ID)
 KEYWORDS = ['You received']
 
 FORWARD_RULES = {
@@ -322,7 +350,7 @@ MILESTONE_MENTIONS = os.getenv('MILESTONE_MENTIONS', '@ethannxxxx @Larryyxx')
 
 # Only these accounts may move the numbers. Numeric ids, so a username change
 # can neither break nor hijack it. @ethannxxxx and @Larryyxx.
-LEDGER_ADMINS = {7418675217, 7578145913}
+LEDGER_ADMINS = {ETHAN_ID, LARRY_ID}
 
 # Every chat that receives forwards.
 TARGET_CHATS = {t for targets in FORWARD_RULES.values() for t in targets}
@@ -807,6 +835,15 @@ CASHOUT_GROUP_CREW = _parse_group_crew(os.getenv(
 # needs to know the moment there is something to send.
 CASHOUT_PROGRESS_HANDLES = _handle_list(
     os.getenv('CASHOUT_PROGRESS_DM_HANDLES', 'larryyxx'))
+
+# Asked of the crew when a request they are already holding CHANGES, and only
+# then. Telegram is where the work happens, but an edit is the one event that
+# can be missed by somebody who has already read the request and moved on - so
+# it is also the one worth a second channel. Deliberately names nobody: the crew
+# know who they are texting, and the two sides never learn each other's people.
+# Set CASHOUT_SIGNAL_NOTE= (empty) to drop the line.
+CASHOUT_SIGNAL_NOTE = os.getenv(
+    'CASHOUT_SIGNAL_NOTE', 'Please text us on Signal as well to confirm.')
 
 # How long a request may sit before the first chase, and the master switch for
 # the whole ladder: 0 disables chasing altogether.
@@ -1315,7 +1352,9 @@ def remember_delivery(source_key, target, message_id, amount):
 # @username -> numeric id. A bot can only DM an id, so the ones we know are
 # seeded here and the rest are learned the first time that person speaks in a
 # watched chat. @Larryyxx and @ethannxxxx, matching LEDGER_ADMINS.
-_user_ids = {'larryyxx': 7418675217, 'ethannxxxx': ADMIN_ID}
+# Seeded so the two of them are reachable before either has spoken. Both were
+# pointed at the wrong person until 2026-08-25 - see LARRY_ID above.
+_user_ids = {'larryyxx': LARRY_ID, 'ethannxxxx': ETHAN_ID}
 
 # Set once the userbot knows who it is, so it never DMs its own account.
 _userbot_username = ''
@@ -1612,6 +1651,69 @@ def _crew_identifiers():
     return {w for w in words if w}
 
 
+# Whose word counts as Ethan's or Larry's when the numeric id is not to hand.
+# Ids first and always - a username can be changed by its owner, an id cannot.
+ADMIN_HANDLES = {h.lower() for h in
+                 (CASHOUT_ADMIN_HANDLES + MENTION_WATCH_HANDLES) if h}
+
+
+def mentions_crew(text):
+    """Does this text name any of the crew?
+
+    Both spellings, exactly as strip_identities() treats them: "@Maynuddin23"
+    and a bare "Maynuddin23" are the same person being addressed, and a rule
+    that only saw the @ would be worked around by accident the first time
+    somebody typed a name without one.
+
+    Read from _crew_identifiers(), so a crew member added to any of the four
+    config lists is covered here with no second list to keep in step."""
+    if not text:
+        return False
+    lowered = text.lower()
+    for handle in _crew_identifiers():
+        # Same word-boundary rule as the redaction: "maynuddin23" must not
+        # match inside "maynuddin233", and "@x" inside an email address is not
+        # a mention of x.
+        if re.search(r'(?<![\w@])@?' + re.escape(handle) + r'(?!\w)', lowered):
+            return True
+    return False
+
+
+def is_admin_crew_note(text, user_id=None, username=None):
+    """Ethan or Larry tagging the crew: chatter about the work, not the work.
+
+    They talk to the crew in these groups - chasing a request, asking about
+    one, quoting one back. Every word of that lands in a chat the bot is also
+    reading for traffic, and two of those words are the ones it routes on. So
+    "@Maynuddin23 what happened to that CASHOUT REQUEST" opened a second,
+    duplicate request and started the whole escalation ladder over a question,
+    and "@Maynuddin23 he says he never got the 200 you received" was forwarded
+    into a chime group as a payment notification.
+
+    Two conditions, both required:
+
+      - Ethan or Larry wrote it. Nobody else's message is touched, so a real
+        request from a chime group is unaffected however it is worded.
+      - It names the crew. Their own /out, /add and ordinary posts still work
+        exactly as before - this only catches a message addressed AT the crew.
+
+    The second condition is not arbitrary. The two sides of a route never learn
+    each other's people (see strip_identities and strip_foreign_handles), so a
+    crew handle appearing in a chime group cannot have come from a customer -
+    it can only be one of ours talking about the job.
+
+    Identification is POSITIVE only. An unattributed post - Telegram credits a
+    channel's messages to the channel, and an anonymous admin's to the group -
+    is not treated as theirs, because guessing the other way would let this
+    swallow a genuine notification. In MH X LARRY GROUP 2, which is a channel,
+    an anonymous admin post is therefore still read as ordinary traffic."""
+    if user_id is not None and user_id in LEDGER_ADMINS:
+        return mentions_crew(text)
+    if user_id is None and (username or '').lower().lstrip('@') in ADMIN_HANDLES:
+        return mentions_crew(text)
+    return False
+
+
 def strip_identities(text, username=None, full_name=None):
     """Take every crew handle and name out of something bound for a chime group.
 
@@ -1743,6 +1845,36 @@ async def send_group(chat_id, text, **kwargs):
     if chat_id in REDACTED_CHATS:
         text = strip_identities(text)
     return await bot.send_message(chat_id, text, **kwargs)
+
+
+async def edit_group(chat_id, message_id, text, **kwargs):
+    """Rewrite something the bot already posted. The same door, same guards.
+
+    A separate function rather than a flag on send_group() because the failure
+    modes are different and the caller has to be able to tell them apart: the
+    message may be gone, or Telegram may refuse an edit that changes nothing.
+    Neither is worth an alert, and neither is a reason to skip whatever the
+    caller was going to do next.
+
+    Returns True if the group now shows the new text."""
+    if chat_paused(chat_id):
+        print(f"⏸️ [PAUSED] not editing in {chat_name(chat_id)}", flush=True)
+        return False
+
+    if chat_id in REDACTED_CHATS:
+        text = strip_identities(text)
+    try:
+        await bot.edit_message_text(text, chat_id=chat_id,
+                                    message_id=message_id, **kwargs)
+        return True
+    except Exception as e:
+        # "message is not modified" means the group already shows this text,
+        # which is the outcome asked for - not a failure.
+        if 'not modified' in str(e).lower():
+            return True
+        print(f"⚠️ [EDIT] could not rewrite {message_id} in "
+              f"{chat_name(chat_id)}: {e}", flush=True)
+        return False
 
 
 async def dm_handles(handles, text, receipts=None):
@@ -1999,6 +2131,89 @@ async def open_cashout_request(source, text, sent_at, origin_msg_id):
     await warn_unreachable(missed)
 
 
+def find_open_request(handling, origin_msg_id):
+    """The open request that came from THIS message in the chime group.
+
+    Matched on the origin id rather than on the text, because the text is
+    exactly what an edit changes."""
+    for request in _pending_cashouts.get(handling, []):
+        if request.get('origin_msg_id') == origin_msg_id:
+            return request
+    return None
+
+
+async def update_cashout_request(source, request, text, sent_at):
+    """The request was edited in the chime group after it was forwarded.
+
+    Two things have to happen, and the second is the one that matters. The copy
+    in the handling group is rewritten, so nobody reading back is looking at a
+    figure that no longer stands. Then the crew are tagged again, because a
+    silent rewrite is the dangerous version: they read a request once, and if it
+    changes underneath them the copy they pay is the one they remember.
+
+    The ladder is NOT restarted. It runs on absolute minutes from `opened`, and
+    the money has been waiting since then however many times the wording moved -
+    resetting it would buy an edited request another five minutes of quiet.
+    Nor is an acknowledgement taken back: replaying the rungs already past would
+    post a burst of reminders at once, and the tagged notice this sends is
+    louder than any of them.
+
+    Left alone deliberately: a request that has already been paid. It is out of
+    the queue, the ❤ is on it, and the money has gone - re-tagging the crew over
+    a change to the wording could only ask them to pay it twice."""
+    handling = CASHOUT_ROUTES[source]['handling']
+    before = request['text']
+
+    # The request is written on the chime side and travels verbatim, so it is
+    # cleaned on the way in - identical to open_cashout_request(), because this
+    # has to produce the message that one would have produced.
+    body = (f"{strip_foreign_handles(correct_timestamp(text, sent_at))}"
+            f"\n\n{crew_mentions(handling)}")
+    rewritten = await edit_group(handling, request['message_id'], body)
+
+    # Recorded whether or not the edit landed. Everything downstream reads
+    # request['text'] - the amount the /out is checked against, Larry's
+    # completion notice, the report - and all of that has to follow the request
+    # as it now stands, not as it was first written.
+    request['text'] = text
+    request['fingerprint'] = ' '.join((text or '').split()).lower()
+
+    if not rewritten:
+        # The copy is gone or unreachable. Telling the crew to "read it again"
+        # would point at nothing, so send the request itself instead - they
+        # still have to know what changed.
+        print(f"⚠️ [CASHOUT] {chat_name(source)} request was edited but the copy "
+              f"in {chat_name(handling)} could not be rewritten - reposting it",
+              flush=True)
+        sent = await send_group(handling, body)
+        if sent is not None:
+            request['message_id'] = sent.message_id
+
+    notice = await send_group(handling,
+                              cashout_edited_text(before, text, handling),
+                              reply_to_message_id=request['message_id'])
+    # Goes with the request when it is settled, exactly like a chase does -
+    # otherwise a live tag on the crew outlives the cashout it points at, which
+    # on this flow is how somebody pays twice. Bare message ids, like the
+    # reminders it sits alongside - see delete_group_notice().
+    if notice is not None:
+        request['group_notice'].append(notice.message_id)
+
+    # ...and back to the side that made the change. Sent whatever happened
+    # above: the crew being told and the askers being asked are two separate
+    # obligations, and a failure on one is not a reason to skip the other.
+    await send_group(source, cashout_edited_origin_text(before, text),
+                     reply_to_message_id=request['origin_msg_id'])
+
+    print(f"✏️ [CASHOUT] {chat_name(source)} request edited - "
+          f"{chat_name(handling)} updated, crew told, {chat_name(source)} asked "
+          "to confirm", flush=True)
+
+    missed = await dm_handles(CASHOUT_ADMIN_HANDLES,
+                              cashout_edited_dm_text(request, handling, before))
+    await warn_unreachable(missed)
+
+
 async def book_cashout_out(origin, text):
     """Move the chime group's Total Out by the figure in the /out reply.
 
@@ -2057,6 +2272,153 @@ def cashout_submitted_text(request, handling):
             f"From: {chat_name(request['origin'])}\n"
             f"Sent to: {chat_name(handling)}, crew tagged.\n\n"
             "Waiting on a reaction, then the /out.")
+
+
+# The ONE shape a cashout request may take, fixed 2026-08-25:
+#
+#     !! Cashout Request !!
+#     Tag name : $CelsoValero88
+#     Amount : 150
+#
+# All THREE parts required - the header, the tag and the figure. The keyword on
+# its own is not a request, and treating it as one is what let a message merely
+# TALKING about a cashout open a real one.
+#
+# Tolerant about punctuation and case, strict about the three parts being
+# there. That balance is the whole design: too loose and chatter opens
+# cashouts; too tight and a real request typed slightly differently is dropped
+# in silence, which is far worse - it is money nobody is asked for.
+_REQ_TAG_LINE_RE = re.compile(
+    r'tag(?:\s*name)?\s*[:\-=]\s*(\$?[A-Za-z][\w.\-]*)', re.I)
+_REQ_AMOUNT_LINE_RE = re.compile(
+    r'amount\s*[:\-=]\s*\$?\s*([\d,]+(?:\.\d+)?)', re.I)
+
+
+def is_cashout_request(text):
+    """Does this message have all three parts? Nothing else opens a request."""
+    if not text or CASHOUT_KEYWORD.lower() not in text.lower():
+        return False
+    return bool(_REQ_TAG_LINE_RE.search(text)) and bool(
+        _REQ_AMOUNT_LINE_RE.search(text))
+
+
+def cashout_malformed_text(source, text):
+    """A message carrying the keyword that is NOT a request.
+
+    Sent because the alternative is silence, and silence here looks exactly
+    like a quiet day - which is the failure this whole bot exists to remove. If
+    somebody meant to ask for money and mistyped the shape, nobody finds out
+    until the customer chases."""
+    return ("⚠️ A CASHOUT REQUEST WAS NOT PICKED UP\n\n"
+            f"{' '.join((text or '').split())[:200]}\n\n"
+            f"In: {chat_name(source)}\n\n"
+            "It says Cashout Request but is missing the tag line, the amount "
+            "line, or both — so nothing was forwarded and nobody was tagged.\n\n"
+            "The shape that works:\n"
+            "!! Cashout Request !!\n"
+            "Tag name : $CelsoValero88\n"
+            "Amount : 150")
+
+
+def request_tag(text):
+    """The cashtag a request is asking to be paid to, or None.
+
+    `$jenny-buhr` and `$Hawkins-Floral-Decor` match; `$500` does not, because a
+    letter must follow the $. That is the same rule clean_out_for_relay() uses
+    to decide what survives redaction, and it has to stay the same rule: what
+    the crew are shown is what they should be told has changed."""
+    line = _REQ_TAG_LINE_RE.search(text or '')
+    if line:
+        tag = line.group(1)
+        return tag if tag.startswith('$') else '$' + tag
+    match = _CASHTAG_RE.search(text or '')
+    return match.group(0) if match else None
+
+
+def _request_changes(before, after):
+    """What actually moved between two versions of a request, a line each.
+
+    The figure is not the only thing that matters and never was - a cashout
+    goes to a TAG, and paying the right amount to the wrong one is the worse
+    mistake of the two, because the money is gone and it is not coming back. A
+    tag that has been REMOVED is called out for the same reason: the crew must
+    not fall back on the one they remember.
+
+    Silent about anything it cannot read on both sides. A guessed figure or a
+    guessed tag on a message telling somebody what to pay is worse than saying
+    nothing and letting them read the request itself."""
+    lines = []
+
+    was, now = request_amount(before), request_amount(after)
+    if was is not None and now is not None and was != now:
+        lines.append(f"Amount: {_money(was)} -> {_money(now)}")
+
+    was_tag, now_tag = request_tag(before), request_tag(after)
+    if was_tag and now_tag:
+        if was_tag.lower() != now_tag.lower():
+            lines.append(f"Tag: {was_tag} -> {now_tag}")
+    elif was_tag and not now_tag:
+        lines.append(f"Tag: {was_tag} -> no longer given")
+    elif now_tag and not was_tag:
+        lines.append(f"Tag: now {now_tag}")
+
+    return ('\n' + '\n'.join(lines)) if lines else ''
+
+
+def cashout_edited_text(before, after, handling):
+    """Posted into the handling group when a request is edited.
+
+    Unsigned and routed nowhere, exactly like the chase: this is the second of
+    only two things the bot says in a handling group, and nothing of Ethan's or
+    of the chime side belongs in either.
+
+    The crew are tagged because a silent rewrite is the dangerous version. They
+    read the request once, and if the figure changes underneath them the copy
+    they remember is the one they pay."""
+    return (f"✏️ THE REQUEST ABOVE HAS BEEN EDITED"
+            f"{_request_changes(before, after)}\n\n"
+            "Please read it again before sending anything.\n\n"
+            f"{crew_mentions(handling)}")
+
+
+def cashout_edited_origin_text(before, after):
+    """Posted back into the chime group that edited its own request.
+
+    Addressed to the side that MADE the change, which is the side that has to
+    confirm it. The crew never see this and have nothing to do with Signal -
+    they read the request in their own group and send the money.
+
+    Signed, and tagging nobody: this is the chime side being spoken to, where
+    every other thing the bot posts carries the sign-off.
+
+    It must never contain the words CASHOUT REQUEST. This is the one message
+    the bot posts INTO a route source, so the keyword would make it a request
+    the bot had asked itself for the moment anything went wrong with the
+    own-message guard."""
+    ask = f"\n{CASHOUT_SIGNAL_NOTE}" if CASHOUT_SIGNAL_NOTE else ""
+    return (f"✏️ THIS REQUEST HAS BEEN EDITED"
+            f"{_request_changes(before, after)}\n\n"
+            f"The updated version has been passed on.{ask}\n\n"
+            "-ETHAN")
+
+
+def cashout_edited_dm_text(request, handling, before):
+    """For Ethan and Larry both, with the routing they alone are told.
+
+    Not on the progress list with the rest of Larry's notices, and that is the
+    point: submitted, picked up and completed are a cashout going normally,
+    where Ethan has nothing to do. A request rewritten while the crew are
+    holding it is money changing shape mid-flight, and it is the two of them who
+    have to decide whether it still stands."""
+    ask = (f"\n{chat_name(request['origin'])} has been asked to confirm on "
+           "Signal too.\n" if CASHOUT_SIGNAL_NOTE else "")
+    return ("✏️ A CASHOUT REQUEST HAS BEEN EDITED\n\n"
+            f"{_cashout_preview(request)}"
+            f"{_request_changes(before, request['text'])}\n\n"
+            f"From: {chat_name(request['origin'])}\n"
+            f"Updated in: {chat_name(handling)}, crew told.\n"
+            f"{ask}\n"
+            "Still waiting on the /out.")
 
 
 def cashout_issue_text(request, handling, who, user_id):
@@ -2586,10 +2948,55 @@ async def observe_cashout(chat_id, text, message_id, sent_at,
 
     source = _canonical(chat_id, CASHOUT_ROUTES)
     if source is not None:
+        # An edit to a request already forwarded is a change to work in flight,
+        # not a new piece of work. Checked BEFORE the keyword, because editing
+        # the keyword OUT still has to reach the crew - a request that quietly
+        # stops saying CASHOUT REQUEST is exactly what they must not miss.
+        #
+        # Falling through when nothing is open is deliberate: it is what lets a
+        # message edited INTO a request open one, and the dedup key below is
+        # what stops an already-settled request being re-opened by an edit.
+        if is_edit:
+            open_request = find_open_request(
+                CASHOUT_ROUTES[source]['handling'], message_id)
+            if open_request is not None:
+                if _is_duplicate(('cashout-edit', source, message_id,
+                                  ' '.join((text or '').split()))):
+                    return              # the same edit down the other path
+                if ' '.join((text or '').split()) == \
+                        ' '.join((open_request['text'] or '').split()):
+                    return              # Telegram re-fires on a link preview
+                await update_cashout_request(source, open_request, text, sent_at)
+                return
+
         if not text or CASHOUT_KEYWORD.lower() not in text.lower():
             return
+        # Ethan or Larry asking the crew about a cashout is not a new cashout.
+        # Without this, a message like "@Maynuddin23 what about that CASHOUT
+        # REQUEST" opens a second request for money already asked for, tags the
+        # crew again and runs the whole chase ladder over a question - and the
+        # duplicate is indistinguishable from a real one once it is posted.
+        #
+        # Below the dedup key rather than above it, so the two input paths
+        # report this once between them instead of both saying it.
         if _is_duplicate(('cashout', source, message_id)):
             return
+        if is_admin_crew_note(text, user_id, username):
+            print(f"💬 [CHATTER] {chat_name(source)}: that is Ethan or Larry "
+                  "talking to the crew - not opening a request.", flush=True)
+            return
+
+        # The three-part shape, and nothing else - see is_cashout_request().
+        # Reported rather than dropped: a mistyped request is money nobody is
+        # being asked for, and silence is indistinguishable from a quiet day.
+        if not is_cashout_request(text):
+            print(f"⚠️ [CASHOUT] {chat_name(source)}: keyword without the tag "
+                  "and amount lines - not a request.", flush=True)
+            missed = await dm_handles(CASHOUT_ADMIN_HANDLES,
+                                      cashout_malformed_text(source, text))
+            await warn_unreachable(missed)
+            return
+
         await open_cashout_request(source, text, sent_at, message_id)
         return
 
@@ -2686,9 +3093,88 @@ async def close_deleted_cashouts(client, chat_id, deleted_ids):
                 print(f"🗑️ [CASHOUT] {label} in {chat_name(chat)} was deleted after "
                       f"{request['nudges']} reminder(s) - treating it as handled. "
                       "No chasing, no reaction.", flush=True)
+                if label == 'request':
+                    await withdraw_request(handling, request)
                 break
         if not queue:
             _pending_cashouts.pop(handling, None)
+
+
+def cashout_deleted_text(request, handling, removed, failed):
+    """For Ethan and Larry: a request was withdrawn by the side that asked.
+
+    The last line is the point of the message. Nothing was booked, because
+    nothing was booked until a /out arrives - but the crew may have SENT the
+    money already and simply not typed one, and once the request and its copy
+    are gone there is no record left in either group that it was ever asked
+    for. That is the one thing worth checking by hand, and nobody else is in a
+    position to check it."""
+    # Not "delete it by hand": Larry is not a Telegram administrator in Chime
+    # Rev & out no-7, so in the group where it matters most he cannot. /del is
+    # the route that works for both of them - see message_command().
+    trouble = ("\n\n⚠️ Could not remove: " + ", ".join(failed)
+               + ". Still visible in the group — reply to it with /del."
+               ) if failed else ""
+    return ("🗑️ A CASHOUT REQUEST WAS DELETED\n\n"
+            f"{_cashout_preview(request)}\n\n"
+            f"Deleted in: {chat_name(request['origin'])}\n"
+            f"Was waiting in: {chat_name(handling)}\n"
+            f"Open for: {_humanise((datetime.now(timezone.utc) - request['opened']).total_seconds() / 60.0)}"
+            f", {request['nudges']} reminder(s)\n"
+            + ("Acknowledged by the crew before it went.\n" if request['seen'] else "")
+            + f"\nTaken out of {chat_name(handling)}: {removed}."
+            + trouble
+            + "\n\nNo /out ever came, so nothing was booked. If the crew had "
+              "already sent it, that money left without a record — worth checking.")
+
+
+async def withdraw_request(handling, request):
+    """The chime group deleted its own request. Take it back off the crew.
+
+    One direction only, and deliberately. A request deleted where it was ASKED
+    has been withdrawn, so the copy standing in front of the crew is an
+    instruction to send money nobody is asking for any more. A copy deleted in
+    the HANDLING group means the opposite - the crew tidying up after
+    themselves - and the original belongs to the group that wrote it, which the
+    bot does not delete on their behalf.
+
+    Everything the request put in that group goes with it, not just the copy:
+    the reminders and the crew's chase DM all read "still waiting on a /out",
+    and a live tag about a request nobody can see any more is how somebody pays
+    for something that was called off."""
+    removed, failed = [], []
+
+    try:
+        await bot.delete_message(handling, request['message_id'])
+        removed.append('the forwarded request')
+    except Exception as e:
+        if _looks_deleted(e):
+            removed.append('the forwarded request (already gone)')
+        else:
+            print(f"⚠️ [CASHOUT] could not delete the forwarded request in "
+                  f"{chat_name(handling)}: {e}", flush=True)
+            failed.append('the forwarded request')
+
+    reason = f"A cashout request was DELETED in {chat_name(request['origin'])}"
+    tail = ("Nothing was booked. Check by hand whether the crew had already "
+            "sent it.")
+    notices = len(request['group_notice'])
+    if notices:
+        await delete_group_notice(handling, request, reason=reason, tail=tail)
+        removed.append(f"{notices} reminder(s)")
+    if request['crew_notice']:
+        await delete_crew_notice(request, reason=reason, tail=tail)
+        removed.append("the crew's chase DM")
+
+    print(f"🗑️ [CASHOUT] withdrawn from {chat_name(handling)}: "
+          f"{', '.join(removed) or 'nothing to remove'}", flush=True)
+
+    missed = await dm_handles(
+        CASHOUT_ADMIN_HANDLES,
+        cashout_deleted_text(request, handling,
+                             ', '.join(removed) or 'nothing was left to remove',
+                             failed))
+    await warn_unreachable(missed)
 
 
 def cashout_nudge_text(waited_minutes, handling=None):
@@ -2842,7 +3328,9 @@ async def dm_crew_last_resort(handling, request, waited):
                                             receipts=request['crew_notice']))
 
 
-async def delete_crew_notice(request):
+async def delete_crew_notice(request, reason='A cashout was completed',
+                             tail='The money side is already done and booked — '
+                                  'ask them not to send it again.'):
     """Take back the crew's last-resort chase once the /out has landed.
 
     That DM says the request is "still waiting on a /out". The moment one
@@ -2875,14 +3363,13 @@ async def delete_crew_notice(request):
 
     if failed:
         await notify_admin(
-            "⚠️ A cashout was completed, but the earlier "
+            f"⚠️ {reason}, but the earlier "
             f"{_humanise(CASHOUT_CREW_DM_MINUTES)} chase DM to the crew could not "
             f"be deleted ({', '.join(failed)}).\n\n"
-            "It still reads as waiting on a /out. The money side is already done "
-            "and booked — ask them not to send it again.")
+            f"It still reads as waiting on a /out. {tail}")
 
 
-async def delete_group_notice(handling, request):
+async def delete_group_notice(handling, request, reason=None, tail=None):
     """Take back the group reminders once the /out has landed.
 
     Same reasoning as delete_crew_notice(), in the open. Every reminder reads
@@ -2897,6 +3384,9 @@ async def delete_group_notice(handling, request):
     else is - the tag is still live - so Ethan is told, with the figure already
     booked so nobody sends it again. The crew are never told: they are the ones
     being chased, and the group is where they can already see the /out."""
+    reason = reason or f"A cashout in {chat_name(handling)} was completed"
+    tail = tail or ("The money side is already done and booked — ask them not to "
+                    "send it again.")
     notices, request['group_notice'] = request['group_notice'], []
     failed = []
     for msg_id in notices:
@@ -2913,11 +3403,10 @@ async def delete_group_notice(handling, request):
 
     if failed:
         await notify_admin(
-            f"⚠️ A cashout in {chat_name(handling)} was completed, but "
+            f"⚠️ {reason}, but "
             f"{len(failed)} earlier reminder(s) could not be deleted from the "
             f"group ({', '.join(failed)}).\n\n"
-            "They still tag the crew saying it is waiting on a /out. The money "
-            "side is already done and booked — ask them not to send it again.")
+            f"They still tag the crew saying it is waiting on a /out. {tail}")
 
 
 async def chase_acknowledged(handling, request, waited):
@@ -3035,7 +3524,7 @@ async def cashout_watchdog():
 
 
 async def process_incoming(chat_id, text, origin, from_bot=False, sent_at=None,
-                           source_msg_id=None):
+                           source_msg_id=None, user_id=None, username=None):
     global forwarded_count, today_count
 
     print(f"📩 [MSG RECEIVED] ({origin}) Chat ID: {chat_id} | Text: '{text}'", flush=True)
@@ -3061,6 +3550,20 @@ async def process_incoming(chat_id, text, origin, from_bot=False, sent_at=None,
     lowered = text.lower()
     if not any(kw.lower() in lowered for kw in KEYWORDS):
         print("⚠️ [SKIP] Message does not contain keyword 'You received'.", flush=True)
+        return
+
+    # Ethan or Larry quoting a payment back at the crew is not a new payment.
+    # BOT_ONLY_SOURCES already covers this for Chime Rev and MH x LARRY VENMO,
+    # where nothing a human types is forwarded at all - but MH X LARRY GROUP 2
+    # is not on that list, so "@Maynuddin23 he says he never got the 200 you
+    # received" went straight into CHIME PICCASO looking like a fresh deposit.
+    #
+    # `from_bot` is in the condition to make the safe half of it structural: a
+    # genuine notification comes from the notification bot, so this can never
+    # hold one back however it happens to be worded.
+    if not from_bot and is_admin_crew_note(text, user_id, username):
+        print(f"💬 [CHATTER] {chat_name(rule_key)}: that is Ethan or Larry "
+              "talking to the crew - not forwarding it.", flush=True)
         return
 
     print("✅ [KEYWORD MATCH] Forwarding message...", flush=True)
@@ -3466,6 +3969,29 @@ async def help_command(message):
         "(the space is optional: /add-100 works too)\n"
         "/set in 800 — sets Total In to 800.00$\n"
         "/set out 300 — sets Total Out to 300.00$\n"
+        "\n"
+        "TIDYING UP — in a group, reply to the message\n"
+        "\n"
+        "/del — deletes it, whoever sent it, including\n"
+        "another bot. The /del itself goes too.\n"
+        "/edit <new text> — rewrites it. This bot's own\n"
+        "messages only; Telegram lets no account edit\n"
+        "another's.\n"
+        "\n"
+        "TIDYING UP — here in private, for a group you\n"
+        "are not in\n"
+        "\n"
+        "/del rev — lists the last few messages there,\n"
+        "numbered, whoever sent them\n"
+        "/del rev 2 — removes number 2 from that list\n"
+        "/edit rev 1 <new text> — rewrites number 1\n"
+        "The list goes stale after 10 minutes. Needs the\n"
+        "user account, which is the only thing that can\n"
+        "read a group's history.\n"
+        "\n"
+        "A message carrying BOTH totals is refused —\n"
+        "the books are rebuilt from the newest of those\n"
+        "after every deploy. Add force to override.\n"
         "\n"
         "PAYMENT PROMPTS — here in private, or silently in a group\n"
         "\n"
@@ -4038,6 +4564,369 @@ async def cashout_from_bot_api(message, is_edit=False):
                            getattr(sender, 'username', None), full_name or None)
 
 
+# How many recent messages /del lists from a private chat, and how long that
+# listing stays good for. Short-lived on purpose: it is a numbered menu, and a
+# stale menu is how somebody deletes the wrong thing.
+DEL_LIST_LIMIT = int(os.getenv('DEL_LIST_LIMIT', '8'))
+DEL_LIST_TTL_SECONDS = int(os.getenv('DEL_LIST_TTL_SECONDS', '600'))
+
+# user id -> what they were last shown. Per user, so the two of them working at
+# once cannot pick out of each other's list.
+_del_listings = {}
+
+
+def _one_group(argument):
+    """One chat id from a name typed by a person, or None.
+
+    NOT resolve_group(), which deliberately returns the whole route - naming
+    either end of a pause takes both, because half a paused route is the shape
+    of trouble it exists to prevent. Deleting is the opposite: it must land on
+    exactly the group named and nowhere else."""
+    argument = (argument or '').strip().lower().lstrip('@')
+    if not argument:
+        return None
+    named = GROUP_ALIASES.get(argument)
+    if named is not None:
+        return named
+    try:
+        named = int(argument)
+    except ValueError:
+        return None
+    return named if named in _known_groups() else None
+
+
+def _preview_of(msg):
+    """One line standing in for a message in the menu."""
+    text = (getattr(msg, 'raw_text', None) or getattr(msg, 'message', None)
+            or getattr(msg, 'caption', None) or '')
+    body = ' '.join(text.split())
+    if not body:
+        return '[media]' if getattr(msg, 'media', None) else '[no text]'
+    return body[:58] + ('…' if len(body) > 58 else '')
+
+
+async def list_recent(chat_id, client):
+    """The last few messages in a group, whoever sent them.
+
+    Everyone's, not just the bot's: the crew's messages are exactly what needs
+    clearing and the bot cannot see them any other way from a private chat.
+    Read through the userbot, because the Bot API cannot fetch history at all -
+    which is also why this stops working the moment that session dies."""
+    entity = await _resolve_one(client, chat_id)
+    if entity is None:
+        return None
+    items = []
+    async for msg in client.iter_messages(entity, limit=DEL_LIST_LIMIT):
+        text = (getattr(msg, 'raw_text', None) or getattr(msg, 'message', None) or '')
+        items.append({
+            'id': msg.id,
+            'who': 'the bot' if _report_is_ours(msg) else _report_sender(msg),
+            'at': msg.date,
+            'preview': _preview_of(msg),
+            'ledger': _carries_ledger(text),
+        })
+    return items
+
+
+def del_listing_text(chat_id, items):
+    lines = [f"Last {len(items)} in {chat_name(chat_id)}:", ""]
+    for index, item in enumerate(items, 1):
+        stamp = item['at'].astimezone(LOCAL_TZ).strftime('%I:%M %p')
+        mark = "  ⚠️ carries the totals" if item['ledger'] else ""
+        lines.append(f"{index}. [{item['who']}] {stamp}")
+        lines.append(f"   {item['preview']}{mark}")
+    lines += ["", f"/del {chat_name(chat_id)} <number> to remove one.",
+              "The number is this list's, and it goes stale in "
+              f"{DEL_LIST_TTL_SECONDS // 60} minutes."]
+    return "\n".join(lines)
+
+
+def _target_text(message):
+    """Whatever the replied-to message says, text or caption."""
+    return (getattr(message, 'text', None)
+            or getattr(message, 'caption', None) or '')
+
+
+def _carries_ledger(text):
+    """Does this message hold BOTH totals?
+
+    Those are not ordinary messages. recover_ledgers() rebuilds each group's
+    books after a deploy by reading back the newest one, so deleting it makes
+    recovery fall through to an OLDER message and quietly revert the books, and
+    rewriting the figures makes recovery adopt whatever was typed. Neither shows
+    up until the next redeploy, which is the worst possible moment to find out."""
+    total_in, total_out = parse_totals(text)
+    return total_in is not None and total_out is not None
+
+
+@bot.message_handler(commands=['del', 'delete', 'edit'])
+async def message_command(message):
+    """/del and /edit, on any message in any group. Ethan and Larry only.
+
+    Larry is NOT a Telegram administrator in Chime Rev & out no-7, and may not
+    be in groups added later, so he cannot remove a message by hand however
+    obviously it needs removing. The bot IS an administrator everywhere, so it
+    can do it for him - including messages posted by OTHER bots.
+
+    Reply to the message and send `/del`, or `/edit <new text>`.
+
+    Editing is the bot's own messages only, and that is Telegram's limit rather
+    than a rule of ours: no account may edit another's message. Deleting has no
+    such restriction while the bot holds can_delete_messages."""
+    chat_id = message.chat.id
+    user_id = getattr(message.from_user, 'id', None)
+
+    # Nothing at all in a paused group, not even a refusal - the same silence
+    # every other command keeps there.
+    if chat_paused(chat_id):
+        return
+
+    match = _CMD_NAME_RE.match(message.text or '')
+    command = match.group(1).lower() if match else ''
+    deleting = command in ('del', 'delete')
+
+    if user_id not in LEDGER_ADMINS:
+        print(f"⛔ [MSG] {user_id} denied /{command} in {chat_id}", flush=True)
+        await bot.reply_to(message, "⛔ Not permitted. Only Ethan and Larry can "
+                                    "remove or rewrite the bot's messages.")
+        return
+
+    # A private chat has no message to reply to, and is the only way to reach a
+    # group you are not a member of - which is the whole reason this form
+    # exists. A DM's chat id IS the sender's id, so this is the private chat.
+    if chat_id in LEDGER_ADMINS:
+        await message_command_from_dm(message, user_id, deleting)
+        return
+
+    target = getattr(message, 'reply_to_message', None)
+    if target is None:
+        await bot.reply_to(
+            message,
+            "Reply to the message you want to act on.\n\n"
+            "  /del                 delete it (any message, including another bot's)\n"
+            "  /edit <new text>     rewrite it (this bot's own messages only)\n\n"
+            "Add `force` to /del to remove a message carrying the running totals.")
+        return
+
+    rest = (message.text or '').split(None, 1)
+    argument = rest[1].strip() if len(rest) > 1 else ''
+    forced = deleting and argument.lower() == 'force'
+
+    # The one thing worth refusing outright. See _carries_ledger().
+    if _carries_ledger(_target_text(target)) and not forced:
+        totals = parse_totals(_target_text(target))
+        await bot.reply_to(
+            message,
+            "⚠️ That message carries the running totals "
+            f"({_money(totals[0])} in, {_money(totals[1])} out).\n\n"
+            "The books are rebuilt after every deploy by reading the newest "
+            "message that carries both. Removing or rewriting this one changes "
+            "what this group's books say the next time the bot restarts — not "
+            "now, which is what makes it easy to miss.\n\n"
+            + ("Use `/del force` if that is what you want.\n\n" if deleting else
+               "Use /set to change the books, which posts the new totals "
+               "properly.\n\n")
+            + "To correct the figures, use /add, /out or /set.")
+        return
+
+    if not deleting and not argument:
+        await bot.reply_to(message, "Usage: /edit <new text>")
+        return
+
+    who = describe_user(getattr(message.from_user, 'username', None),
+                        ' '.join(part for part in
+                                 (getattr(message.from_user, 'first_name', None),
+                                  getattr(message.from_user, 'last_name', None))
+                                 if part) or None)
+
+    if deleting:
+        try:
+            await bot.delete_message(chat_id, target.message_id)
+        except Exception as e:
+            await bot.reply_to(
+                message, f"❌ Could not delete it: {e}\n\n"
+                "A bot can only delete another sender's message while it is an "
+                "administrator here with permission to delete messages.")
+            return
+    else:
+        # Telegram refuses this for anyone else's message, bot or human, and
+        # the error it gives back says nothing useful - so say it plainly.
+        if BOT_ID is not None and getattr(
+                getattr(target, 'from_user', None), 'id', None) != BOT_ID:
+            await bot.reply_to(
+                message, "❌ That message was not sent by this bot, so it cannot "
+                "be edited — Telegram allows no account to edit another's "
+                "message. It can still be deleted with /del.")
+            return
+        if not await edit_group(chat_id, target.message_id, argument):
+            await bot.reply_to(message, "❌ Could not rewrite it — see the log.")
+            return
+
+    print(f"🧹 [MSG] {who} {'deleted' if deleting else 'rewrote'} "
+          f"{target.message_id} in {chat_name(chat_id)}"
+          f"{' (FORCED, carried totals)' if forced else ''}", flush=True)
+
+    # The command itself goes too: the point of this is a group with less in it,
+    # and "/del" left behind is one more thing to read.
+    try:
+        await bot.delete_message(chat_id, message.message_id)
+        spoke = False
+    except Exception:
+        spoke = True
+
+    done = (f"{'🗑️ Deleted' if deleting else '✏️ Rewrote'} a message in "
+            f"{chat_name(chat_id)}."
+            + (f"\n\n⚠️ It carried the running totals. This group's books will "
+               f"read differently after the next deploy — post them again with "
+               f"/set if that was not intended." if forced else ""))
+    if spoke:
+        await bot.reply_to(message, done)
+    else:
+        missed = await dm_handles([h for h in CASHOUT_ADMIN_HANDLES
+                                   if _user_ids.get(h.lower()) == user_id], done)
+        if missed:
+            await bot.reply_to(message, done)
+
+    if forced:
+        await notify_admin(f"⚠️ {who} used /del force in {chat_name(chat_id)} on a "
+                           "message carrying the running totals.\n\n"
+                           "recover_ledgers() will read an older message after the "
+                           "next deploy. Post the correct totals with /set.")
+
+
+async def message_command_from_dm(message, user_id, deleting):
+    """/del and /edit worked from a private chat, against a named group.
+
+    The in-group form needs you to be IN the group. @ethannxxxx is not in any
+    of the three handling groups, so for that account the group form does not
+    exist - and the bot is the only thing that can reach in there.
+
+    Two steps on purpose. `/del rev` shows a numbered menu of what is actually
+    in the group right now; `/del rev 2` removes one of them. Nothing is
+    deleted from a number typed blind, and you see whose message it is and
+    whether it carries the totals before it goes.
+
+    Read through the userbot, because the Bot API cannot fetch history at all.
+    That is also the one dependency worth knowing about: if the Telethon
+    session is dead this form of the command dies with it, and it says so
+    rather than looking like an empty group."""
+    parts = (message.text or '').split()
+    argument = parts[1] if len(parts) > 1 else ''
+    chat_id = _one_group(argument)
+    if chat_id is None:
+        await bot.reply_to(
+            message,
+            f"Usage: /{'del' if deleting else 'edit'} <group>"
+            + ("" if deleting else " <number> <new text>") + "\n"
+            + ("       /del <group> <number>\n" if deleting else "")
+            + "\nGroups: " + ', '.join(sorted(set(GROUP_ALIASES))))
+        return
+
+    if chat_paused(chat_id):
+        await bot.reply_to(message, f"⏸️ {chat_name(chat_id)} is out of service.")
+        return
+
+    client = _active_client
+    if client is None:
+        await bot.reply_to(
+            message,
+            "❌ The user account is not connected, and only it can read a "
+            "group's history. Nothing can be listed until it is back — "
+            "/status says why.")
+        return
+
+    # ---- step one: show what is there --------------------------------------
+    index = parts[2] if len(parts) > 2 else ''
+    if not index.isdigit():
+        try:
+            items = await list_recent(chat_id, client)
+        except Exception as e:
+            await bot.reply_to(message, f"❌ Could not read {chat_name(chat_id)}: {e}")
+            return
+        if not items:
+            await bot.reply_to(message, f"Nothing readable in {chat_name(chat_id)}.")
+            return
+        _del_listings[user_id] = {'chat': chat_id, 'items': items,
+                                  'at': datetime.now(timezone.utc)}
+        await bot.reply_to(message, del_listing_text(chat_id, items))
+        return
+
+    # ---- step two: act on one of them --------------------------------------
+    listing = _del_listings.get(user_id)
+    if listing is None or listing['chat'] != chat_id:
+        await bot.reply_to(message, f"Run /del {argument} first, to see the list.")
+        return
+    age = (datetime.now(timezone.utc) - listing['at']).total_seconds()
+    if age > DEL_LIST_TTL_SECONDS:
+        _del_listings.pop(user_id, None)
+        await bot.reply_to(message, f"That list is {int(age // 60)} minutes old. "
+                                    f"Run /del {argument} again.")
+        return
+
+    position = int(index)
+    if not 1 <= position <= len(listing['items']):
+        await bot.reply_to(message, f"Pick 1 to {len(listing['items'])}.")
+        return
+    item = listing['items'][position - 1]
+
+    # The id, never the position. A message arriving between the list and the
+    # command must not be able to shift what gets deleted.
+    rest = parts[3:] if len(parts) > 3 else []
+    forced = deleting and rest and rest[0].lower() == 'force'
+    if item['ledger'] and not forced:
+        await bot.reply_to(
+            message,
+            f"⚠️ #{position} carries the running totals.\n\n"
+            "The books are rebuilt after every deploy from the newest message "
+            "that carries both, so removing it changes what this group's books "
+            "say the next time the bot restarts.\n\n"
+            + (f"/del {argument} {position} force if that is what you want."
+               if deleting else "Use /set to change the books instead."))
+        return
+
+    if deleting:
+        try:
+            await bot.delete_message(chat_id, item['id'])
+        except Exception as e:
+            await bot.reply_to(message, f"❌ Could not delete #{position}: {e}")
+            return
+    else:
+        text = ' '.join(rest)
+        if not text:
+            await bot.reply_to(message,
+                               f"Usage: /edit {argument} {position} <new text>")
+            return
+        if item['who'] != 'the bot':
+            await bot.reply_to(
+                message, f"❌ #{position} was sent by {item['who']}, so it cannot "
+                "be edited — Telegram allows no account to edit another's "
+                f"message. /del {argument} {position} still works.")
+            return
+        if not await edit_group(chat_id, item['id'], text):
+            await bot.reply_to(message, f"❌ Could not rewrite #{position}.")
+            return
+
+    # The menu is now wrong by one. Dropping it is safer than renumbering:
+    # a stale list is exactly how somebody deletes the wrong thing next.
+    _del_listings.pop(user_id, None)
+    print(f"🧹 [MSG] {user_id} {'deleted' if deleting else 'rewrote'} "
+          f"{item['id']} in {chat_name(chat_id)} from a private chat"
+          f"{' (FORCED, carried totals)' if forced else ''}", flush=True)
+    await bot.reply_to(
+        message,
+        f"{'🗑️ Deleted' if deleting else '✏️ Rewrote'} #{position} in "
+        f"{chat_name(chat_id)} — [{item['who']}] {item['preview']}"
+        + ("\n\n⚠️ It carried the running totals. Post them again with /set."
+           if forced else "")
+        + f"\n\nRun /del {argument} again for a fresh list.")
+
+    if forced:
+        await notify_admin(f"⚠️ /del force was used in {chat_name(chat_id)} on a "
+                           "message carrying the running totals.\n\n"
+                           "recover_ledgers() will read an older message after the "
+                           "next deploy. Post the correct totals with /set.")
+
+
 @bot.message_reaction_handler(func=lambda r: True)
 async def on_request_reaction(reaction):
     """A reaction on a forwarded cashout request buys another timeout.
@@ -4230,7 +5119,17 @@ def _read_handling_side(messages):
         amount = parse_received_amount(text)
         if amount is not None and 'received' in text.lower():
             received.append({'at': msg.date, 'amount': amount})
-        if CASHOUT_KEYWORD.lower() in text.lower():
+        # The same rule the live path applies, applied to history: Ethan or
+        # Larry asking the crew about a cashout never opened one, so the report
+        # must not count it as a request nobody answered - that would show a
+        # phantom unpaid cashout in the day's figures. It stays eligible for
+        # the /out branch below, which is a separate question about the same
+        # message and not one this rule was asked to answer.
+        _sender = getattr(msg, 'sender', None)
+        _chatter = is_admin_crew_note(
+            text, getattr(msg, 'sender_id', None) or getattr(_sender, 'id', None),
+            getattr(_sender, 'username', None))
+        if CASHOUT_KEYWORD.lower() in text.lower() and not _chatter:
             requests.append({'at': msg.date, 'id': msg.id,
                              'asked': request_amount(text),
                              'text': ' '.join(text.split())[:120],
@@ -4778,10 +5677,13 @@ async def forward_text(message):
     sender_is_bot = bool(getattr(message.from_user, 'is_bot', False))
     sent_at = (datetime.fromtimestamp(message.date, tz=timezone.utc)
                if getattr(message, 'date', None) else None)
+    sender = getattr(message, 'from_user', None)
     await cashout_from_bot_api(message)
     await process_incoming(message.chat.id, message.text, 'bot-api',
                            from_bot=sender_is_bot, sent_at=sent_at,
-                           source_msg_id=message.message_id)
+                           source_msg_id=message.message_id,
+                           user_id=getattr(sender, 'id', None),
+                           username=getattr(sender, 'username', None))
 
 
 # ---------------------------------------------------------------------------
@@ -5486,7 +6388,9 @@ async def run_userbot():
                 # _is_target_sender above already guaranteed a bot sender.
                 await process_incoming(event.chat_id, text, 'telethon',
                                        from_bot=True, sent_at=event.message.date,
-                                       source_msg_id=event.id)
+                                       source_msg_id=event.id,
+                                       user_id=sender_id,
+                                       username=getattr(sender, 'username', None))
 
             @client.on(events.MessageEdited(chats=chats))
             async def on_source_edited(event):

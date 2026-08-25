@@ -28,7 +28,8 @@ import forwarder as f
 PICCASO, GAFFER = -5350880041, -5580596463
 PICCASO_VENMO, GAFFER_VENMO = -5306739731, -5100231154
 MHLARRY, CHIMEREV = -1003894781195, -1002335630148
-ETHAN, LARRY, CREW = 7578145913, 7418675217, 77
+ETHAN, LARRY, CREW = f.ETHAN_ID, f.LARRY_ID, 77
+ADMIN = f.ADMIN_ID          # notify_admin(): the bot-owner account
 
 sent, dms = [], []
 _next = [9000]
@@ -132,7 +133,7 @@ async def main():
     # -- 4. through the REAL request path ----------------------------------
     # The forward into the handling group must still carry CASHOUT_MENTIONS.
     reset()
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $25 $jenny-buhr', 901, now,
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 25', 901, now,
                             user_id=42)
     posted = [t for c, t in sent if c == MHLARRY]
     check('the request forward still tags the crew',
@@ -145,8 +146,8 @@ async def main():
     # in front of the crew - and again in their chase DM.
     reset()
     await f.observe_cashout(
-        GAFFER, 'CASHOUT REQUEST $500 for Gabriel W.\n'
-                'asked by @gaffer_boss pay to $jenny-buhr', 902, now, user_id=42)
+        GAFFER, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 500\n'
+                'asked by @gaffer_boss for Gabriel W.', 902, now, user_id=42)
     posted = [t for c, t in sent if c == CHIMEREV]
     check('a chime handle never reaches the handling group',
           posted and '@gaffer_boss' not in posted[0], str(posted))
@@ -154,14 +155,14 @@ async def main():
           posted and '@Maynuddin23' in posted[0] and '@NPR_CA' in posted[0],
           str(posted))
     check('and everything needed to pay it survives',
-          posted and '$500' in posted[0] and '$jenny-buhr' in posted[0]
+          posted and 'Amount : 500' in posted[0] and '$jenny-buhr' in posted[0]
           and 'Gabriel W.' in posted[0], str(posted))
 
     # The same text goes out again in the crew's chase DM.
     request = f._pending_cashouts[CHIMEREV][0]
     crew_dm = f.cashout_crew_dm_text(request, 10)
     check('nor reaches them in the chase DM', '@gaffer_boss' not in crew_dm, crew_dm)
-    check('which still says what is owed', '$500' in crew_dm, crew_dm)
+    check('which still says what is owed', 'Amount : 500' in crew_dm, crew_dm)
 
     # Ethan and Larry are the exception, exactly as everywhere else.
     admin_dm = f.cashout_admin_dm_text(request, CHIMEREV, 5)
@@ -221,7 +222,7 @@ async def main():
 
     # -- 6. through the REAL /out relay ------------------------------------
     reset()
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $25 $jenny-buhr', 910, now,
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 25', 910, now,
                             user_id=42)
     sent.clear()
     await f.observe_cashout(MHLARRY, '/out 25 sent by @Maynuddin23', 911, now,
@@ -239,7 +240,7 @@ async def main():
     # flag_cashout_issue exists to tell Ethan and Larry WHICH crew member has
     # gone quiet. A redacted version of that would be worthless.
     reset()
-    await f.observe_cashout(GAFFER, 'CASHOUT REQUEST $40 for Dana', 920, now,
+    await f.observe_cashout(GAFFER, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 40', 920, now,
                             user_id=42)
     await f.observe_cashout(CHIMEREV, 'looking at it', 921, now,
                             user_id=CREW, username='Maynuddin23',
@@ -264,18 +265,19 @@ async def main():
     # a) the heart cannot be placed
     reset()
     f.bot.react_error = 'Bad Request: not enough rights to manage reactions'
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $25 $jenny-buhr', 930, now,
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 25', 930, now,
                             user_id=42)
     await f.observe_cashout(MHLARRY, '/out 25', 931, now,
                             user_id=CREW, username='Maynuddin23')
-    check('a failed heart tells Ethan', any(c == ETHAN for c, _ in dms), str(dms))
+    check('a failed heart tells the admin account',
+          any(c == ADMIN for c, _ in dms), str(dms))
     check('and tells the crew nothing', crew_got() == [], str(crew_got()))
 
     # b) something arrives while the flow is stopped
     reset()
     await f.set_cashout_stopped(True, '@ethannxxxx')
     dms.clear()
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $25 $jenny-buhr', 932, now,
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 25', 932, now,
                             user_id=42)
     check('an ignored request tells Ethan and Larry',
           sorted({c for c, _ in dms}) == sorted([ETHAN, LARRY]), str(dms))
@@ -284,7 +286,7 @@ async def main():
 
     # c) a crew member is engaged but stuck
     reset()
-    await f.observe_cashout(GAFFER, 'CASHOUT REQUEST $40 for Dana', 940, now,
+    await f.observe_cashout(GAFFER, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 40', 940, now,
                             user_id=42)
     await f.observe_cashout(CHIMEREV, 'on it', 941, now,
                             user_id=CREW, username='Maynuddin23')

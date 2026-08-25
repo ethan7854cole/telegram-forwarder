@@ -102,7 +102,7 @@ def reset():
 
 async def open_request(chime=PICCASO, mid=901):
     now = datetime.now(timezone.utc)
-    await f.observe_cashout(chime, 'CASHOUT REQUEST $25 $jenny-buhr', mid, now,
+    await f.observe_cashout(chime, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 25', mid, now,
                             user_id=42)
     sent.clear()                       # drop the forward into the handling group
 
@@ -306,7 +306,7 @@ async def main():
             self.caption = caption
 
     check('a captioned CASHOUT REQUEST in a chime group is not dispatched',
-          f.media_concerns_cashout(GateMsg(PICCASO, 'CASHOUT REQUEST $25')) is False)
+          f.media_concerns_cashout(GateMsg(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 25')) is False)
     check('a captioned /out still is',
           f.media_concerns_cashout(GateMsg(PICCASO, '/out 25')) is True)
     check('and anything in a handling group still is',

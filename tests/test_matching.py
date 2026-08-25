@@ -36,7 +36,7 @@ _ids = [1000]
 
 # The shape the notification bot actually posts, and the hand-typed shape.
 BOT_FORM = '!! Cashout Request !!\nTag name : ${tag}\nAmount : {amt}'
-TYPED_FORM = 'CASHOUT REQUEST ${amt} for {tag}'
+TYPED_FORM = '!! cashout request !!\ntag name: ${tag}\namount: {amt}'
 
 
 class FakeMsg:
@@ -198,7 +198,7 @@ async def main():
     check('the Amount line is preferred over the cashtag',
           f.request_amount('Tag name : $jenny-buhr\nAmount : 25') == 25.0,
           str(f.request_amount('Tag name : $jenny-buhr\nAmount : 25')))
-    check('a typed request still reads', f.request_amount('CASHOUT REQUEST $80 for x') == 80.0)
+    check('a typed request still reads', f.request_amount('!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 80') == 80.0)
 
     # -- 8. the same fix on the Piccaso route -------------------------------
     reset()

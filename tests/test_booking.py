@@ -9,7 +9,7 @@ import forwarder as f
 
 PICCASO, GAFFER = -5350880041, -5580596463
 MHLARRY, CHIMEREV = -1003894781195, -1002335630148
-LARRY = 7418675217
+LARRY = f.LARRY_ID
 sent, reactions, failures = [], [], []
 fail_next = [False]
 
@@ -45,7 +45,7 @@ def reset():
 async def open_and_answer(origin, reply_text, mid=1):
     handling = f.CASHOUT_ROUTES[origin]['handling']
     now = datetime.now(timezone.utc)
-    await f.observe_cashout(origin, 'CASHOUT REQUEST', 100 + mid, now, user_id=42)
+    await f.observe_cashout(origin, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 100', 100 + mid, now, user_id=42)
     await f.observe_cashout(handling, reply_text, 200 + mid, now,
                             user_id=77, username='Maynuddin23')
     return handling

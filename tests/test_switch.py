@@ -33,7 +33,7 @@ import forwarder as f
 
 PICCASO, GAFFER = -5350880041, -5580596463
 MHLARRY, CHIMEREV = -1003894781195, -1002335630148
-ETHAN, LARRY, CREW = 7578145913, 7418675217, 77
+ETHAN, LARRY, CREW = f.ETHAN_ID, f.LARRY_ID, 77
 BOTID = 111222
 
 sent, dms, replies, copies = [], [], [], []
@@ -160,7 +160,7 @@ async def main():
           all(f.CASHOUT_STOP_MARK in t for _, t in dms), str(dms))
 
     sent.clear(); dms.clear()
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $25 $jenny-buhr', 901, now,
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 25', 901, now,
                             user_id=42)
     check('the request is NOT forwarded', sent == [], str(sent))
     check('and nothing is opened', f._pending_cashouts == {}, str(f._pending_cashouts))
@@ -193,7 +193,7 @@ async def main():
     # Stopping is a pause. Dropping them would strand real cashouts that were
     # already in flight when the switch was thrown.
     reset()
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $500 for Gabriel', 910, now,
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 500', 910, now,
                             user_id=42)
     check('a request is open before stopping',
           len(f._pending_cashouts.get(MHLARRY, [])) == 1)
@@ -221,7 +221,7 @@ async def main():
           len(f._pending_cashouts.get(MHLARRY, [])) == 1)
 
     sent.clear()
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $75 for Dana', 911, now,
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 75', 911, now,
                             user_id=42)
     check('requests are forwarded again',
           any(c == MHLARRY for c, _ in sent), str(sent))

@@ -21,7 +21,7 @@ import forwarder as f
 
 CHIMEREV, GAFFER = -1002335630148, -5580596463      # the retractable route
 MHLARRY, PICCASO = -1003894781195, -5350880041      # the one that is not
-ETHAN, LARRY = f.ADMIN_ID, 7418675217
+ETHAN, LARRY = f.ETHAN_ID, f.LARRY_ID
 STRANGER = 999
 
 sent, deleted, user_deleted, dms, failures = [], [], [], [], []

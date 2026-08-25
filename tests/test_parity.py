@@ -12,7 +12,7 @@ import forwarder as f
 
 PICCASO, GAFFER = -5350880041, -5580596463
 MHLARRY, CHIMEREV = -1003894781195, -1002335630148
-LARRY = 7418675217
+LARRY = f.LARRY_ID
 CREW = 555
 sent, dms, reactions, failures = [], [], [], []
 real_sleep = asyncio.sleep
@@ -64,7 +64,7 @@ async def full_flow(origin, base):
     r = {'handling': handling}
 
     # 1. submitted
-    await f.observe_cashout(origin, 'CASHOUT REQUEST $500 for Gabriel W.',
+    await f.observe_cashout(origin, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 500',
                             base + 1, now, user_id=42)
     r['forwarded'] = len([1 for c, _ in sent if c == handling])
     r['tagged'] = any('@Maynuddin23' in t for c, t in sent if c == handling)
@@ -176,7 +176,7 @@ async def main():
     # -- cross-contamination: one route must never touch the other ----------
     reset()
     now = datetime.now(timezone.utc)
-    await f.observe_cashout(GAFFER, 'CASHOUT REQUEST $80', 700, now, user_id=42)
+    await f.observe_cashout(GAFFER, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 80', 700, now, user_id=42)
     check('a GAFFER request never reaches MH X LARRY',
           not any(c == MHLARRY for c, _ in sent), str(sent))
     await f.observe_cashout(MHLARRY, '/out 80', 701, now, user_id=77, username='Maynuddin23')
@@ -192,7 +192,7 @@ async def main():
     for name, origin, handling, mid in (('PICCASO', PICCASO, MHLARRY, 601),
                                         ('GAFFER', GAFFER, CHIMEREV, 602)):
         reset()
-        await f.observe_cashout(origin, 'CASHOUT REQUEST $10', mid, now, user_id=42)
+        await f.observe_cashout(origin, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 10', mid, now, user_id=42)
         copy_id = f._pending_cashouts[handling][0]['message_id']
 
         class FakeClient:
@@ -202,7 +202,7 @@ async def main():
         check(f'{name}: deleting the request settles it', not f._pending_cashouts)
 
         reset()
-        await f.observe_cashout(origin, 'CASHOUT REQUEST $10', mid, now, user_id=42)
+        await f.observe_cashout(origin, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 10', mid, now, user_id=42)
         copy_id = f._pending_cashouts[handling][0]['message_id']
         await f.close_deleted_cashouts(FakeClient(), handling, [copy_id])
         check(f'{name}: deleting the forwarded copy settles it', not f._pending_cashouts)

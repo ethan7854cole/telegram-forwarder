@@ -17,7 +17,7 @@ python3 tests/run.py            # all suites
 python3 tests/run.py cashout    # only matching suites
 ```
 
-1157 checks across 30 suites, all stubbed — nothing touches Telegram, the
+1480 checks across 33 suites, all stubbed — nothing touches Telegram, the
 network, or the live groups. They cover the pre-existing behaviour as well as
 the new, so they are the guard against a change quietly altering something that
 already worked.
@@ -124,7 +124,10 @@ nothing.
   ❤, because the request it answers is not in memory and neither is its message
   id. **The crew's `/out` with nothing open is still ignored** — that is what
   keeps this from firing on chatter.
-- **Only Ethan (`7578145913`) and Larry (`7418675217`) may move ledger figures.**
+- **Only `ETHAN_ID` (7418675217, @ethannxxxx) and `LARRY_ID` (7578145913,
+  @Larryyxx) may move ledger figures** — two accounts, one person. Those
+  numbers were labelled **the wrong way round** everywhere until they were
+  checked against `getChat` on 2026-08-25. Never re-inline them.
 - **Anything that changes the ledger must post a message containing BOTH total
   lines.** `recover_ledgers()` rebuilds each group's books after a deploy by
   reading its own newest such message back. Booking silently means the next
@@ -161,6 +164,10 @@ nothing.
   `/status` leads with which groups are out of service.
 - **Crew count only in the group they work.** `_is_responder()` takes the
   handling group for exactly this reason; see "Who the crew are".
+- **Ethan or Larry naming the crew is chatter, never traffic** — see
+  "Chatter is not traffic". It opens no request and forwards no payment.
+- **An edited request updates the one in flight; it never opens a second.**
+  See "A request that changes after it was sent".
 
 ## The escalation ladder
 
@@ -633,6 +640,257 @@ in front of the crew, and again in their 10-minute chase DM.
 - Any new path carrying text between the two sides needs this considered again:
   the door only guards what leaves, never what arrives.
 
+## The shape of a cashout request
+
+Since 2026-08-25 a request must carry **all three parts**, and nothing else
+opens one — `is_cashout_request()`:
+
+```
+!! Cashout Request !!
+Tag name : $CelsoValero88
+Amount : 150
+```
+
+The keyword on its own is **not** a request. That is the whole point: a message
+merely *talking about* a cashout used to open a real one, forward it to the
+other group and tag the crew.
+
+- **Tolerant about punctuation and case, strict about the three parts.** Lower
+  case, `tag name:` with no space, `-` or `=` instead of `:`, a tag written
+  without its `$`, and a header without the `!!` all still count. That balance
+  is deliberate: too loose and chatter opens cashouts, too tight and a real
+  request typed slightly differently is dropped **in silence** — which is money
+  nobody is being asked for, and far worse.
+- **A near miss is reported, never dropped quietly.** A message carrying the
+  keyword without the tag or amount lines DMs both admin accounts with the text
+  and the shape that works — `cashout_malformed_text()`. This closes the "a
+  near-miss keyword is silent" gap that used to be under Known gaps.
+- **The chatter rule runs first**, so their own message tagging the crew raises
+  no malformed alert either.
+- `request_tag()` reads the `Tag name` line first and falls back to a bare
+  cashtag; `request_amount()` reads the `Amount` line. Both feed the edit
+  notice and the paid-the-wrong-figure check.
+
+Pinned by `tests/test_chatter.py`. Every suite's request fixture uses the real
+shape now — if you add one, copy the block above.
+
+## Chatter is not traffic
+
+Ethan and Larry work *inside* the groups the bot reads, and two of the words
+they use are the two words it routes on. Until 2026-08-25 a message of theirs
+was indistinguishable from the thing it was talking about:
+
+- `@Maynuddin23 what happened to that CASHOUT REQUEST?` in a chime group opened
+  a **second** request for money already asked for, tagged the crew again and
+  ran the whole escalation ladder over a question. Once posted, the duplicate
+  is indistinguishable from a real one.
+- `@Maynuddin23 he says he never got the 200 you received` in MH X LARRY GROUP
+  2 was forwarded into CHIME PICCASO looking like a fresh deposit.
+
+`is_admin_crew_note()` settles it, and it takes **two** conditions:
+
+1. **Ethan or Larry wrote it** — by numeric id (`LEDGER_ADMINS`), falling back
+   to the handle only when Telegram gave no id at all. A real request is
+   therefore untouched however it is worded.
+2. **It names the crew** — `mentions_crew()`, `@handle` or the bare name, the
+   same word-boundary rule the redaction uses. Their own `/out`, `/add` and
+   ordinary posts keep working exactly as they did.
+
+The second condition is not arbitrary, and it is why this is safe: the two
+sides never learn each other's people (the section above), so a crew handle in
+a chime group cannot have come from a customer — it can only be one of ours
+talking about the job.
+
+Three places apply it, and they are the three places the words mean something:
+
+| Where | What it stops |
+|---|---|
+| `observe_cashout()`, source branch | opening a duplicate request |
+| `process_incoming()`, after the keyword | forwarding a phantom payment |
+| `_read_handling_side()` | counting a phantom in the daily report |
+
+- **`process_incoming()` also requires `not from_bot`.** That makes the safe
+  half structural: a genuine notification comes from the notification bot, so
+  this rule can never hold one back however it is worded.
+- **Identification is positive only.** An unattributed post — Telegram credits
+  a channel's messages to the channel, an anonymous admin's to the group — is
+  *not* treated as theirs, because guessing the other way would let this
+  swallow a real notification. In MH X LARRY GROUP 2, which is a channel, an
+  anonymous admin post is still read as ordinary traffic.
+- **It never touches the answer.** A `/out` from anyone, crew or admin, tagged
+  or not, still settles the request, relays, books and hearts.
+- **`BOT_ONLY_SOURCES` overlaps it and does not replace it.** Chime Rev and MH
+  x LARRY VENMO already drop everything a human types; MH X LARRY GROUP 2 does
+  not, which is where the payment case actually bit.
+
+Pinned by `tests/test_chatter.py`, on all three routes and in both directions.
+
+## A request that changes after it was sent
+
+Editing a `CASHOUT REQUEST` in a chime group used to do nothing at all: the
+dedup key is the message id, so the edit was dropped as a replay and the crew
+went on looking at the figure that no longer stood.
+
+`update_cashout_request()` now rewrites the forwarded copy **and** posts a
+tagged notice under it — `✏️ THE REQUEST ABOVE HAS BEEN EDITED`, followed by
+whatever `_request_changes()` could actually read:
+
+```
+Amount: 200.00$ -> 350.00$
+Tag: $jenny-buhr -> $hawkins-floral
+```
+
+The rewrite alone is not enough and is the more dangerous half on its own: the
+crew read a request once, and a copy that changes silently is one they pay from
+memory.
+
+**The figure is not the only thing that matters, and not the worst to get
+wrong.** A cashout goes to a TAG, and the right amount to the wrong tag is money
+that is gone and not coming back. A tag that has been *removed* is called out
+too (`-> no longer given`), so nobody falls back on the one they remember.
+`request_tag()` reads it with `_CASHTAG_RE` — the same rule
+`clean_out_for_relay()` uses to decide what survives redaction, deliberately, so
+what the crew are told changed is what they can actually see. Nothing readable
+on both sides is reported: a guessed figure or tag on a message telling somebody
+what to pay is worse than saying nothing.
+
+- **Checked before the keyword.** Editing `CASHOUT REQUEST` *out* of a message
+  still has to reach the crew — a request that quietly stops being one is
+  exactly what they must not miss. The request stays open for a person to
+  settle; the bot does not decide that a rewording is a cancellation.
+- **It falls through when nothing is open**, which is what lets a message
+  edited *into* a request open one, as it always did. A request already **paid**
+  is out of the queue and is left completely alone — re-tagging the crew over it
+  could only ask them to pay it twice.
+- **The ladder is not restarted and an acknowledgement is not taken back.** The
+  ladder runs on absolute minutes from `opened`, and the money has been waiting
+  since then however often the wording moved. Replaying rungs already past would
+  post a burst of reminders at once, and the tagged notice is louder anyway.
+- **`request['text']` and `fingerprint` follow the edit**, so the figure the
+  `/out` is checked against, Larry's completion notice and the report all read
+  the request as it now stands.
+- **The notice joins `group_notice`**, so it is taken back with the reminders
+  when the `/out` lands — a live tag on the crew that outlives its cashout is
+  how somebody pays twice.
+- **If the copy cannot be rewritten** (deleted, too old) the request is
+  **reposted** and `message_id` re-pointed. "Read it again" must never point at
+  nothing.
+- **Ethan AND Larry are DMed**, on `CASHOUT_ADMIN_HANDLES` rather than the
+  progress list. Submitted / picked up / completed are a cashout going normally,
+  where Ethan has nothing to do; a request rewritten while the crew are holding
+  it is money changing shape mid-flight, and it is the two of them who decide
+  whether it still stands.
+- **The chime group that made the change is asked to confirm on Signal** —
+  `cashout_edited_origin_text()`, posted back as a reply to the request itself.
+  The ask goes to the side that EDITED it, not to the crew: the crew read the
+  request in their own group and send the money, and Signal has nothing to do
+  with them. Signed `-ETHAN`, tagging nobody, and configured by
+  `CASHOUT_SIGNAL_NOTE` — set it empty to drop the line from both that message
+  and the admin DM.
+- **That message must never contain the words `CASHOUT REQUEST`.** It is the
+  only thing the bot posts INTO a route source, so the keyword would make it a
+  request the bot had asked itself for the moment anything went wrong with the
+  own-message guard. Hence "THIS REQUEST HAS BEEN EDITED". Pinned.
+- Same identity rules as the original: `strip_foreign_handles()` on the way in,
+  unsigned, and no chime group named.
+
+`edit_group()` is the counterpart to `send_group()` — same paused gate, same
+redaction, and it treats Telegram's "message is not modified" as success.
+
+Pinned by `tests/test_reqedit.py`, on all three routes.
+
+## A request withdrawn by the side that asked
+
+Deleting either end has always settled a request — see `close_deleted_cashouts()`.
+Since 2026-08-25 a deletion **in the chime group** does more than settle it, via
+`withdraw_request()`: the copy standing in front of the crew is an instruction
+to send money nobody is asking for any more.
+
+- **The forwarded copy is deleted**, and so is everything else the request put
+  in that group — the reminders (`group_notice`) and the crew's chase DM
+  (`crew_notice`). All of those read "still waiting on a /out"; a live tag
+  about a request nobody can see is how somebody pays for something called off.
+- **Ethan and Larry are DMed** with what was removed and, if anything could not
+  be, what is still visible. A bot cannot delete a group message older than 48
+  hours. The notice points them at `/del` rather than at deleting by hand —
+  Larry is not a Telegram administrator in Chime Rev, so in the group where it
+  matters most, by hand is not open to him.
+- **The DM's last line is the point of it.** Nothing was booked — nothing is,
+  until a `/out` — but the crew may have *sent* the money and simply not typed
+  one, and once both messages are gone there is no record left in either group
+  that it was ever asked for. Nobody but those two can check that.
+- **One direction only.** A copy deleted in the *handling* group means the
+  opposite — the crew tidying up after themselves — and the original belongs to
+  the group that wrote it. The bot does not delete a chime group's own message
+  on their behalf, and does not report it as a withdrawal.
+- `delete_crew_notice()` and `delete_group_notice()` take `reason`/`tail` so
+  their failure alerts do not say "a cashout was completed" about a deletion.
+  The defaults reproduce the completion wording byte for byte.
+
+Pinned by `tests/test_deleted.py`, both chime groups.
+
+## /del and /edit — acting on messages through the bot
+
+**Larry is NOT a Telegram administrator in Chime Rev & out no-7**, and may not
+be in groups added later. He therefore cannot remove a message by hand however
+obviously it needs removing — including the bot's own. The bot *is* an
+administrator everywhere, so `message_command()` does it for him.
+
+Reply to the message and send `/del`, or `/edit <new text>`. Ethan and Larry
+only (`LEDGER_ADMINS`), silent in a paused group like every other command.
+
+- **`/del` works on anything, including another bot's message.** That was the
+  point of "and also apply for other's bot too" — the notification bot's posts
+  are exactly what cannot otherwise be cleared.
+- **`/edit` is this bot's own messages only.** That is Telegram's limit, not
+  ours: no account may edit another's message. The refusal says so and points
+  at `/del`, rather than passing back an unhelpful API error.
+- **The `/del` command message is deleted too**, and the confirmation goes as a
+  DM to whoever ran it. The point of the feature is a group with *less* in it,
+  so it must not leave two messages where there was one. If the DM cannot be
+  delivered it replies in the group instead.
+- **A message carrying BOTH totals is refused.** `recover_ledgers()` rebuilds a
+  group's books from the newest of those, so deleting one makes recovery fall
+  through to an older message and quietly revert the books, and rewriting the
+  figures makes recovery adopt whatever was typed. Neither shows up until the
+  next redeploy. The refusal names the figures and offers `/del force`; a forced
+  deletion warns in the confirmation and calls `notify_admin()`, because it is
+  the other admin's books too. One total alone is not a ledger message.
+- To change the books, use `/add`, `/out` or `/set` — those post the new totals
+  properly, which is the whole invariant.
+
+### From a private chat, for a group you are not in
+
+`@ethannxxxx` is in **none** of the three handling groups, so the in-group form
+does not exist for that account — there is nothing to reply to and no way to
+type there. `message_command_from_dm()` is the way in, and the bot is the only
+thing that can reach.
+
+Two steps, deliberately:
+
+```
+/del rev          → a numbered menu of what is in the group right now
+/del rev 2        → removes that one
+/edit rev 1 <text>
+```
+
+- **Everyone's messages are listed, not just the bot's.** The crew's are
+  exactly what needs clearing, and from a private chat there is no other way to
+  see them. Each row shows who sent it, the time, a preview, and a `⚠️` if it
+  carries the totals.
+- **The delete keys off the message id the menu showed**, never the position, so
+  a message arriving between the two commands cannot shift what goes.
+- **The menu expires** (`DEL_LIST_TTL_SECONDS`, 10 min) and is dropped after any
+  action — a stale menu is how somebody deletes the wrong thing next. It is
+  stored per user, so the two accounts cannot pick out of each other's list.
+- **It needs the userbot.** The Bot API cannot fetch history at all. If the
+  Telethon session is dead this form says so rather than reporting an empty
+  group — that distinction matters, because "nothing there" would read as
+  "already tidy".
+- The same ledger refusal applies, with `force` on the end to override.
+
+Pinned by `tests/test_msgcmd.py`.
+
 ## Marking a cashout done
 
 The ❤ on the original request is the **only durable record** that a cashout was
@@ -874,9 +1132,31 @@ cashout requests.
 
 ## Gotchas
 
+- **"Ethan" and "Larry" are two accounts belonging to the SAME person.**
+  `@Larryyxx` (`LARRY_ID`) is the bot-owner account and the one that is
+  actually *in* the handling groups; `@ethannxxxx` (`ETHAN_ID`) is the personal
+  account, and it is **not a member of any handling group**. `ADMIN_ID` is the
+  Larry one, deliberately — comments saying "Ethan is told" are loose shorthand
+  for "the admin account" and are not the authority; `ADMIN_ID` is.
+- **The two ids were swapped for the life of the project.** `_user_ids` seeded
+  `@larryyxx` with Ethan's id and vice versa, so on every fresh boot — Railway
+  wipes memory on every deploy — a DM addressed to one landed on the other
+  account. Nothing reached a stranger, but the "send the screenshot" notices
+  were arriving on the account that cannot see the group they are about. It
+  self-healed once either account spoke in a watched chat (`remember_user()`),
+  which is exactly the post-deploy window. Fixed 2026-08-25 with named
+  constants. The lesson generalises: **nothing had ever verified a hardcoded id
+  against Telegram.** If you add one, check it with `getChat` first.
 - A stale `~/forwarder.py` (unrelated, 1.5 KB) sits in the home directory, and
   shells often start there. Always use the absolute path when compiling or
   grepping, or you will silently check the wrong file.
+- **`python3` on this Mac is no longer the interpreter with the dependencies.**
+  Homebrew's 3.14 is first on `PATH` and has neither `telebot` nor `telethon`;
+  `/usr/bin/python3` has both. `tests/run.py` launches each suite with
+  `sys.executable`, so the whole suite fails to import and every line reads
+  `ModuleNotFoundError` — which looks like a broken bot and is a broken shell.
+  Run `/usr/bin/python3 tests/run.py`, or `pip3 install -r requirements.txt`
+  into whichever interpreter you want to be the one.
 - Reaction updates only reach a bot that is an **administrator** in the chat,
   and `message_reaction` must be listed in `allowed_updates` explicitly.
 - Telegram only says which chat a deletion happened in when it was a channel.
@@ -913,8 +1193,6 @@ cashout requests.
 
   **This is no longer the only way to get a duplicate, and was not the cause of
   the one on 2026-08-04.** See below.
-- **A near-miss keyword is silent.** `CASH OUT REQUEST` matches nothing,
-  forwards nowhere, and tells nobody — indistinguishable from a quiet day.
 - **The idle watchdog covers only the two CHIME groups**, not the VENMO targets.
 
 ## Layout
@@ -945,6 +1223,9 @@ cashout requests.
 | `tests/test_paused.py` | A group out of service: silent everywhere, and a resume that does not replay the pause |
 | `tests/test_groupswitch.py` | `/group off` and `/group on`: the whole route, durable across a redeploy |
 | `tests/test_crew.py` | Crew who work one handling group and count for nothing in the other |
+| `tests/test_chatter.py` | Ethan or Larry tagging the crew opens nothing and forwards nothing |
+| `tests/test_reqedit.py` | An edited request updates the copy in flight and re-tags the crew |
+| `tests/test_msgcmd.py` | `/del` and `/edit`: who may, what is refused, and the ledger guard |
 | `backfill.py` | Manual one-off backfill, separate from the boot sweep |
 | `telethon_login.py` | Generates a `TELETHON_SESSION`; `--deploy` for Railway |
 

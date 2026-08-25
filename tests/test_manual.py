@@ -30,7 +30,7 @@ import forwarder as f
 
 PICCASO, GAFFER = -5350880041, -5580596463
 MHLARRY, CHIMEREV = -1003894781195, -1002335630148
-ETHAN, LARRY, CREW = 7578145913, 7418675217, 77
+ETHAN, LARRY, CREW = f.ETHAN_ID, f.LARRY_ID, 77
 
 sent, dms, copies, hearts = [], [], [], []
 _ids = [1000]
@@ -133,7 +133,7 @@ async def main():
     # With something open this is the ORDINARY completion: hearted and closed.
     # The manual path must not shadow it.
     reset()
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $25 $jenny-buhr', 910, now,
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 25', 910, now,
                             user_id=42)
     sent.clear(); dms.clear()
     await f.observe_cashout(MHLARRY, '/out 25', 911, now,

@@ -53,10 +53,10 @@ def reset(userbot='ethannxxxx', send=True, client=True):
     f.USERBOT_SEND = send
     f._active_client = FakeClient() if client else None
     f._user_ids.clear()
-    f._user_ids.update({'larryyxx': 7418675217, 'ethannxxxx': f.ADMIN_ID})
+    f._user_ids.update({'larryyxx': f.LARRY_ID, 'ethannxxxx': f.ETHAN_ID})
 
 
-LARRY, ETHAN = 7418675217, f.ADMIN_ID
+LARRY, ETHAN = f.LARRY_ID, f.ETHAN_ID
 CREW = ['maynuddin23', 'mhsupportzone', 'maynuddin233']
 ALL = ['ethannxxxx', 'larryyxx'] + CREW
 
@@ -90,7 +90,7 @@ async def main():
           str(f._user_ids))
 
     # -- the two messages differ in exactly the intended way ----------------
-    req = {'text': 'CASHOUT REQUEST $500 for Gabriel W.', 'origin': -5350880041}
+    req = {'text': '!! Cashout Request !! Tag name : $jenny-buhr Amount : 500', 'origin': -5350880041}
     admin_text = f.cashout_admin_dm_text(req, -1003894781195, 5)
     crew_text = f.cashout_crew_dm_text(req, 5)
 
@@ -106,7 +106,7 @@ async def main():
     check('both carry the required headline',
           'OUT REQUEST HAS CROSSED' in admin_text and 'OUT REQUEST HAS CROSSED' in crew_text)
     check('both carry the request itself',
-          'CASHOUT REQUEST $500' in admin_text and 'CASHOUT REQUEST $500' in crew_text)
+          '!! Cashout Request !! Tag name : $jenny-buhr Amount : 500' in admin_text and '!! Cashout Request !! Tag name : $jenny-buhr Amount : 500' in crew_text)
     check('crew DM says what to do', 'Please action it' in crew_text, crew_text)
     check('admin DM says who is being chased',
           'Tagged in the group' in admin_text, admin_text)

@@ -20,7 +20,7 @@ import forwarder as f
 PICCASO, GAFFER = -5350880041, -5580596463
 MHLARRY, CHIMEREV = -1003894781195, -1002335630148
 GVENMO, VENMO_SRC = -5100231154, -1004298140797
-LARRY, ETHAN, CREW = 7418675217, 7578145913, 555
+LARRY, ETHAN, CREW = f.LARRY_ID, f.ETHAN_ID, 555
 
 sent, documents, failures = [], [], []
 DAY = datetime(2026, 8, 10, tzinfo=f.LOCAL_TZ).date()
@@ -424,7 +424,7 @@ async def main():
 
     # -- midnight waits for an unanswered /out ------------------------------
     f._pending_cashouts.clear()
-    f._pending_cashouts[CHIMEREV] = [{'text': 'CASHOUT REQUEST $200'}]
+    f._pending_cashouts[CHIMEREV] = [{'text': '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 200'}]
     real_sleep = asyncio.sleep
 
     async def instant(_):

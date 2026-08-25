@@ -28,7 +28,7 @@ import forwarder as f
 
 PICCASO, GAFFER = -5350880041, -5580596463
 MHLARRY, CHIMEREV = -1003894781195, -1002335630148
-ETHAN, LARRY = 7578145913, 7418675217
+ETHAN, LARRY = f.ETHAN_ID, f.LARRY_ID
 MAY, NPR = 77, 88
 BOTID = 111222
 
@@ -107,7 +107,7 @@ async def run_watchdog(seconds=0.25):
 
 async def open_request(origin, mid=601, minutes_ago=0):
     handling = f.CASHOUT_ROUTES[origin]['handling']
-    await f.observe_cashout(origin, 'CASHOUT REQUEST $500 for Gabriel W.', mid,
+    await f.observe_cashout(origin, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 500', mid,
                             datetime.now(timezone.utc), user_id=42)
     for request in f._pending_cashouts.get(handling, []):
         request['opened'] = (datetime.now(timezone.utc)

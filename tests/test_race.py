@@ -127,9 +127,9 @@ async def main():
     # The fix must not turn a burst of real, distinct cashouts into one post.
     reset()
     await asyncio.gather(
-        f.observe_cashout(PICCASO, 'CASHOUT REQUEST $25 $jenny-buhr', 820, now, user_id=42),
-        f.observe_cashout(PICCASO, 'CASHOUT REQUEST $40 $someone-else', 821, now, user_id=42),
-        f.observe_cashout(PICCASO, 'CASHOUT REQUEST $25 $third-person', 822, now, user_id=42),
+        f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 25', 820, now, user_id=42),
+        f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $someone-else\nAmount : 40', 821, now, user_id=42),
+        f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $third-person\nAmount : 25', 822, now, user_id=42),
     )
     check('three distinct requests all post', len(sent) == 3, f"{len(sent)} posts: {sent}")
     check('and all three are left open',

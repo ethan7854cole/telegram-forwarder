@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import forwarder as f
 
 PICCASO, MHLARRY = -5350880041, -1003894781195
-CREW, LARRY, ETHAN = 77, 7418675217, 7578145913
+CREW, LARRY, ETHAN = 77, f.LARRY_ID, f.ETHAN_ID
 
 sent, dms, reactions = [], [], []
 _next_id = [7000]
@@ -79,7 +79,7 @@ async def run_watchdog(seconds=0.2):
 
 
 async def open_one(amount=200):
-    await f.observe_cashout(PICCASO, f'CASHOUT REQUEST ${amount} for Gabriel W.',
+    await f.observe_cashout(PICCASO, f'!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 100',
                             901, datetime.now(timezone.utc), user_id=42)
     return f._pending_cashouts[MHLARRY][0]
 

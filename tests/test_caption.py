@@ -205,7 +205,7 @@ async def main():
     check('a bare /out caption is recognised', f.is_caption_out('/out'))
     check('/out mid-caption is recognised', f.is_caption_out('sent it, /out 500 done'))
     check('a captioned CASHOUT REQUEST is not a /out',
-          not f.is_caption_out('CASHOUT REQUEST $500 for Gabriel'))
+          not f.is_caption_out('!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 500'))
     check('an ordinary caption is not a /out', not f.is_caption_out('here is the proof'))
     check('an empty caption is not a /out',
           not f.is_caption_out('') and not f.is_caption_out(None))
@@ -231,7 +231,7 @@ async def main():
     check('a screenshot in a chime group is still ignored',
           await route(BotApiMsg(PICCASO, 'photo', caption='here is the proof')) is None)
     check('a captioned CASHOUT REQUEST reaches no handler',
-          await route(BotApiMsg(PICCASO, 'photo', caption='CASHOUT REQUEST $500')) is None)
+          await route(BotApiMsg(PICCASO, 'photo', caption='!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 500')) is None)
     check('a captioned payment notification in a chime group is ignored',
           await route(BotApiMsg(PICCASO, 'photo',
                                 caption='You received $15.0 from Gabriel W.')) is None)
@@ -251,7 +251,7 @@ async def main():
 
     # -- 3. Bot API: the whole flow, end to end ------------------------------
     reset()
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $120 for Kristan', 901, now,
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 120', 901, now,
                             user_id=42, username='chimeguy')
     copy_id = f._pending_cashouts[MHLARRY][0]['message_id']
     sent.clear()
@@ -287,7 +287,7 @@ async def main():
     mixed = 'You received $15.0 from Gabriel W. /out 5'
     f.ledger_commit(PICCASO, (100.0, 0.0))      # books already open, so a
     f.ledger_commit(MHLARRY, (100.0, 0.0))      # deposit would really land
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $5', 904, now, user_id=42)
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 5', 904, now, user_id=42)
     sent.clear()
     await f.cashout_caption(BotApiMsg(MHLARRY, 'photo', mid=905, caption=mixed))
     check('a caption never moves Total In',
@@ -305,7 +305,7 @@ async def main():
     check('the Telethon listener registered a handler', 'NewMessage' in captured)
 
     reset()
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $120 for Kristan', 906, now,
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 120', 906, now,
                             user_id=42, username='chimeguy')
     copy_id = f._pending_cashouts[MHLARRY][0]['message_id']
     sent.clear()
@@ -323,7 +323,7 @@ async def main():
 
     # -- 7. Telethon: captions that are not a /out stay dropped --------------
     reset()
-    await handler(TeleEvent(PICCASO, 'CASHOUT REQUEST $500', 908, media=Media(),
+    await handler(TeleEvent(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 500', 908, media=Media(),
                             sender=User(42, 'chimeguy')))
     check('userbot: a captioned CASHOUT REQUEST opens nothing',
           sent == [] and not f._pending_cashouts, str(sent))
@@ -341,7 +341,7 @@ async def main():
 
     # -- 8. plain text through the same handler is untouched -----------------
     reset()
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $30', 910, now, user_id=42)
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 30', 910, now, user_id=42)
     sent.clear()
     await handler(TeleEvent(MHLARRY, '/out 30', 911))
     check('userbot: a typed /out still behaves exactly as before',
@@ -364,7 +364,7 @@ async def main():
 
     # -- 9. dedup still holds across the two paths, with a caption -----------
     reset()
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $60', 913, now, user_id=42)
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 60', 913, now, user_id=42)
     copy_id = f._pending_cashouts[MHLARRY][0]['message_id']
     sent.clear()
     photo = BotApiMsg(MHLARRY, 'photo', caption='/out 60', mid=914, reply_to=copy_id)
@@ -380,7 +380,7 @@ async def main():
     # group's books are the ones that move - never the other route's.
     reset()
     gaffer_out = '/out 200\n$Some-Other-Cashtag'
-    await f.observe_cashout(GAFFER, 'CASHOUT REQUEST $200', 915, now, user_id=43)
+    await f.observe_cashout(GAFFER, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 200', 915, now, user_id=43)
     check('the GAFFER request is handled in Chime Rev',
           sent and sent[0][0] == CHIMEREV, str(sent))
     copy_id = f._pending_cashouts[CHIMEREV][0]['message_id']
@@ -405,7 +405,7 @@ async def main():
     # TARGET_CHAT where /out is a real ledger command. If that copy were ever
     # acted on, every cashout would come off the books twice.
     reset()
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $120', 917, now, user_id=42)
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 120', 917, now, user_id=42)
     copy_id = f._pending_cashouts[MHLARRY][0]['message_id']
     await f.cashout_caption(BotApiMsg(MHLARRY, 'photo', caption='/out 120',
                                       mid=918, reply_to=copy_id))

@@ -62,11 +62,11 @@ async def main():
 
     # -- 1. a request opens, is posted to the handling group, tagged ----------
     reset()
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $500 for Gabriel',
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 500',
                             901, now, user_id=42, username='chimeguy')
     check('request forwarded to the handling group', len(sent) == 1 and sent[0][0] == MHLARRY)
     check('crew tagged on the forward', '@Maynuddin23' in sent[0][1] and '@MHSUPPORTZONE' in sent[0][1])
-    check('original text preserved', 'CASHOUT REQUEST $500 for Gabriel' in sent[0][1])
+    check('original text preserved', '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 500' in sent[0][1])
     check('one request now open', len(f._pending_cashouts.get(MHLARRY, [])) == 1)
     posted_id = f._pending_cashouts[MHLARRY][0]['message_id']
     check('the origin message id is kept for the reaction',
@@ -74,7 +74,7 @@ async def main():
           str(f._pending_cashouts[MHLARRY][0]))
 
     # -- 2. GAFFER routes to its own group, not PICCASO's --------------------
-    await f.observe_cashout(GAFFER, 'CASHOUT REQUEST $80', 902, now, user_id=43)
+    await f.observe_cashout(GAFFER, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 80', 902, now, user_id=43)
     check('GAFFER routes to Chime Rev', sent[-1][0] == CHIMEREV)
 
     # -- 3. the /out answer goes home and earns the heart --------------------
@@ -104,13 +104,13 @@ async def main():
 
     # -- 6. our own posts never loop -----------------------------------------
     reset()
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $1', 912, now, user_id=BOTID)
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 1', 912, now, user_id=BOTID)
     check('own bot message ignored', sent == [] and not f._pending_cashouts)
 
     # -- 7. dedup across the two input paths ---------------------------------
     reset()
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $99', 913, now, user_id=42)
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $99', 913, now, user_id=42)
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 99', 913, now, user_id=42)
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 99', 913, now, user_id=42)
     check('same message seen twice forwards once', len(sent) == 1)
 
     # -- 7b. the SAME request arriving as two DIFFERENT messages -------------
@@ -119,9 +119,9 @@ async def main():
     # handling group, two sets of reminders and two things to answer for one
     # cashout.
     reset()
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $120 $Hawkins-Floral-Decor',
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $Hawkins-Floral-Decor\nAmount : 120',
                             930, now, user_id=42)
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $120 $Hawkins-Floral-Decor',
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $Hawkins-Floral-Decor\nAmount : 120',
                             931, now, user_id=42)
     check('an identical request under a different id is posted once',
           len(sent) == 1, str(sent))
@@ -134,7 +134,7 @@ async def main():
     check('reformatting the same request does not slip past it',
           len(sent) == 1, str(sent))
 
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $75 for someone else',
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 75',
                             933, now, user_id=42)
     check('a genuinely different request is still posted', len(sent) == 2, str(sent))
 
@@ -142,21 +142,21 @@ async def main():
     # Asking for the same amount to the same cashtag again later is ordinary,
     # so the guard is a burst filter, not a permanent block.
     reset()
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $120', 934, now, user_id=42)
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 120', 934, now, user_id=42)
     f._pending_cashouts[MHLARRY][0]['opened'] -= timedelta(
         seconds=f.CASHOUT_DEDUP_SECONDS + 1)
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $120', 935, now, user_id=42)
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 120', 935, now, user_id=42)
     check('the same request asked for again later is a real second one',
           len(sent) == 2, str(sent))
 
     # -- 7d. and once the first is actioned, an identical one is welcome -----
     reset()
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $120', 936, now, user_id=42)
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 120', 936, now, user_id=42)
     await f.observe_cashout(MHLARRY, '/out 120', 937, now,
                             user_id=77, username='Maynuddin23')
     check('the first is closed by its /out', MHLARRY not in f._pending_cashouts)
     sent.clear()
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $120', 938, now, user_id=42)
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 120', 938, now, user_id=42)
     check('an identical request after the first is settled still posts',
           len(sent) == 1, str(sent))
 
@@ -165,11 +165,11 @@ async def main():
     # they have hit a problem. The alert is HELD first: the crew routinely edit
     # the /out onto the message they just sent, and firing on the first version
     # would make an alert out of the ordinary way they work.
-    ETHAN, LARRY = f.ADMIN_ID, 7418675217
+    ETHAN, LARRY = f.ETHAN_ID, f.LARRY_ID
     f._user_ids['larryyxx'] = LARRY
 
     reset()
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $200', 940, now, user_id=42)
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 200', 940, now, user_id=42)
     req = f._pending_cashouts[MHLARRY][0]
     await f.note_cashout_seen(MHLARRY, req['message_id'], 77, 'Maynuddin23',
                               'Maynuddin Ahmed')
@@ -209,7 +209,7 @@ async def main():
 
     # -- 7f. a screenshot with NO caption counts as the same signal ----------
     reset()
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $200', 943, now, user_id=42)
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 200', 943, now, user_id=42)
     req = f._pending_cashouts[MHLARRY][0]
     await f.note_cashout_seen(MHLARRY, req['message_id'], 77, 'Maynuddin23')
     dms.clear()
@@ -223,7 +223,7 @@ async def main():
     # -- 7g. and the cases that must NOT raise it ---------------------------
     # The first thing anyone says is an acknowledgement, not a problem.
     reset()
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $200', 945, now, user_id=42)
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 200', 945, now, user_id=42)
     dms.clear()
     await f.observe_cashout(MHLARRY, 'looking now', 946, now,
                             user_id=77, username='Maynuddin23')
@@ -232,7 +232,7 @@ async def main():
 
     # A /out is the answer, not a problem.
     reset()
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $200', 947, now, user_id=42)
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 200', 947, now, user_id=42)
     req = f._pending_cashouts[MHLARRY][0]
     await f.note_cashout_seen(MHLARRY, req['message_id'], 77, 'Maynuddin23')
     dms.clear()
@@ -250,7 +250,7 @@ async def main():
 
     # A stranger talking is not the crew hitting a problem.
     reset()
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $200', 949, now, user_id=42)
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 200', 949, now, user_id=42)
     req = f._pending_cashouts[MHLARRY][0]
     await f.note_cashout_seen(MHLARRY, req['message_id'], 77, 'Maynuddin23')
     dms.clear()
@@ -273,9 +273,11 @@ async def main():
 
     # -- 9. two open requests: reply-to wins, else oldest --------------------
     reset()
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST A', 920, now, user_id=42)
+    # Distinct on purpose: two identical requests minutes apart are caught by
+    # the duplicate guard, which is a different test (see below).
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $tag-a\nAmount : 100', 920, now, user_id=42)
     first = f._pending_cashouts[MHLARRY][0]['message_id']
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST B', 921, now, user_id=42)
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $tag-b\nAmount : 200', 921, now, user_id=42)
     second = f._pending_cashouts[MHLARRY][1]['message_id']
     await f.observe_cashout(MHLARRY, '/out B', 922, now, user_id=77,
                             username='Maynuddin23', reply_to=second)
@@ -291,7 +293,7 @@ async def main():
     # -- 10. escalation: re-tag in group + private warnings ------------------
     reset()
     f._user_ids['maynuddin23'] = 555            # learned id, so the bot can DM
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $700', 930, now, user_id=42)
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 700', 930, now, user_id=42)
     req = f._pending_cashouts[MHLARRY][0]
     # The ladder runs on absolute time from when the request was posted, so it
     # is 'opened' - not 'last_seen' - that makes a rung due.
@@ -319,7 +321,7 @@ async def main():
     # 'OUT REQUEST HAS CROSSED' separates the escalation DM from the separate
     # notify_admin alert about who could not be reached, which also goes to Ethan.
     admin_dms = [t for uid, t in dms
-                 if uid in (f.ADMIN_ID, 7418675217) and 'OUT REQUEST HAS CROSSED' in t]
+                 if uid in (f.ETHAN_ID, f.LARRY_ID) and 'OUT REQUEST HAS CROSSED' in t]
     crew_dms = [t for uid, t in dms if uid == 555]        # learned id, above
     check('Ethan and Larry both warned', len(admin_dms) == 2, str(len(admin_dms)))
     check('admin DMs carry the routing',
@@ -367,8 +369,8 @@ async def main():
 
     # -- NOTHING the bot posts into a handling group carries Ethan's name ----
     reset()
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $400', 960, now, user_id=42)
-    await f.observe_cashout(GAFFER, 'CASHOUT REQUEST $60', 961, now, user_id=42)
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 400', 960, now, user_id=42)
+    await f.observe_cashout(GAFFER, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 60', 961, now, user_id=42)
     for chat in (MHLARRY, CHIMEREV):
         f._pending_cashouts[chat][0]['opened'] = (
             datetime.now(timezone.utc) - timedelta(minutes=6))
@@ -392,7 +394,7 @@ async def main():
 
     # -- 11. a crew reply resets the clock -----------------------------------
     reset()
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $300', 940, now, user_id=42)
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 300', 940, now, user_id=42)
     req = f._pending_cashouts[MHLARRY][0]
     req['last_seen'] = now - timedelta(minutes=10)
     await f.observe_cashout(MHLARRY, 'checking now', 941, now, user_id=77, username='MHSUPPORTZONE')
@@ -402,7 +404,7 @@ async def main():
 
     # -- 12. a stranger talking does NOT reset the clock ---------------------
     reset()
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $10', 950, now, user_id=42)
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 10', 950, now, user_id=42)
     req = f._pending_cashouts[MHLARRY][0]
     stale = now - timedelta(minutes=10)
     req['last_seen'] = stale

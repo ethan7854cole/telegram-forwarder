@@ -40,7 +40,7 @@ import forwarder as f
 
 PICCASO, GAFFER = -5350880041, -5580596463
 MHLARRY, CHIMEREV = -1003894781195, -1002335630148
-ETHAN, LARRY, CREW = 7578145913, 7418675217, 77
+ETHAN, LARRY, CREW = f.ETHAN_ID, f.LARRY_ID, 77
 BOTID = 111222
 
 sent, dms, replies, copies, reactions = [], [], [], [], []
@@ -162,7 +162,7 @@ async def seed_open_request(origin, mid=901, minutes_ago=0):
     kept_ids, kept = f.PAUSED_CHAT_IDS, f.PAUSED_CHATS
     f.PAUSED_CHAT_IDS, f.PAUSED_CHATS = [], set()
     try:
-        await f.observe_cashout(origin, 'CASHOUT REQUEST $500 for Gabriel W.',
+        await f.observe_cashout(origin, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 500',
                                 mid, datetime.now(timezone.utc), user_id=42)
     finally:
         f.PAUSED_CHAT_IDS, f.PAUSED_CHATS = kept_ids, kept
@@ -227,7 +227,7 @@ async def test_forwarding():
 # --------------------------------------------------------------------------
 async def test_cashouts():
     reset()
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $500 for Gabriel W.',
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 500',
                             701, datetime.now(timezone.utc), user_id=42)
     check('a request in a paused chime group opens nothing',
           not f._pending_cashouts, str(f._pending_cashouts))
@@ -258,7 +258,7 @@ async def test_cashouts():
 
     # the control
     reset()
-    await f.observe_cashout(GAFFER, 'CASHOUT REQUEST $500 for Gabriel W.',
+    await f.observe_cashout(GAFFER, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 500',
                             705, datetime.now(timezone.utc), user_id=42)
     check('the live route still opens requests',
           len(f._pending_cashouts.get(CHIMEREV, [])) == 1, str(f._pending_cashouts))
@@ -486,7 +486,7 @@ async def test_silence():
     await seed_open_request(PICCASO, mid=1001, minutes_ago=45)
     reset_dms = len(dms)
     now = datetime.now(timezone.utc)
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $900 for Someone', 1002, now,
+    await f.observe_cashout(PICCASO, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 900', 1002, now,
                             user_id=42)
     await f.observe_cashout(MHLARRY, '/out 900', 1003, now, user_id=CREW,
                             username='maynuddin23')

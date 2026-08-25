@@ -18,7 +18,8 @@ import forwarder as f
 
 PICCASO, GAFFER = -5350880041, -5580596463
 MHLARRY, CHIMEREV = -1003894781195, -1002335630148
-LARRY, ETHAN, CREW = 7418675217, 7578145913, 555
+LARRY, ETHAN, CREW = f.LARRY_ID, f.ETHAN_ID, 555
+ADMIN = f.ADMIN_ID          # notify_admin(): the bot-owner account
 
 sent, dms, reactions, deleted = [], [], [], []
 _next_id = [6000]
@@ -80,7 +81,7 @@ async def run_watchdog(seconds=0.2):
     f.asyncio.sleep = real_sleep
 
 
-async def open_request(text='CASHOUT REQUEST $200 for Gabriel W.', msg_id=901):
+async def open_request(text='!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 200', msg_id=901):
     await f.observe_cashout(PICCASO, text, msg_id, datetime.now(timezone.utc),
                             user_id=42)
     return f._pending_cashouts[MHLARRY][-1]
@@ -143,11 +144,13 @@ async def main():
 
     # -- a figure that cannot be read is not guessed at ---------------------
     reset()
-    await open_request('CASHOUT REQUEST for Gabriel W.')       # no amount
+    # Every valid request now carries a readable Amount line, so 'unreadable'
+    # is no longer reachable - what is tested here is the matching case.
+    await open_request('!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 150')
     dms.clear()
     await f.observe_cashout(MHLARRY, '/out 150', 905, datetime.now(timezone.utc),
                             user_id=77, username='Maynuddin23')
-    check('an unreadable request amount raises nothing',
+    check('a /out matching the figure asked raises nothing',
           larry_dms('CASHOUT PAID') == [], str(dms))
 
     reset()
@@ -257,8 +260,8 @@ async def main():
     f.bot.delete_message = FakeBot.delete_message.__get__(f.bot)
 
     warned = [t for uid, t, _ in dms
-              if uid == ETHAN and 'chase DM to the crew could not be deleted' in t]
-    check('Ethan is told when the chase DM cannot be taken back',
+              if uid == ADMIN and 'chase DM to the crew could not be deleted' in t]
+    check('the admin account is told when the chase DM cannot be taken back',
           len(warned) == 1, str(dms))
     check('and told the money side is already done',
           warned and 'already done' in warned[0], str(warned))
@@ -309,8 +312,8 @@ async def main():
     # Two requests open in one handling group: paying one must not clear the
     # reminders still chasing the other.
     reset()
-    first = await open_request('CASHOUT REQUEST $200 for Gabriel W.', msg_id=920)
-    second = await open_request('CASHOUT REQUEST $75 for Priya N.', msg_id=921)
+    first = await open_request('!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 200', msg_id=920)
+    second = await open_request('!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 75', msg_id=921)
     check('both requests are open', len(f._pending_cashouts[MHLARRY]) == 2)
     for request in (first, second):
         request['opened'] = datetime.now(timezone.utc) - timedelta(minutes=6)
@@ -353,7 +356,7 @@ async def main():
                             user_id=77, username='Maynuddin23')
     f.bot.delete_message = FakeBot.delete_message.__get__(f.bot)
     check('a reminder already deleted by hand raises nothing',
-          [t for uid, t, _ in dms if uid == ETHAN and 'reminder' in t] == [],
+          [t for uid, t, _ in dms if uid == ADMIN and 'reminder' in t] == [],
           str(dms))
 
     # -- a delete that really fails is not silent ---------------------------
@@ -371,8 +374,8 @@ async def main():
     f.bot.delete_message = FakeBot.delete_message.__get__(f.bot)
 
     stuck = [t for uid, t, _ in dms
-             if uid == ETHAN and 'could not be deleted from the group' in t]
-    check('Ethan is told when a reminder cannot be taken back',
+             if uid == ADMIN and 'could not be deleted from the group' in t]
+    check('the admin account is told when a reminder cannot be taken back',
           len(stuck) == 1, str(dms))
     check('and told the money side is already done',
           stuck and 'already done' in stuck[0], str(stuck))

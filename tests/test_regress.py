@@ -85,14 +85,14 @@ async def main():
 
     # -- /out ledger command in a target group is unaffected -----------------
     reset()
-    await f.ledger_command(M(GAFFER, '/out 100', 7418675217))
+    await f.ledger_command(M(GAFFER, '/out 100', f.ETHAN_ID))
     check('/out still books to Total Out in a chime group',
           f.ledger_snapshot(GAFFER) == (0.0, 100.0), str(f.ledger_snapshot(GAFFER)))
     check('/out opened no cashout request', not f._pending_cashouts)
 
     # -- /add still works ----------------------------------------------------
     reset()
-    await f.ledger_command(M(GAFFER, '/add 250', 7418675217))
+    await f.ledger_command(M(GAFFER, '/add 250', f.ETHAN_ID))
     check('/add still books to Total In', f.ledger_snapshot(GAFFER) == (250.0, 0.0))
 
     # -- a non-admin is still refused ----------------------------------------
@@ -103,7 +103,7 @@ async def main():
 
     # -- /set still corrects -------------------------------------------------
     reset()
-    await f.ledger_set_command(M(GAFFER, '/set in 800', 7418675217))
+    await f.ledger_set_command(M(GAFFER, '/set in 800', f.ETHAN_ID))
     check('/set still overwrites a column', f.ledger_snapshot(GAFFER) == (800.0, 0.0))
 
     # -- watched chat list now covers both ends of a cashout route -----------

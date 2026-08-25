@@ -74,7 +74,7 @@ async def main():
     # -- a completely different pair of groups works end to end -------------
     NEWSRC, NEWHANDLE = -777001, -777002
     use_routes(f'{NEWSRC}:{NEWHANDLE}')
-    await f.observe_cashout(NEWSRC, 'CASHOUT REQUEST $50', 501, now, user_id=42)
+    await f.observe_cashout(NEWSRC, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 50', 501, now, user_id=42)
     check('a re-pointed request forwards to the new group',
           sent and sent[0][0] == NEWHANDLE, str(sent))
     await f.observe_cashout(NEWHANDLE, '/out 50', 502, now, user_id=77,
@@ -89,7 +89,7 @@ async def main():
     # -- /out routed to a THIRD group ---------------------------------------
     SRC, HANDLE, OUT = -888001, -888002, -888003
     use_routes(f'{SRC}:{HANDLE}:{OUT}')
-    await f.observe_cashout(SRC, 'CASHOUT REQUEST $80', 601, now, user_id=42)
+    await f.observe_cashout(SRC, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 80', 601, now, user_id=42)
     check('request still forwards to the handling group',
           sent and sent[0][0] == HANDLE, str(sent))
     await f.observe_cashout(HANDLE, '/out 80', 602, now, user_id=77,
@@ -108,7 +108,7 @@ async def main():
 
     # -- an in-flight request keeps its target if the route is re-pointed ---
     use_routes(f'{SRC}:{HANDLE}:{OUT}')
-    await f.observe_cashout(SRC, 'CASHOUT REQUEST $10', 701, now, user_id=42)
+    await f.observe_cashout(SRC, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 10', 701, now, user_id=42)
     use_routes_keep = dict(f.CASHOUT_ROUTES)
     pending = f._pending_cashouts[HANDLE][0]
     f.CASHOUT_ROUTES[SRC] = {'handling': HANDLE, 'out_to': -999999}   # re-pointed

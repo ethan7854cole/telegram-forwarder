@@ -200,7 +200,7 @@ async def main():
     # The reaction still on the original is what says it was taken back.
     CHIMEREV, GAFFER = -1002335630148, -5580596463
     check('the live route is a retract source', CHIMEREV in f.RETRACT_SOURCES)
-    ETHAN = 7578145913
+    ETHAN = f.ETHAN_ID
 
     twin5 = payment(5, 100.0, 20.0)
     retracted = [Msg(451, twin5, 12, src_bot, Reaction([ETHAN])),

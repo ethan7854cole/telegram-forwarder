@@ -9,8 +9,10 @@ import forwarder as f
 
 PICCASO, GAFFER = -5350880041, -5580596463
 MHLARRY, CHIMEREV = -1003894781195, -1002335630148
-sent, reactions, failures = [], [], []
+sent, dms, deleted, reactions, failures = [], [], [], [], []
 react_error = [None]
+delete_error = [None]
+ETHAN, LARRY = f.ETHAN_ID, f.LARRY_ID
 
 
 class FakeMsg:
@@ -18,12 +20,21 @@ class FakeMsg:
 
 
 class FakeBot:
+    # Ethan and Larry are administrators in every group and the bot posts its
+    # own messages, so a delete lands - except past Telegram's 48-hour limit,
+    # which is what delete_error stands in for.
     async def send_message(self, chat_id, text, reply_to_message_id=None):
+        if chat_id > 0:
+            dms.append((chat_id, text)); return FakeMsg(7000 + len(dms))
         sent.append((chat_id, text)); return FakeMsg(7000 + len(sent))
     async def set_message_reaction(self, chat_id, message_id, reaction):
         if react_error[0]:
             raise RuntimeError(react_error[0])
         reactions.append((chat_id, message_id)); return True
+    async def delete_message(self, chat_id, message_id):
+        if delete_error[0]:
+            raise RuntimeError(delete_error[0])
+        deleted.append((chat_id, message_id)); return True
 
 
 class FakeEntity:
@@ -49,15 +60,16 @@ def check(label, cond, detail=''):
 
 
 def reset():
-    sent.clear(); reactions.clear(); f._ledger.clear()
+    sent.clear(); dms.clear(); deleted.clear(); reactions.clear(); f._ledger.clear()
     f._seen_messages.clear(); f._pending_cashouts.clear()
-    react_error[0] = None
+    react_error[0] = None; delete_error[0] = None
     f.USERBOT_SEND = False; f._active_client = None
+    f._user_ids.update({'ethannxxxx': ETHAN, 'larryyxx': LARRY})
 
 
 async def open_one(origin=PICCASO, origin_msg_id=901):
     now = datetime.now(timezone.utc)
-    await f.observe_cashout(origin, 'CASHOUT REQUEST $500', origin_msg_id, now, user_id=42)
+    await f.observe_cashout(origin, '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 500', origin_msg_id, now, user_id=42)
     return f.CASHOUT_ROUTES[origin]['handling']
 
 
@@ -88,6 +100,78 @@ async def main():
     task.cancel()
     f.asyncio.sleep = real_sleep
     check('a deleted request is never chased', sent == [], str(sent))
+
+    # -- the chime side deleting it takes it back off the crew --------------
+    for origin in (PICCASO, GAFFER):
+        reset()
+        handling = await open_one(origin, origin_msg_id=901)
+        request = f._pending_cashouts[handling][0]
+        copy_id = request['message_id']
+        request['group_notice'] = [5001, 5002]
+        request['crew_notice'] = [('bot', 77, 6001)]
+        sent.clear(); dms.clear()      # only what the DELETION does, from here
+        await f.close_deleted_cashouts(FakeClient(alive=[]), origin, [901])
+        label = f.chat_name(origin)
+
+        check(f'{label}: the forwarded copy is deleted',
+              (handling, copy_id) in deleted, str(deleted))
+        check(f'{label}: the reminders go with it',
+              (handling, 5001) in deleted and (handling, 5002) in deleted,
+              str(deleted))
+        check(f"{label}: and the crew's chase DM",
+              (77, 6001) in deleted, str(deleted))
+        check(f'{label}: nothing is deleted in the chime group itself',
+              not [d for d in deleted if d[0] == origin], str(deleted))
+
+        for who, name in ((ETHAN, 'Ethan'), (LARRY, 'Larry')):
+            note = [t for c, t in dms if c == who and 'WAS DELETED' in t]
+            check(f'{label}: {name} is told', len(note) == 1, str(dms))
+            check(f'{label}: {name} is told which group it was deleted in',
+                  note and f'Deleted in: {label}' in note[0], str(note))
+            check(f'{label}: {name} is warned to check it was not already paid',
+                  note and 'worth checking' in note[0], str(note))
+        check(f'{label}: the crew are not DMed about it',
+              [t for c, t in dms if c == 77] == [], str(dms))
+        check(f'{label}: and nothing is posted in either group', sent == [],
+              str(sent))
+
+    # -- the crew deleting the copy is NOT the same thing -------------------
+    reset()
+    handling = await open_one(PICCASO, origin_msg_id=901)
+    request = f._pending_cashouts[handling][0]
+    sent.clear(); dms.clear()
+    await f.close_deleted_cashouts(FakeClient(alive=[]), handling,
+                                   [request['message_id']])
+    check('a copy deleted in the handling group settles the request',
+          not f._pending_cashouts, str(f._pending_cashouts))
+    check('and the chime group\'s own message is never deleted for them',
+          deleted == [], str(deleted))
+    check('nor is a withdrawal reported', dms == [], str(dms))
+
+    # -- a copy too old to delete is reported, not swallowed ----------------
+    reset()
+    handling = await open_one(PICCASO, origin_msg_id=901)
+    delete_error[0] = 'Bad Request: message can\'t be deleted'
+    dms.clear()
+    await f.close_deleted_cashouts(FakeClient(alive=[]), PICCASO, [901])
+    note = [t for c, t in dms if c == ETHAN and 'WAS DELETED' in t]
+    check('a copy that cannot be deleted is called out',
+          note and 'Could not remove: the forwarded request' in note[0], str(note))
+    check('and they are pointed at /del, which works without admin rights',
+          note and 'reply to it with /del' in note[0], str(note))
+    check('the request is still dropped from the queue',
+          not f._pending_cashouts, str(f._pending_cashouts))
+
+    # -- a copy already gone is not an error --------------------------------
+    reset()
+    handling = await open_one(PICCASO, origin_msg_id=901)
+    delete_error[0] = 'Bad Request: message to delete not found'
+    dms.clear()
+    await f.close_deleted_cashouts(FakeClient(alive=[]), PICCASO, [901])
+    note = [t for c, t in dms if c == ETHAN and 'WAS DELETED' in t]
+    check('a copy already gone is not reported as a failure',
+          note and 'Could not remove' not in note[0]
+          and 'already gone' in note[0], str(note))
 
     # -- a deletion in a DIFFERENT chat leaves it alone ---------------------
     reset()

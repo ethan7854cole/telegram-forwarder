@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import forwarder as f
 
 PICCASO, MHLARRY = -5350880041, -1003894781195
-LARRY, CREW = 7418675217, 77
+LARRY, CREW = f.LARRY_ID, 77
 sent, dms, failures = [], [], []
 
 # Learned ids, so the bot can actually DM them. Without these every private
@@ -43,7 +43,7 @@ def reset():
 
 
 async def open_one():
-    await f.observe_cashout(PICCASO, 'CASHOUT REQUEST $500', 901,
+    await f.observe_cashout(PICCASO, '!! Cashout Request !! Tag name : $jenny-buhr Amount : 500', 901,
                             datetime.now(timezone.utc), user_id=42)
     return f._pending_cashouts[MHLARRY][0]
 
@@ -247,7 +247,7 @@ async def main():
           submitted and 'CHIME PICCASO' in submitted[0]
           and 'MH X LARRY GROUP 2' in submitted[0], str(submitted))
     check('it carries the request text',
-          submitted and 'CASHOUT REQUEST $500' in submitted[0], str(submitted))
+          submitted and '!! Cashout Request !! Tag name : $jenny-buhr Amount : 500' in submitted[0], str(submitted))
     check('it says what happens next',
           submitted and 'Waiting on a reaction' in submitted[0], str(submitted))
     check('submission fires before any reaction', req['seen'] is False)
@@ -262,7 +262,7 @@ async def main():
           str(larry_dms))
     check('it names the @username', larry_dms and '@Maynuddin23' in larry_dms[0],
           str(larry_dms))
-    check('it carries the request', larry_dms and 'CASHOUT REQUEST $500' in larry_dms[0])
+    check('it carries the request', larry_dms and '!! Cashout Request !! Tag name : $jenny-buhr Amount : 500' in larry_dms[0])
     check('it says the /out is still awaited',
           larry_dms and 'Waiting on the /out' in larry_dms[0], str(larry_dms))
 
@@ -340,7 +340,7 @@ async def main():
 
     # -- nobody reacts: Larry on the first rung, the crew not until 17 min ---
     reset()
-    f._user_ids['larryyxx'] = 7418675217
+    f._user_ids['larryyxx'] = f.LARRY_ID
     req = await open_one()
     dms.clear()
     req['opened'] = datetime.now(timezone.utc) - timedelta(minutes=6)
@@ -349,7 +349,7 @@ async def main():
     crew = [t for uid, t in dms if uid == 77]
     check('Larry is told on the first rung', len(larry) == 1, str(dms))
     check('it carries the request and the routing',
-          larry and 'CASHOUT REQUEST $500' in larry[0]
+          larry and '!! Cashout Request !! Tag name : $jenny-buhr Amount : 500' in larry[0]
           and 'CHIME PICCASO' in larry[0] and 'MH X LARRY GROUP 2' in larry[0], str(larry))
     check('it says nobody has sent a /out',
           larry and 'Nobody has sent a /out' in larry[0], str(larry))
