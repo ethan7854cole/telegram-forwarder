@@ -403,10 +403,63 @@ async def test_only_the_format_opens():
 
 
 # --------------------------------------------------------------------------
+# The real message, verbatim, that was REJECTED on 26 Aug 2026. Kept exactly as
+# it was typed - venmo @tag, the bracketed note after it, the blank line and the
+# 🆘 line underneath. Every part of it broke something at some point, so it is
+# the whole message that is pinned here, not a tidied version of it.
+
+LIVE = ("!! Cashout Request !!\n"
+        "Tag name: @michelle-surman-2 ( Venmo )\n"
+        "Amount: 200\n\n"
+        "\U0001F198 IMP NOTE: Already requested by player on group tag")
+
+
+async def test_the_request_that_failed():
+    reset()
+    await f.observe_cashout(GAFFER, LIVE, 4001, NOW, user_id=999,
+                            username='galactus')
+
+    check('it opens', len(f._pending_cashouts.get(CHIMEREV, [])) == 1,
+          str(f._pending_cashouts))
+    posted = to(CHIMEREV)
+    check('it reaches the crew', len(posted) == 1, str(posted))
+    check('with the venmo tag intact',
+          posted and '@michelle-surman-2' in posted[0], str(posted))
+    check('the bracketed ( Venmo ) note survives',
+          posted and '( Venmo )' in posted[0], str(posted))
+    check('so does the 🆘 note underneath',
+          posted and 'Already requested by player' in posted[0], str(posted))
+    check('and the crew are tagged',
+          posted and '@Maynuddin23' in posted[0], str(posted))
+    check('the figure is read', f.request_amount(LIVE) == 200.0,
+          str(f.request_amount(LIVE)))
+    check('and the tag', f.request_tag(LIVE) == '@michelle-surman-2',
+          str(f.request_tag(LIVE)))
+    check('Larry is told it was submitted',
+          [t for c, t in dms if 'SUBMITTED' in t] != [], str(dms))
+
+    # ...and the crew answer it with the receipt.
+    request = f._pending_cashouts[CHIMEREV][0]
+    sent.clear(); dms.clear()
+    await f.observe_cashout(CHIMEREV, '/out 200', 4002, NOW, user_id=MAY,
+                            username='Maynuddin23', has_media=True,
+                            reply_to=request['message_id'])
+    check('the /out settles it', f._pending_cashouts.get(CHIMEREV, []) == [],
+          str(f._pending_cashouts))
+    check('the screenshot reaches CHIME GAFFER',
+          [c for c, _ in copies if c == GAFFER] != [], str(copies))
+    check('200 is booked to the group that asked',
+          f.ledger_snapshot(GAFFER)[1] == 200.0, str(f.ledger_snapshot(GAFFER)))
+    check('and Larry is told it completed',
+          [t for c, t in dms if 'COMPLETED' in t] != [], str(dms))
+
+
+# --------------------------------------------------------------------------
 async def main():
     test_the_format()
     test_mentions_crew()
     test_who_wrote_it()
+    await test_the_request_that_failed()
     await test_only_the_format_opens()
     await test_no_request_opened()
     await test_real_requests_still_open()
