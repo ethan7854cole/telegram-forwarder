@@ -271,12 +271,25 @@ async def main():
     check('Larry is told it completed',
           any('SCREENSHOT' in t.upper() for _, t in dms), str(dms))
 
-    # -- 4. a captioned /out with nothing pending is left completely alone ---
+    # -- 4. a captioned /out with NOTHING pending is still relayed ----------
+    # Changed 2026-08-27. It used to be dropped, and a real one was: $200 left,
+    # the group that asked was told nothing, and its Total Out was short by that
+    # much for a day. A payment screenshot is not posted in passing - it is the
+    # proof the money moved, which is what separates it from chatter.
     reset()
     await f.cashout_caption(BotApiMsg(MHLARRY, 'photo', caption=screenshot_out, mid=903))
-    check('a captioned /out with nothing pending is ignored',
-          sent == [] and reactions == [] and f.ledger_snapshot(MHLARRY) == (0.0, 0.0),
-          str(sent))
+    relayed = [t for c, t, _ in sent if c == PICCASO]
+    check('a captioned /out with nothing pending is still relayed',
+          relayed != [], str(sent))
+    check('and booked to the group that asked',
+          f.ledger_snapshot(PICCASO)[1] == 120.0, str(f.ledger_snapshot(PICCASO)))
+    check('the handling group\'s own books are untouched',
+          f.ledger_snapshot(MHLARRY) == (0.0, 0.0), str(f.ledger_snapshot(MHLARRY)))
+    check('no heart, because the request it answers is not in memory',
+          reactions == [], str(reactions))
+    check('and both accounts are told it was taken on the screenshot',
+          [t for c, t in dms if 'screenshot' in t and 'nothing was open' in t] != [],
+          str(dms))
 
     # -- 5. a caption is never a payment notification ------------------------
     # Both keywords in one caption, posted in MH X LARRY - which is a cashout

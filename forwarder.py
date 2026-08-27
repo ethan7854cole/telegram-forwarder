@@ -1779,10 +1779,27 @@ def strip_foreign_handles(text):
     if not text:
         return text
 
-    cleaned = _HANDLE_RE.sub('', text)
+    # The TAG is exempt - and it is the tag itself that is exempt, not the line
+    # it sits on. A venmo tag is written "@michelle-surman-2", indistinguishable
+    # from a person's handle to a regex, and stripping it leaves the crew a
+    # cashout with no destination: it is the one @ from the chime side they are
+    # meant to see.
+    #
+    # Held out by token rather than by line because the callers do not all pass
+    # whole lines. _cashout_preview() collapses the request to ONE line before
+    # this runs, so exempting "the line with the tag on it" would exempt the
+    # entire request - and put every chime handle straight into the chase DM.
+    tag = _REQ_TAG_LINE_RE.search(text or '')
+    token = tag.group(1) if tag else ''
+    held = token.startswith('@')
+    working = text.replace(token, '\x00tag\x00', 1) if held else text
+
+    cleaned = _HANDLE_RE.sub('', working)
     cleaned = re.sub(r'[ \t]{2,}', ' ', cleaned)
     cleaned = re.sub(r'[ \t]+(\r?\n)', r'\1', cleaned)
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    if held:
+        cleaned = cleaned.replace('\x00tag\x00', token)
     return cleaned.strip() or text
 
 
@@ -2288,8 +2305,11 @@ def cashout_submitted_text(request, handling):
 # there. That balance is the whole design: too loose and chatter opens
 # cashouts; too tight and a real request typed slightly differently is dropped
 # in silence, which is far worse - it is money nobody is asked for.
+# The tag may be a Cash App $cashtag OR a Venmo @handle. Only $ was accepted
+# until 2026-08-27, which rejected "Tag name: @michelle-surman-2 ( Venmo )" -
+# a real request, dropped, and the cashout went unforwarded.
 _REQ_TAG_LINE_RE = re.compile(
-    r'tag(?:\s*name)?\s*[:\-=]\s*(\$?[A-Za-z][\w.\-]*)', re.I)
+    r'tag(?:\s*name)?\s*[:\-=]\s*([@$]?[A-Za-z][\w.\-]*)', re.I)
 _REQ_AMOUNT_LINE_RE = re.compile(
     r'amount\s*[:\-=]\s*\$?\s*([\d,]+(?:\.\d+)?)', re.I)
 
@@ -2330,7 +2350,7 @@ def request_tag(text):
     line = _REQ_TAG_LINE_RE.search(text or '')
     if line:
         tag = line.group(1)
-        return tag if tag.startswith('$') else '$' + tag
+        return tag if tag[0] in '@$' else '$' + tag
     match = _CASHTAG_RE.search(text or '')
     return match.group(0) if match else None
 
@@ -2764,19 +2784,24 @@ async def _deliver_out(out_to, handling, text, username=None, full_name=None,
 
 async def force_complete_cashout(handling, text, user_id, username,
                                  full_name=None, message_id=None, has_media=False,
-                                 media_group_id=None):
-    """Ethan or Larry finishing a cashout by hand, with nothing open here.
+                                 media_group_id=None, by_admin=True):
+    """A /out completed with nothing open here. Two ways to earn that.
 
     The standing rule is that a /out with no request pending is ordinary traffic
-    and is left completely alone. That rule is right for the crew and wrong for
-    Ethan and Larry, because open requests live in MEMORY: a redeploy wipes
-    them, and a redeploy is exactly the moment somebody needs to finish a
-    cashout the bot has forgotten. Until now their /out did nothing at all - it
-    sat in the group looking actioned to everyone reading it, while the group
-    that asked was told nothing and its books never moved.
+    and is left completely alone. Open requests live in MEMORY, so a redeploy
+    wipes them - and a redeploy is exactly the moment somebody needs to finish a
+    cashout the bot has forgotten. Two cases are allowed through:
 
-    Ethan and Larry only. The crew's /out with nothing open stays ordinary
-    traffic, which is what keeps this from firing on chatter.
+    - **Ethan or Larry**, whose word is taken at face value.
+    - **Anybody, when the /out carries a SCREENSHOT.** Added 2026-08-27 after a
+      crew /out on a Cash App receipt was ignored for a day: $200 had left, the
+      group that asked was told nothing, and its Total Out was short by that
+      much with no record anywhere that it had happened. A payment screenshot is
+      not something anyone posts in passing - it is the proof the money moved,
+      and that is exactly what separates it from chatter.
+
+    A bare /out from the crew with nothing open is still ordinary traffic. That
+    is what keeps this from firing on conversation.
 
     There is nothing to ❤: the request this answers is not in memory, so its
     message id is not either. The money side is what matters here, and it is
@@ -2786,8 +2811,9 @@ async def force_complete_cashout(handling, text, user_id, username,
         return
     out_to = CASHOUT_ROUTES.get(source, {}).get('out_to', source)
 
+    why = "by hand" if by_admin else "on the screenshot"
     print(f"🔧 [CASHOUT] no request open in {chat_name(handling)} - completing "
-          f"by hand for {username or user_id}", flush=True)
+          f"{why} for {username or user_id}", flush=True)
 
     if not await _deliver_out(out_to, handling, text, username, full_name,
                               message_id, has_media, media_group_id):
@@ -2797,10 +2823,17 @@ async def force_complete_cashout(handling, text, user_id, username,
 
     await warn_unreachable(await dm_handles(
         CASHOUT_ADMIN_HANDLES,
-        f"🔧 A /out was completed by hand in {chat_name(handling)}.\n\n"
-        f"Nothing was open there — most likely the request was lost in a "
-        f"redeploy — so it was taken at face value.\n\n"
-        f"Sent to: {chat_name(out_to)}\n"
+        (f"🔧 A /out was completed by hand in {chat_name(handling)}.\n\n"
+         "Nothing was open there — most likely the request was lost in a "
+         "redeploy — so it was taken at face value.\n\n"
+         if by_admin else
+         f"🧾 A /out arrived in {chat_name(handling)} with a screenshot, and "
+         "nothing was open there.\n\n"
+         f"Sent by {describe_user(username, full_name)}. The screenshot is the "
+         "proof the money moved, so it was relayed and booked rather than "
+         "ignored — most likely the request was lost in a redeploy, or never "
+         "opened.\n\n")
+        + f"Sent to: {chat_name(out_to)}\n"
         f"Booked: {f'{booked:,.2f}$' if booked else 'nothing (no figure in the /out)'}\n\n"
         "No ❤ was placed: the original request is not in memory, so there is "
         "nothing to mark. Worth adding by hand if it is still there."))
@@ -2821,10 +2854,30 @@ async def handle_cashout_reply(handling, text, user_id, username, reply_to,
     text = text or ''
     queue = _pending_cashouts.get(handling)
     if not queue:
-        if user_id in LEDGER_ADMINS and _OUT_CMD_RE.search(text):
+        # Nothing open. Ethan's and Larry's word carries on its own; anybody
+        # else needs the screenshot, which is the proof the money actually
+        # moved - see force_complete_cashout().
+        by_admin = user_id in LEDGER_ADMINS
+        if _OUT_CMD_RE.search(text) and (by_admin or has_media):
             await force_complete_cashout(handling, text, user_id, username,
                                          full_name, message_id, has_media,
-                                         media_group_id)
+                                         media_group_id, by_admin=by_admin)
+        elif _OUT_CMD_RE.search(text):
+            # A bare /out from the crew, still ordinary traffic - but no longer
+            # SILENT. Somebody typing this usually means money has just left,
+            # and a day passed before the last one was noticed.
+            print(f"⚠️ [CASHOUT] bare /out in {chat_name(handling)} with nothing "
+                  f"open - not relayed ({username or user_id})", flush=True)
+            if out_amount(text) is not None:
+                await warn_unreachable(await dm_handles(
+                    CASHOUT_ADMIN_HANDLES,
+                    f"⚠️ A /out WAS NOT RELAYED from {chat_name(handling)}.\n\n"
+                    f"{' '.join((text or '').split())[:200]}\n\n"
+                    f"Sent by {describe_user(username, full_name)}, with no "
+                    "request open there and no screenshot on it — so the bot "
+                    "cannot tell which cashout it answers or whether the money "
+                    "really went.\n\n"
+                    "If it did, reply to it with /out to relay and book it."))
         return
     responder = _is_responder(user_id, username, handling)
     target = _match_request(queue, reply_to, text)

@@ -164,6 +164,31 @@ async def main():
     check('nor reaches them in the chase DM', '@gaffer_boss' not in crew_dm, crew_dm)
     check('which still says what is owed', 'Amount : 500' in crew_dm, crew_dm)
 
+    # A VENMO tag is an @handle, and it is the one @ on the chime side the crew
+    # MUST see - it is the payment destination, not somebody's identity.
+    reset()
+    await f.observe_cashout(
+        GAFFER, '!! Cashout Request !!\nTag name: @michelle-surman-2 ( Venmo )\n'
+                'Amount: 200\nasked by @gaffer_boss', 903, now, user_id=42)
+    posted = [t for c, t in sent if c == CHIMEREV]
+    check('the venmo tag reaches the crew intact',
+          posted and '@michelle-surman-2' in posted[0], str(posted))
+    check('while the chime handle beside it is still stripped',
+          posted and '@gaffer_boss' not in posted[0], str(posted))
+    check('and the crew tag line still survives',
+          posted and '@Maynuddin23' in posted[0], str(posted))
+
+    # The chase DM collapses the request to ONE line before redacting it. An
+    # exemption written per-LINE would exempt the whole request here and put
+    # every chime handle straight in front of the crew - nearly shipped.
+    venmo_req = f._pending_cashouts[CHIMEREV][0]
+    dm = f.cashout_crew_dm_text(venmo_req, 10)
+    check('the collapsed chase DM keeps the venmo tag',
+          '@michelle-surman-2' in dm, dm)
+    check('and still strips the chime handle beside it',
+          '@gaffer_boss' not in dm, dm)
+
+
     # Ethan and Larry are the exception, exactly as everywhere else.
     admin_dm = f.cashout_admin_dm_text(request, CHIMEREV, 5)
     check('but the admins still see who asked',

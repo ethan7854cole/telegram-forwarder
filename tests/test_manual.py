@@ -112,10 +112,31 @@ async def main():
     reset()
     await f.observe_cashout(MHLARRY, '/out 25', 901, now,
                             user_id=CREW, username='Maynuddin23')
-    check('the crew /out with nothing open is still ignored', sent == [], str(sent))
+    check('the crew /out with nothing open is still not relayed', sent == [], str(sent))
     check('no ledger movement', f.ledger_snapshot(PICCASO) == (0.0, 0.0),
           str(f.ledger_snapshot(PICCASO)))
-    check('and nobody is DMed', dms == [], str(dms))
+    # ...but no longer SILENT. A bare /out usually means money has just left,
+    # and the last one went a whole day before anybody noticed.
+    told = [t for c, t in dms if 'WAS NOT RELAYED' in t]
+    check('both accounts are told it was not relayed', len(told) == 2, str(dms))
+    check('and told why the bot could not act on it',
+          told and 'no screenshot on it' in told[0], str(told))
+    check('and what to do about it', told and '/out' in told[0], str(told))
+
+    # A bare /out with no figure at all is conversation, and stays silent.
+    reset()
+    await f.observe_cashout(MHLARRY, 'ok /out done', 902, now,
+                            user_id=CREW, username='Maynuddin23')
+    check('a /out with no figure raises nothing', dms == [] and sent == [], str(dms))
+
+    # With a SCREENSHOT it is relayed, whoever sent it.
+    reset()
+    await f.observe_cashout(MHLARRY, '/out 25', 903, now, user_id=CREW,
+                            username='Maynuddin23', has_media=True)
+    check('a crew /out on a screenshot IS relayed',
+          [t for c, t in sent if c == PICCASO] != [], str(sent))
+    check('and booked to the group that asked',
+          f.ledger_snapshot(PICCASO)[1] == 25.0, str(f.ledger_snapshot(PICCASO)))
 
     # -- 3. it routes to the right chime group ------------------------------
     # The handling group decides. Sending Chime Rev's cashout to PICCASO would

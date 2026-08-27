@@ -347,6 +347,18 @@ def test_the_format():
           not f.is_cashout_request('Tag name : $x\nAmount : 150'))
     check('and ordinary talk is not', not f.is_cashout_request('any cashouts today?'))
 
+    # A venmo tag is an @handle, not a $cashtag. Rejecting those dropped a real
+    # request on 26 Aug 2026 and the cashout went unforwarded for a day.
+    VENMO = ('!! Cashout Request !!\nTag name: @michelle-surman-2 ( Venmo )\n'
+             'Amount: 200\n\nIMP NOTE: Already requested by player on group tag')
+    check('a venmo @handle is a valid tag', f.is_cashout_request(VENMO))
+    check('and is read back whole, dashes and digits included',
+          f.request_tag(VENMO) == '@michelle-surman-2', str(f.request_tag(VENMO)))
+    check('the amount survives the note under it',
+          f.request_amount(VENMO) == 200.0, str(f.request_amount(VENMO)))
+    check('a $cashtag is still not given an @',
+          f.request_tag(GOOD).startswith('$'), str(f.request_tag(GOOD)))
+
     check('the tag is read from its own line',
           f.request_tag(GOOD) == '$CelsoValero88', str(f.request_tag(GOOD)))
     check('and the amount from its own line',
