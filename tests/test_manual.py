@@ -30,6 +30,7 @@ import forwarder as f
 
 PICCASO, GAFFER = -5350880041, -5580596463
 MHLARRY, CHIMEREV = -1003894781195, -1002335630148
+GVENMO, LVENMO = -5100231154, -1004298140797
 ETHAN, LARRY, CREW = f.ETHAN_ID, f.LARRY_ID, 77
 
 sent, dms, copies, hearts = [], [], [], []
@@ -120,7 +121,7 @@ async def main():
     told = [t for c, t in dms if 'WAS NOT RELAYED' in t]
     check('both accounts are told it was not relayed', len(told) == 2, str(dms))
     check('and told why the bot could not act on it',
-          told and 'no screenshot on it' in told[0], str(told))
+          told and 'no request open' in told[0], str(told))
     check('and what to do about it', told and '/out' in told[0], str(told))
 
     # A bare /out with no figure at all is conversation, and stays silent.
@@ -129,14 +130,28 @@ async def main():
                             user_id=CREW, username='Maynuddin23')
     check('a /out with no figure raises nothing', dms == [] and sent == [], str(dms))
 
-    # With a SCREENSHOT it is relayed, whoever sent it.
+    # Nor with a SCREENSHOT - the user's call on 2026-09-24. With no request
+    # open, a crew /out never reaches CHIME GAFFER or GAFFER VENMO.
+    for handling, target in ((CHIMEREV, GAFFER), (LVENMO, GVENMO)):
+        reset()
+        await f.observe_cashout(handling, '/out 25', 903, now, user_id=CREW,
+                                username='Maynuddin23', has_media=True)
+        name = f.chat_name(target)
+        check(f'a crew /out on a screenshot is NOT relayed to {name}',
+              sent == [] and copies == [], str((sent, copies)))
+        check(f'and nothing is booked on {name}',
+              f.ledger_snapshot(target) == (0.0, 0.0), str(f.ledger_snapshot(target)))
+        told = [t for c, t in dms if 'WAS NOT RELAYED' in t]
+        check(f'both accounts are told ({name})', len(told) == 2, str(dms))
+        check(f'and told it was on a screenshot ({name})',
+              told and 'on a screenshot' in told[0], str(told))
+    # A crew screenshot with a bare /out and no figure is still worth a word.
     reset()
-    await f.observe_cashout(MHLARRY, '/out 25', 903, now, user_id=CREW,
+    await f.observe_cashout(LVENMO, '/out', 906, now, user_id=CREW,
                             username='Maynuddin23', has_media=True)
-    check('a crew /out on a screenshot IS relayed',
-          [t for c, t in sent if c == PICCASO] != [], str(sent))
-    check('and booked to the group that asked',
-          f.ledger_snapshot(PICCASO)[1] == 25.0, str(f.ledger_snapshot(PICCASO)))
+    check('a figureless crew /out on a screenshot is reported, not relayed',
+          sent == [] and len([t for c, t in dms if 'WAS NOT RELAYED' in t]) == 2,
+          str((sent, dms)))
 
     # -- 3. it routes to the right chime group ------------------------------
     # The handling group decides. Sending Chime Rev's cashout to PICCASO would

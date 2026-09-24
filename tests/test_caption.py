@@ -271,24 +271,22 @@ async def main():
     check('Larry is told it completed',
           any('SCREENSHOT' in t.upper() for _, t in dms), str(dms))
 
-    # -- 4. a captioned /out with NOTHING pending is still relayed ----------
-    # Changed 2026-08-27. It used to be dropped, and a real one was: $200 left,
-    # the group that asked was told nothing, and its Total Out was short by that
-    # much for a day. A payment screenshot is not posted in passing - it is the
-    # proof the money moved, which is what separates it from chatter.
+    # -- 4. a captioned /out with NOTHING pending is NOT relayed ------------
+    # Relayed from 2026-08-27 to 2026-09-24; the user then ruled that a crew
+    # /out with no request behind it never reaches the chime group, screenshot
+    # or not. Both accounts are told instead, so a real one can be finished by
+    # hand with their own /out.
     reset()
     await f.cashout_caption(BotApiMsg(MHLARRY, 'photo', caption=screenshot_out, mid=903))
-    relayed = [t for c, t, _ in sent if c == PICCASO]
-    check('a captioned /out with nothing pending is still relayed',
-          relayed != [], str(sent))
-    check('and booked to the group that asked',
-          f.ledger_snapshot(PICCASO)[1] == 120.0, str(f.ledger_snapshot(PICCASO)))
+    check('a captioned crew /out with nothing pending is not relayed',
+          [t for c, t, _ in sent if c == PICCASO] == [], str(sent))
+    check('and nothing is booked to the group that asked',
+          f.ledger_snapshot(PICCASO) == (0.0, 0.0), str(f.ledger_snapshot(PICCASO)))
     check('the handling group\'s own books are untouched',
           f.ledger_snapshot(MHLARRY) == (0.0, 0.0), str(f.ledger_snapshot(MHLARRY)))
-    check('no heart, because the request it answers is not in memory',
-          reactions == [], str(reactions))
-    check('and both accounts are told it was taken on the screenshot',
-          [t for c, t in dms if 'screenshot' in t and 'nothing was open' in t] != [],
+    check('no heart', reactions == [], str(reactions))
+    check('and both accounts are told it was NOT relayed',
+          len([t for c, t in dms if 'WAS NOT RELAYED' in t and 'screenshot' in t]) == 2,
           str(dms))
 
     # -- 5. a caption is never a payment notification ------------------------

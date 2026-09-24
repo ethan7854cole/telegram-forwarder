@@ -2794,18 +2794,15 @@ async def force_complete_cashout(handling, text, user_id, username,
     The standing rule is that a /out with no request pending is ordinary traffic
     and is left completely alone. Open requests live in MEMORY, so a redeploy
     wipes them - and a redeploy is exactly the moment somebody needs to finish a
-    cashout the bot has forgotten. Two cases are allowed through:
+    cashout the bot has forgotten. One case is allowed through:
 
-    - **Ethan or Larry**, whose word is taken at face value.
-    - **Anybody, when the /out carries a SCREENSHOT.** Added 2026-08-27 after a
-      crew /out on a Cash App receipt was ignored for a day: $200 had left, the
-      group that asked was told nothing, and its Total Out was short by that
-      much with no record anywhere that it had happened. A payment screenshot is
-      not something anyone posts in passing - it is the proof the money moved,
-      and that is exactly what separates it from chatter.
+    - **Ethan or Larry**, whose word is taken at face value. Nobody else.
 
-    A bare /out from the crew with nothing open is still ordinary traffic. That
-    is what keeps this from firing on conversation.
+    A crew /out with nothing open is NEVER relayed, screenshot or not - the
+    user's call on 2026-09-24, for chime and venmo alike. From 2026-08-27 a
+    screenshot let it through, which forwarded crew /outs nobody had asked
+    for. Instead both admins are told it was not relayed, so a real one (after
+    a redeploy wiped the request) can still be finished with their own /out.
 
     There is nothing to ❤: the request this answers is not in memory, so its
     message id is not either. The money side is what matters here, and it is
@@ -2858,30 +2855,32 @@ async def handle_cashout_reply(handling, text, user_id, username, reply_to,
     text = text or ''
     queue = _pending_cashouts.get(handling)
     if not queue:
-        # Nothing open. Ethan's and Larry's word carries on its own; anybody
-        # else needs the screenshot, which is the proof the money actually
-        # moved - see force_complete_cashout().
+        # Nothing open. Only Ethan's and Larry's word completes a cashout
+        # here - see force_complete_cashout(). The crew's /out is never
+        # relayed to the chime group with no request behind it, screenshot or
+        # not: the user's call on 2026-09-24, for both chime and venmo.
         by_admin = user_id in LEDGER_ADMINS
-        if _OUT_CMD_RE.search(text) and (by_admin or has_media):
+        if _OUT_CMD_RE.search(text) and by_admin:
             await force_complete_cashout(handling, text, user_id, username,
                                          full_name, message_id, has_media,
-                                         media_group_id, by_admin=by_admin)
+                                         media_group_id, by_admin=True)
         elif _OUT_CMD_RE.search(text):
-            # A bare /out from the crew, still ordinary traffic - but no longer
-            # SILENT. Somebody typing this usually means money has just left,
-            # and a day passed before the last one was noticed.
-            print(f"⚠️ [CASHOUT] bare /out in {chat_name(handling)} with nothing "
+            # A crew /out, still ordinary traffic - but no longer SILENT.
+            # Somebody typing this usually means money has just left, and a day
+            # passed before the last one was noticed.
+            print(f"⚠️ [CASHOUT] crew /out in {chat_name(handling)} with nothing "
                   f"open - not relayed ({username or user_id})", flush=True)
-            if out_amount(text) is not None:
+            if out_amount(text) is not None or has_media:
                 await warn_unreachable(await dm_handles(
                     CASHOUT_ADMIN_HANDLES,
                     f"⚠️ A /out WAS NOT RELAYED from {chat_name(handling)}.\n\n"
                     f"{' '.join((text or '').split())[:200]}\n\n"
-                    f"Sent by {describe_user(username, full_name)}, with no "
-                    "request open there and no screenshot on it — so the bot "
-                    "cannot tell which cashout it answers or whether the money "
-                    "really went.\n\n"
-                    "If it did, reply to it with /out to relay and book it."))
+                    f"Sent by {describe_user(username, full_name)}"
+                    f"{' on a screenshot' if has_media else ''}, with no "
+                    "request open there — so nothing was sent to the group that "
+                    "asks and nothing was booked.\n\n"
+                    "If it really answers a cashout, reply to it with /out to "
+                    "relay and book it."))
         return
     responder = _is_responder(user_id, username, handling)
     target = _match_request(queue, reply_to, text)

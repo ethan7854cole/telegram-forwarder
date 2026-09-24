@@ -122,8 +122,11 @@ nothing.
   everyone reading it while the group that asked was told nothing and its books
   never moved. It relays, books and tells both admins what it did; there is no
   ❤, because the request it answers is not in memory and neither is its message
-  id. **The crew's `/out` with nothing open is still ignored** — that is what
-  keeps this from firing on chatter.
+  id. **The crew's `/out` with nothing open is never relayed** — with or
+  without a screenshot, on chime and venmo alike (the user's call,
+  2026-09-24; a screenshot let it through from 2026-08-27). Nothing reaches
+  CHIME GAFFER or GAFFER VENMO and nothing is booked; both admins are DM'd
+  "A /out WAS NOT RELAYED" so a real one can be finished with their own `/out`.
 - **Only `ETHAN_ID` (7418675217, @ethannxxxx) and `LARRY_ID` (7578145913,
   @Larryyxx) may move ledger figures** — two accounts, one person. Those
   numbers were labelled **the wrong way round** everywhere until they were
