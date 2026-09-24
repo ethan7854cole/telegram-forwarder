@@ -934,13 +934,17 @@ A payment is forwarded and booked within seconds of landing, so by the time
 anyone can see it should not count, the money is on the target's books and the
 copy is in the group. **Reacting to the original** in `Chime Rev & out no-7`
 undoes both: `retract_payment()` deletes the forwarded copy in `CHIME GAFFER`
-and takes the amount back off that group's Total In.
+and takes the amount back off that group's Total In. The venmo route works the
+same way (since 2026-09-24): react in `MH x LARRY VENMO` and the copy comes out
+of `GAFFER VENMO`.
 
 - **ANY reaction retracts** — the user's explicit choice, with no confirmation
   step. A stray tap on a payment in that group really does move the books.
 - **Only Ethan and Larry**, like every other ledger movement.
-- **Only the Gaffer route** (`RETRACT_SOURCES`). A reaction on a payment in
-  `MH X LARRY GROUP 2` does nothing.
+- **Only the Gaffer and Gaffer Venmo routes** (`RETRACT_SOURCES`). A reaction
+  on a payment in `MH X LARRY GROUP 2` does nothing. If Railway sets
+  `RETRACT_SOURCES` itself, that value replaces the default in the code and has
+  to list both sources.
 - **Post, commit, delete — in that order.** The message being deleted is itself
   one of the messages `recover_ledgers()` reads back, so the correction has to
   publish both totals *first*. A delete that fails then still leaves the

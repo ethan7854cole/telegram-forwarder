@@ -225,6 +225,14 @@ async def main():
     check('a genuinely missed payment beside it is still delivered',
           len(out) == 1 and 'Person6' in out[0], str(out))
 
+    # -- the venmo route is protected the same way (since 2026-09-24) -------
+    LVENMO, GVENMO = -1004298140797, -5100231154
+    check('the venmo route is a retract source', LVENMO in f.RETRACT_SOURCES)
+    out = await run(retracted, corrections, ledger={'in': 12146.64, 'out': 7026.0},
+                    source=LVENMO, target=GVENMO)
+    check('a retracted venmo payment is not re-sent after a deploy', out == [],
+          f"{len(out)} re-sent")
+
     # -- a reaction from somebody who cannot retract is not a retraction ----
     out = await run([Msg(453, twin5, 5, src_bot, Reaction([424242]))], [],
                     ledger={'in': 12146.64, 'out': 7026.0},

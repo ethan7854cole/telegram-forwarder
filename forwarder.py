@@ -1317,9 +1317,13 @@ async def set_groups_paused(chats, pausing, who=None):
 # ANY reaction retracts - the user's explicit choice. There is deliberately no
 # confirmation step, so a stray tap on a payment in one of these groups really
 # does take the money off the books.
+#
+# Chime Rev & out no-7 (-> CHIME GAFFER) and, since 2026-09-24, MH x LARRY
+# VENMO (-> GAFFER VENMO), so the two live routes undo a payment the same way.
 RETRACT_SOURCES = _with_variants(
     [int(c.strip()) for c in
-     os.getenv('RETRACT_SOURCES', '-1002335630148').split(',') if c.strip()])
+     os.getenv('RETRACT_SOURCES', '-1002335630148,-1004298140797').split(',')
+     if c.strip()])
 
 # (rule key, source message id) -> [(target, message id there, amount booked)]
 #
@@ -5003,8 +5007,10 @@ async def on_request_reaction(reaction):
                             getattr(user, 'id', None), getattr(user, 'username', None),
                             full_name or None)
 
-    # The two cannot collide: note_cashout_seen only looks at handling groups,
-    # retract_payment only at RETRACT_SOURCES, and no chat is both.
+    # The two cannot collide even though Chime Rev and MH x LARRY VENMO are
+    # both handling groups AND retract sources: note_cashout_seen only matches
+    # an open cashout request, and retract_payment only a forwarded payment -
+    # a request carries no "You received" amount, so it retracts nothing.
     await retract_payment(reaction.chat.id, reaction.message_id,
                           getattr(user, 'id', None))
 

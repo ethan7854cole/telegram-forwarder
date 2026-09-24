@@ -21,6 +21,7 @@ import forwarder as f
 
 CHIMEREV, GAFFER = -1002335630148, -5580596463      # the retractable route
 MHLARRY, PICCASO = -1003894781195, -5350880041      # the one that is not
+LVENMO, GVENMO = -1004298140797, -5100231154        # retractable since 2026-09-24
 ETHAN, LARRY = f.ETHAN_ID, f.LARRY_ID
 STRANGER = 999
 
@@ -193,6 +194,37 @@ async def main():
     check('PICCASO keeps the payment', f.ledger_snapshot(PICCASO)[0] == 115.0,
           str(f.ledger_snapshot(PICCASO)))
     check('and nothing is deleted there', deleted == [], str(deleted))
+
+    # -- 4b. the venmo route retracts exactly like the chime one -------------
+    # Added 2026-09-24: reacting in MH x LARRY VENMO takes the copy out of
+    # GAFFER VENMO and the amount back off its Total In.
+    reset()
+    f.ledger_commit(GVENMO, (100.0, 20.0))
+    await forward(source=LVENMO, mid=503)
+    check('the venmo payment is forwarded', any(c == GVENMO for c, _, _ in sent),
+          str(sent))
+    check('and booked on GAFFER VENMO', f.ledger_snapshot(GVENMO)[0] == 115.0,
+          str(f.ledger_snapshot(GVENMO)))
+    vcopy = [i for c, _, i in sent if c == GVENMO][0]
+    sent.clear()
+    did = await f.retract_payment(LVENMO, 503, ETHAN)
+    check('reacting in MH x LARRY VENMO retracts it', did is True)
+    check('GAFFER VENMO Total In is back', f.ledger_snapshot(GVENMO)[0] == 100.0,
+          str(f.ledger_snapshot(GVENMO)))
+    check('GAFFER VENMO Total Out is untouched', f.ledger_snapshot(GVENMO)[1] == 20.0,
+          str(f.ledger_snapshot(GVENMO)))
+    check('the venmo copy is deleted', deleted == [(GVENMO, vcopy)], str(deleted))
+    check('the correction reads like /add -15 there',
+          any(t.startswith('✏️ Total In adjusted by -15.00$')
+              for t in totals_posts(GVENMO)), str(sent))
+    check('CHIME GAFFER is not touched', f.ledger_snapshot(GAFFER)[0] == 100.0,
+          str(f.ledger_snapshot(GAFFER)))
+    check('a second venmo reaction does nothing',
+          await f.retract_payment(LVENMO, 503, ETHAN) is False)
+    reset()
+    await forward(source=LVENMO, mid=504)
+    check('a stranger cannot retract on venmo either',
+          await f.retract_payment(LVENMO, 504, STRANGER) is False)
 
     # -- 5. a message we never forwarded -------------------------------------
     reset()
