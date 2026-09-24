@@ -210,6 +210,47 @@ async def test_tag_changes():
     check('case alone is not a change',
           f._request_changes('to $Jenny-Buhr', 'to $jenny-buhr') == '',
           repr(f._request_changes('to $Jenny-Buhr', 'to $jenny-buhr')))
+    # -- any other line that moved is shown too (2026-09-24) -----------------
+    base = '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 200'
+    diff = f._request_changes(base, base + '\nNote: send in two parts')
+    check('an added line is shown', 'Now: Note: send in two parts' in diff, repr(diff))
+    diff = f._request_changes(base + '\nNote: urgent', base + '\nNote: not urgent')
+    check('a reworded line shows what it was and what it is now',
+          'Was: Note: urgent' in diff and 'Now: Note: not urgent' in diff, repr(diff))
+    diff = f._request_changes(base + '\nNote: urgent', base)
+    check('a removed line is shown', diff.strip() == 'Was: Note: urgent', repr(diff))
+    diff = f._request_changes(base + '\nNote:  URGENT', base + '\nnote: urgent')
+    check('case and spacing alone are not a change', diff == '', repr(diff))
+    diff = f._request_changes(base, base.replace('200', '250') + '\nNote: rush')
+    check('the amount and the extra line are shown together',
+          'Amount: 200.00$ -> 250.00$' in diff and 'Now: Note: rush' in diff
+          and 'Was:' not in diff, repr(diff))
+    # The crew must never learn a chime handle, even through an edit notice.
+    crew = f._request_changes(base + '\nasked by @gaffer_boss',
+                              base + '\nasked by @gaffer_boss, rush it', for_crew=True)
+    check('a changed line reaches the crew without the chime handle',
+          'rush it' in crew and 'gaffer_boss' not in crew, repr(crew))
+    crew = f._request_changes(base + '\nasked by @gaffer_boss',
+                              base + '\nasked by @other_boss', for_crew=True)
+    check('a change to nothing but a chime handle is no change to the crew',
+          crew == '', repr(crew))
+    venmo = '!! Cashout Request !!\nTag name : @michelle-surman-2\nAmount : 80'
+    crew = f._request_changes(venmo, venmo + '\nvia @michelle-surman-2 only', for_crew=True)
+    check('a venmo tag on a changed line still reaches the crew',
+          '@michelle-surman-2' in crew, repr(crew))
+    leaky = '!! Cashout Request !!\nTag name : @mich\nAmount : 80\nask @michelle'
+    check('a handle that only starts with the venmo tag is still removed',
+          '@michelle' not in f.strip_foreign_handles(leaky)
+          and '@mich' in f.strip_foreign_handles(leaky), f.strip_foreign_handles(leaky))
+    await open_request(GAFFER, mid=822, text=base)
+    sent.clear()
+    await edit_request(GAFFER, 822, base + '\nNote: send in two parts @gaffer_boss')
+    notice = [t for t in to(CHIMEREV) if 'HAS BEEN EDITED' in t]
+    check('the crew notice in the group shows the changed line',
+          notice and 'Now: Note: send in two parts' in notice[0], str(notice))
+    check('with the chime handle taken out',
+          notice and 'gaffer_boss' not in notice[0], str(notice))
+
     check('a reworded request with nothing readable changed says nothing',
           f._request_changes('!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 200',
                              '!! Cashout Request !!\nTag name : $jenny-buhr\nAmount : 200') == '')

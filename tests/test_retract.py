@@ -26,6 +26,7 @@ ETHAN, LARRY = f.ETHAN_ID, f.LARRY_ID
 STRANGER = 999
 
 sent, deleted, user_deleted, dms, failures = [], [], [], [], []
+replies, user_sent = [], []
 _next_id = [4000]
 
 
@@ -41,6 +42,8 @@ class FakeBot:
     async def send_message(self, chat_id, text, reply_to_message_id=None):
         if self.fail_send:
             raise RuntimeError('send refused')
+        if reply_to_message_id is not None:
+            replies.append((chat_id, reply_to_message_id, text))
         _next_id[0] += 1
         (dms if chat_id > 0 else sent).append((chat_id, text, _next_id[0]))
         return FakeMsg(_next_id[0])
@@ -71,6 +74,7 @@ def check(label, cond, detail=''):
 
 def reset(opening=(100.0, 20.0)):
     sent.clear(); deleted.clear(); user_deleted.clear(); dms.clear()
+    replies.clear(); user_sent.clear()
     f._ledger.clear(); f._delivered.clear(); f._seen_messages.clear()
     f.bot.fail_send = f.bot.fail_delete = False
     if opening:
@@ -140,6 +144,10 @@ class FakeClient:
             raise RuntimeError('not an admin here')
         user_deleted.append((entity.id, ids[0]))
         return True
+
+    async def send_message(self, entity, text, reply_to=None):
+        user_sent.append((entity.id, reply_to, text))
+        return FakeMsg(1)
 
 
 async def main():
@@ -258,6 +266,23 @@ async def main():
           len(totals_posts(GAFFER)) == 1, str(sent))
     check('and Ethan is told to delete it by hand',
           any('could not be deleted' in t for _, t, _ in dms), str(dms))
+    # -- 7b. ...and the copy that stays says it was taken back ---------------
+    # Past 48 hours Telegram will not let the bot delete it, so the group would
+    # otherwise go on looking at a payment that still seems to count.
+    note = [(c, m, t) for c, m, t in replies if c == GAFFER]
+    check('a note is replied under the copy that could not be deleted',
+          len(note) == 1, str(replies))
+    check('and it says the payment was taken back',
+          note and 'Taken back' in note[0][2], str(note))
+    check('Ethan is told the note is there',
+          any('note saying the payment was taken back' in t for _, t, _ in dms), str(dms))
+    text = f.RETRACTED_NOTE
+    check('the note is not a payment to the report or the sweep',
+          f.parse_received_amount(text) is None and 'received' not in text.lower())
+    check('the note carries no totals, so recover_ledgers() ignores it',
+          f.parse_totals(text) == (None, None), str(f.parse_totals(text)))
+    check('and reads as no correction to the report',
+          not f._REPORT_ADJ_RE.search(text) and not f._REPORT_OUT_RE.search(text))
 
     # -- 8. an overshoot is REFUSED, exactly as /add -N refuses one ----------
     # Clamping would invent a figure and then delete the evidence for it.
@@ -400,6 +425,25 @@ async def main():
           f.ledger_snapshot(GAFFER)[0] == 90.0, str(f.ledger_snapshot(GAFFER)))
     check('and Ethan is asked to remove it by hand',
           any('could not be deleted' in t for _, t, _ in dms), str(dms))
+    check('with USERBOT_SEND off, no note is posted by the account',
+          user_sent == [] and replies == [], str((user_sent, replies)))
+
+    # A copy the ACCOUNT found gets its note from the account, replying by the
+    # id it read - the bot would be replying to some other message.
+    reset()
+    f._delivered.clear()
+    f.bot.fail_delete = True
+    f.USERBOT_SEND = True
+    f._active_client = FakeClient(
+        source={704: TeleMsg(704, source_body)},
+        history={GAFFER: [TeleMsg(7804, forwarded_body)]}, can_delete=False)
+    await f.retract_payment(CHIMEREV, 704, ETHAN)
+    f.bot.fail_delete = False
+    f.USERBOT_SEND = False
+    check('the account replies the note under the copy it found',
+          user_sent == [(GAFFER, 7804, f.RETRACTED_NOTE)], str(user_sent))
+    check('and the bot does not reply with the account\'s id',
+          replies == [], str(replies))
     f._active_client = None
 
     print()

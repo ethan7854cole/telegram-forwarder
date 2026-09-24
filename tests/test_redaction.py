@@ -194,9 +194,12 @@ async def main():
     check('but the admins still see who asked',
           '@gaffer_boss' in admin_dm, admin_dm)
 
-    # A request that is nothing BUT a handle must not be emptied to nothing.
-    check('a request stripped to nothing keeps its original text',
-          f.strip_foreign_handles('@someone') == '@someone',
+    # Never the original as a fallback - that handed a message made only of
+    # handles straight back to the crew, handles and all. Changed 2026-09-24:
+    # "by any cost". A real request cannot be emptied: its keyword, tag and
+    # amount always survive.
+    check('a message that is nothing but a handle is NOT handed back',
+          '@someone' not in f.strip_foreign_handles('@someone'),
           f.strip_foreign_handles('@someone'))
 
     # -- 6. a username inside a "You received" is ignored -------------------

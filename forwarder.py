@@ -1320,9 +1320,10 @@ async def set_groups_paused(chats, pausing, who=None):
 #
 # Chime Rev & out no-7 (-> CHIME GAFFER) and, since 2026-09-24, MH x LARRY
 # VENMO (-> GAFFER VENMO), so the two live routes undo a payment the same way.
+RETRACT_SOURCES_DEFAULT = '-1002335630148,-1004298140797'
 RETRACT_SOURCES = _with_variants(
     [int(c.strip()) for c in
-     os.getenv('RETRACT_SOURCES', '-1002335630148,-1004298140797').split(',')
+     os.getenv('RETRACT_SOURCES', RETRACT_SOURCES_DEFAULT).split(',')
      if c.strip()])
 
 # (rule key, source message id) -> [(target, message id there, amount booked)]
@@ -1718,7 +1719,133 @@ def is_admin_crew_note(text, user_id=None, username=None):
     return False
 
 
-def strip_identities(text, username=None, full_name=None):
+# ---------------------------------------------------------------------------
+# Who is on which side
+# ---------------------------------------------------------------------------
+#
+# The two sides of a route must never learn each other's people - not the
+# @username, not the display name, nothing (the user's standing rule, restated
+# "by any cost" on 2026-09-24). @handles were always stripped; plain names were
+# not, because nothing knew whose names they were. This is that knowledge:
+# everyone seen in a group, filed under the side that group belongs to, read
+# from each group's member list at boot and topped up by whoever speaks.
+#
+# Ethan, Larry, the bot and the user account are never filed: they are in the
+# groups on both sides, so there is nothing about them to hide. Nor is anyone
+# found on BOTH sides, for the same reason. Bots are skipped - the payment
+# notifier's name must not be stripped out of anything.
+_side_people = {'chime': {}, 'handling': {}}     # side -> user id -> identifiers
+_userbot_id = None
+
+# Words a person's name must never be allowed to take out of a request, or the
+# request stops being one. Also anything under three letters.
+_NAME_STOPWORDS = {'cashout', 'request', 'tag', 'name', 'amount', 'out', 'venmo',
+                   'chime', 'cash', 'app', 'the', 'and', 'from', 'sent', 'paid',
+                   'done', 'total'}
+
+
+def _side_of(chat_id):
+    """'handling', 'chime', or None for a chat on neither side of a route."""
+    if chat_id is None:
+        return None
+    if _canonical(chat_id, _CASHOUT_HANDLERS) is not None:
+        return 'handling'
+    if (_canonical(chat_id, CASHOUT_ROUTES) is not None
+            or chat_id in REDACTED_CHATS
+            or any(v in REDACTED_CHATS for v in _id_variants(chat_id))):
+        return 'chime'
+    return None
+
+
+def _person_identifiers(user):
+    """Every way this person could be written: handle, first, last, full name."""
+    first = (getattr(user, 'first_name', None) or '').strip()
+    last = (getattr(user, 'last_name', None) or '').strip()
+    handle = (getattr(user, 'username', None) or '').strip().lstrip('@')
+    found = set()
+    for candidate in (handle, first, last, f"{first} {last}".strip()):
+        key = ' '.join(candidate.split()).lower()
+        if (len(key) >= 3 and re.search(r'[a-z]', key)
+                and key not in _NAME_STOPWORDS):
+            found.add(key)
+    return found
+
+
+def note_person(chat_id, user):
+    """File this person under the side of the route this chat belongs to."""
+    side = _side_of(chat_id)
+    uid = getattr(user, 'id', None)
+    if side is None or uid is None:
+        return
+    if getattr(user, 'bot', False) or getattr(user, 'is_bot', False):
+        return
+    if uid in LEDGER_ADMINS or uid == BOT_ID or uid == _userbot_id:
+        return
+    found = _person_identifiers(user)
+    if found:
+        _side_people[side].setdefault(uid, set()).update(found)
+
+
+def names_from(side):
+    """Everything identifying the people on `side` who are ONLY on that side."""
+    other = 'handling' if side == 'chime' else 'chime'
+    names = set()
+    for uid, found in _side_people[side].items():
+        if uid not in _side_people[other]:
+            names |= found
+    return names
+
+
+def _strip_names(text, names):
+    """Take these names out, whole words only, leaving tags and cashtags alone.
+
+    Every $cashtag and @tag is masked first: a crew member called "Jenny" must
+    not carve the destination out of "$jenny-buhr", or the cashout cannot be
+    paid. Longest first, so a full name goes before the first name inside it."""
+    if not text or not names:
+        return text
+    held = []
+
+    def hold(match):
+        held.append(match.group(0))
+        return f"\x00{len(held) - 1}\x00"
+
+    working = re.sub(r'[$@][A-Za-z][\w.\-]*', hold, text)
+    for name in sorted(names, key=len, reverse=True):
+        working = re.sub(r'(?<![\w\x00])' + re.escape(name) + r'(?![\w\x00])', '',
+                         working, flags=re.I)
+    return re.sub(r'\x00(\d+)\x00', lambda m: held[int(m.group(1))], working)
+
+
+def _tidy(text):
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+    text = re.sub(r'[ \t]+(\r?\n)', r'\1', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+async def learn_sides(client):
+    """Read every group's member list, so names are known before anyone speaks.
+
+    A redeploy wipes what was learned from people speaking, and the first
+    request after one must be cleaned as thoroughly as any other. A group that
+    cannot be read is logged and skipped - the live top-up still covers it."""
+    chats = set(_CASHOUT_HANDLERS) | set(CASHOUT_ROUTES) | set(REDACTED_CHATS)
+    for chat in sorted(chats):
+        entity = await _resolve_one(client, chat)
+        if entity is None:
+            continue
+        try:
+            async for user in client.iter_participants(entity):
+                note_person(chat, user)
+        except Exception as e:
+            print(f"⚠️ [SIDES] could not read the members of {chat_name(chat)}: {e}",
+                  flush=True)
+    print(f"🙈 [SIDES] {len(_side_people['chime'])} people on the chime side, "
+          f"{len(_side_people['handling'])} on the handling side", flush=True)
+
+
+def strip_identities(text, username=None, full_name=None, crew_names=False):
     """Take every crew handle and name out of something bound for a chime group.
 
     The /out is relayed verbatim, which is right for the figure and wrong for
@@ -1749,6 +1876,14 @@ def strip_identities(text, username=None, full_name=None):
         if phrase:
             cleaned = re.sub(r'(?<!\w)' + re.escape(phrase) + r'(?!\w)', '',
                              cleaned, flags=re.I)
+
+    # Everyone known to be on the handling side, not only the configured crew
+    # and the sender - "Maynuddin sent it" names somebody too. Only for the
+    # crew's own words (the /out relay): the door also carries forwarded
+    # payments, whose payer names are customers and are compared by the
+    # catch-up sweep, and must never be touched.
+    if crew_names:
+        cleaned = _strip_names(cleaned, names_from('handling'))
 
     cleaned = re.sub(r'[ \t]{2,}', ' ', cleaned)
     cleaned = re.sub(r'[ \t]+(\r?\n)', r'\1', cleaned)
@@ -1796,15 +1931,22 @@ def strip_foreign_handles(text):
     tag = _REQ_TAG_LINE_RE.search(text or '')
     token = tag.group(1) if tag else ''
     held = token.startswith('@')
-    working = text.replace(token, '\x00tag\x00', 1) if held else text
+    # Every mention, not just the first: the same token twice is the same tag,
+    # and stripping the second left the crew a mangled "-surman-2".
+    # Whole token only, so a longer handle that merely STARTS with the tag
+    # ("@mich" held, "@michelle" not) is still taken out.
+    working = (re.sub(re.escape(token) + r'(?![\w.\-])', '\x00tag\x00', text)
+               if held else text)
 
     cleaned = _HANDLE_RE.sub('', working)
-    cleaned = re.sub(r'[ \t]{2,}', ' ', cleaned)
-    cleaned = re.sub(r'[ \t]+(\r?\n)', r'\1', cleaned)
-    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
     if held:
         cleaned = cleaned.replace('\x00tag\x00', token)
-    return cleaned.strip() or text
+    # And every plain name of the people on the chime side - "asked by John"
+    # carries no @ and used to reach the crew untouched.
+    cleaned = _tidy(_strip_names(cleaned, names_from('chime')))
+    # Never the original as a fallback: that handed a message made only of
+    # handles straight back, handles and all.
+    return cleaned
 
 
 # A cashtag, never an amount: $jenny-buhr and $Hawkins-Floral-Decor match,
@@ -1824,7 +1966,7 @@ def clean_out_for_relay(text, username=None, full_name=None):
     that a name was removed. So the message is rebuilt instead, from the only
     two things the group that asked actually needs: the figure and the cashtag.
     The screenshot still travels; only the words around it are replaced."""
-    cleaned = strip_identities(text, username, full_name)
+    cleaned = strip_identities(text, username, full_name, crew_names=True)
     if cleaned == text:
         return text                     # nothing was hidden - leave it alone
 
@@ -1972,7 +2114,7 @@ def _looks_deleted(error):
     return any(marker in text for marker in _GONE_MARKERS)
 
 
-async def heart_request(chat_id, message_id):
+async def heart_request(chat_id, message_id, user_only=False):
     """❤ a cashout request, marking it actioned.
 
     Falls back to the user account because the bot may not be able to react on
@@ -1980,13 +2122,21 @@ async def heart_request(chat_id, message_id):
     that has been deleted is not an error and gets no retry - there is nothing
     left to mark.
 
+    `user_only` is for an id the user account read (a recovered request). In a
+    basic group that id means nothing to the bot - or worse, names a different
+    message - so the bot is not tried at all.
+
     Both routes failing is NOT a cosmetic miss. The ❤ is the durable record that
-    a request was actioned - the only one, since the open requests themselves
-    live in memory and a redeploy wipes them. A cashout that was paid but never
-    marked reads as still outstanding to anyone scrolling the group. So when
-    neither route can place it, Ethan is told, with the error, rather than it
-    ending as one line in a log nobody is reading."""
-    bot_error = user_error = None
+    a request was actioned. A cashout that was paid but never marked reads as
+    still outstanding to anyone scrolling the group - and since 2026-09-24 it
+    would also be re-opened by recover_open_requests() if its /out could not be
+    paired either. So when neither route can place it, Ethan is told, with the
+    error, rather than it ending as one line in a log nobody is reading."""
+    if user_only:
+        return await _heart_via_user(
+            chat_id, message_id,
+            'skipped - the request id was read by the user account')
+    bot_error = None
     try:
         await bot.set_message_reaction(chat_id, message_id,
                                        [ReactionTypeEmoji(CASHOUT_HEART)])
@@ -2000,7 +2150,12 @@ async def heart_request(chat_id, message_id):
         bot_error = e
         print(f"⚠️ [CASHOUT] bot could not react in {chat_name(chat_id)}: {e}",
               flush=True)
+    return await _heart_via_user(chat_id, message_id, bot_error)
 
+
+async def _heart_via_user(chat_id, message_id, bot_error):
+    """The user-account half of heart_request(), and the alert if it fails too."""
+    user_error = None
     if USERBOT_REACT and _active_client is not None:
         try:
             entity = await _resolve_one(_active_client, chat_id)
@@ -2096,19 +2251,43 @@ async def open_cashout_request(source, text, sent_at, origin_msg_id):
         _release_cashout(handling, fingerprint)
         return
 
-    request = {
+    request = _request_record(source, text, origin_msg_id, sent.message_id, now)
+    _pending_cashouts.setdefault(handling, []).append(request)
+    # Handover. The request is now on the books, and the check at the top of
+    # this function can see it, so the claim has done its job. Releasing here
+    # rather than on a clock of its own keeps _pending_cashouts the single
+    # answer to "is this a duplicate" - two windows that could disagree is how
+    # the guard would start refusing genuine second cashouts.
+    _release_cashout(handling, fingerprint)
+    print(f"📤 [CASHOUT] {chat_name(source)} -> {chat_name(handling)} "
+          f"(msg {sent.message_id}), waiting {CASHOUT_TIMEOUT_MINUTES}m for /out",
+          flush=True)
+
+    # Larry follows a cashout from here: submitted, picked up, completed.
+    missed = await dm_handles(CASHOUT_PROGRESS_HANDLES,
+                              cashout_submitted_text(request, handling))
+    await warn_unreachable(missed)
+
+
+def _request_record(source, text, origin_msg_id, message_id, opened):
+    """One open request, as the rest of the flow expects to find it.
+
+    Shared by open_cashout_request() and recover_open_requests(), so a request
+    picked back up after a redeploy has exactly the shape of one opened live."""
+    return {
         'origin': source,
-        'fingerprint': fingerprint,        # what the duplicate guard compares
+        # What the duplicate guard compares.
+        'fingerprint': ' '.join((text or '').split()).lower(),
         # Resolved once, at open time, so re-pointing a route in Railway cannot
         # strand a request that is already in flight.
-        'out_to': route['out_to'],
+        'out_to': CASHOUT_ROUTES[source]['out_to'],
         'text': text,
         'origin_msg_id': origin_msg_id,    # in the chime group - gets the ❤
-        'message_id': sent.message_id,     # in the handling group - reminders reply to it
-        'opened': now,                     # the ladder is measured from here
+        'message_id': message_id,          # in the handling group - reminders reply to it
+        'opened': opened,                  # the ladder is measured from here
         # Moved by a reply OR a reaction. Records that somebody engaged; it no
         # longer moves the ladder, which runs on absolute time from 'opened'.
-        'last_seen': now,
+        'last_seen': opened,
         'seen': False,                     # somebody has acknowledged it
         'seen_at': None,                   # ...and when, which picks Larry's mark
         'seen_by': None,                   # ...and who, for his notice
@@ -2134,22 +2313,33 @@ async def open_cashout_request(source, text, sent_at, origin_msg_id):
         'mismatch_told': False,            # paid a different figure than it asked for
         'nudges': 0,
         'exhausted': False,
+        # Picked back up after a redeploy - see recover_open_requests().
+        'recovered': False,
+        # The origin id was read by the USER ACCOUNT. In a basic group (both
+        # chime groups are) each account numbers messages its own way, so the
+        # bot must never be handed this id - it would ❤ or reply to some other
+        # message. heart_request() and update_cashout_request() check this.
+        'origin_via_user': False,
     }
-    _pending_cashouts.setdefault(handling, []).append(request)
-    # Handover. The request is now on the books, and the check at the top of
-    # this function can see it, so the claim has done its job. Releasing here
-    # rather than on a clock of its own keeps _pending_cashouts the single
-    # answer to "is this a duplicate" - two windows that could disagree is how
-    # the guard would start refusing genuine second cashouts.
-    _release_cashout(handling, fingerprint)
-    print(f"📤 [CASHOUT] {chat_name(source)} -> {chat_name(handling)} "
-          f"(msg {sent.message_id}), waiting {CASHOUT_TIMEOUT_MINUTES}m for /out",
-          flush=True)
 
-    # Larry follows a cashout from here: submitted, picked up, completed.
-    missed = await dm_handles(CASHOUT_PROGRESS_HANDLES,
-                              cashout_submitted_text(request, handling))
-    await warn_unreachable(missed)
+
+def _recovered_by_tag(source, text):
+    """A recovered request this edit is most likely changing.
+
+    A recovered request knows its original only by the USER ACCOUNT's id, so
+    the same edit arriving down the bot's path, with the bot's id, cannot find
+    it by id - and would otherwise fall through and open a second request, tag
+    the crew and run the ladder over a cashout already in hand. Matched on the
+    tag, which an edit to the amount leaves alone. An edit that changes the tag
+    itself cannot be told apart from a new request; that one is not caught."""
+    tag = (request_tag(text or '') or '').lower()
+    if not tag:
+        return None
+    for request in _pending_cashouts.get(CASHOUT_ROUTES[source]['handling'], []):
+        if (request.get('recovered') and request['origin'] == source
+                and (request_tag(request['text'] or '') or '').lower() == tag):
+            return request
+    return None
 
 
 def find_open_request(handling, origin_msg_id):
@@ -2223,8 +2413,12 @@ async def update_cashout_request(source, request, text, sent_at):
     # ...and back to the side that made the change. Sent whatever happened
     # above: the crew being told and the askers being asked are two separate
     # obligations, and a failure on one is not a reason to skip the other.
-    await send_group(source, cashout_edited_origin_text(before, text),
-                     reply_to_message_id=request['origin_msg_id'])
+    # Not as a reply when the id came from the user account (a recovered
+    # request): the bot would be replying to some other message. The notice
+    # quotes the before and after, so it still reads on its own.
+    reply = ({} if request.get('origin_via_user')
+             else {'reply_to_message_id': request['origin_msg_id']})
+    await send_group(source, cashout_edited_origin_text(before, text), **reply)
 
     print(f"✏️ [CASHOUT] {chat_name(source)} request edited - "
           f"{chat_name(handling)} updated, crew told, {chat_name(source)} asked "
@@ -2359,7 +2553,7 @@ def request_tag(text):
     return match.group(0) if match else None
 
 
-def _request_changes(before, after):
+def _request_changes(before, after, for_crew=False):
     """What actually moved between two versions of a request, a line each.
 
     The figure is not the only thing that matters and never was - a cashout
@@ -2386,7 +2580,50 @@ def _request_changes(before, after):
     elif now_tag and not was_tag:
         lines.append(f"Tag: now {now_tag}")
 
+    # Everything else that moved, line by line - a note added, a line
+    # reworded. Until 2026-09-24 only the tag and the amount were spelled out,
+    # so any other edit said "HAS BEEN EDITED" and left the reader to find it.
+    # The tag, amount and keyword lines are left out: they are reported above,
+    # or carry nothing. Case and spacing alone are not a change.
+    # For the crew the lines are cleaned BEFORE they are compared, so an edit
+    # that only changed a chime handle is no change at all to them - rather
+    # than two identical lines hinting that something was taken out.
+    # The WHOLE request is cleaned, not line by line: the venmo tag is exempt
+    # only when the cleaner can see the tag line it belongs to.
+    clean = strip_foreign_handles if for_crew else (lambda t: t)
+    was_lines = _other_lines(clean(before))
+    now_lines = _other_lines(clean(after))
+    was_keys = {_line_key(l) for l in was_lines}
+    now_keys = {_line_key(l) for l in now_lines}
+    for line in [l for l in was_lines if _line_key(l) not in now_keys][:EDIT_DIFF_MAX_LINES]:
+        lines.append(f"Was: {line[:120]}")
+    for line in [l for l in now_lines if _line_key(l) not in was_keys][:EDIT_DIFF_MAX_LINES]:
+        lines.append(f"Now: {line[:120]}")
+
     return ('\n' + '\n'.join(lines)) if lines else ''
+
+
+# How many "Was:"/"Now:" lines an edit notice lists, each way. A request is a
+# few lines long; an edit that moves more than this is a rewrite, and the
+# notice already tells them to read it again.
+EDIT_DIFF_MAX_LINES = 4
+
+
+def _line_key(line):
+    return ' '.join(line.split()).lower()
+
+
+def _other_lines(text):
+    """The lines of a request that are not its keyword, tag or amount."""
+    out = []
+    for line in (text or '').splitlines():
+        if not line.strip():
+            continue
+        if (CASHOUT_KEYWORD.lower() in line.lower()
+                or _REQ_TAG_LINE_RE.search(line) or _REQ_AMOUNT_LINE_RE.search(line)):
+            continue
+        out.append(' '.join(line.split()))
+    return out
 
 
 def cashout_edited_text(before, after, handling):
@@ -2399,8 +2636,10 @@ def cashout_edited_text(before, after, handling):
     The crew are tagged because a silent rewrite is the dangerous version. They
     read the request once, and if the figure changes underneath them the copy
     they remember is the one they pay."""
+    # for_crew: a changed line comes from the chime side, and a chime handle
+    # must never reach the crew - see strip_foreign_handles().
     return (f"✏️ THE REQUEST ABOVE HAS BEEN EDITED"
-            f"{_request_changes(before, after)}\n\n"
+            f"{_request_changes(before, after, for_crew=True)}\n\n"
             "Please read it again before sending anything.\n\n"
             f"{crew_mentions(handling)}")
 
@@ -2943,7 +3182,8 @@ async def handle_cashout_reply(handling, text, user_id, username, reply_to,
     # The ❤ goes on the original request in the chime group, not on the copy in
     # the handling group: it is the group that asked which needs to see, at a
     # glance, which of its requests have been dealt with.
-    await heart_request(request['origin'], request['origin_msg_id'])
+    await heart_request(request['origin'], request['origin_msg_id'],
+                        user_only=request.get('origin_via_user', False))
 
     # ...and the chase is unsaid, now that it is wrong - privately to the crew,
     # and in the handling group where the same words are still tagging them.
@@ -3015,6 +3255,8 @@ async def observe_cashout(chat_id, text, message_id, sent_at,
         if is_edit:
             open_request = find_open_request(
                 CASHOUT_ROUTES[source]['handling'], message_id)
+            if open_request is None:
+                open_request = _recovered_by_tag(source, text)
             if open_request is not None:
                 if _is_duplicate(('cashout-edit', source, message_id,
                                   ' '.join((text or '').split()))):
@@ -3867,6 +4109,14 @@ async def retract_payment(chat_id, message_id, user_id):
         if await delete_forwarded_copy(target, target_msg_id, entity):
             print(f"🗑️ [RETRACT] {amount:,.2f} taken back off {chat_name(target)} "
                   "and the forwarded copy deleted", flush=True)
+        elif await mark_retracted_copy(target, target_msg_id, entity):
+            await notify_admin(
+                f"⚠️ Retracted {amount:,.2f}$ from {chat_name(target)}, but the "
+                "forwarded message could not be deleted (Telegram stops a bot "
+                "deleting after 48 hours).\n\n"
+                "The totals are correct, and a note saying the payment was taken "
+                "back is now replied under the old message. Delete it by hand if "
+                "you want it gone.")
         else:
             await notify_admin(
                 f"⚠️ Retracted {amount:,.2f}$ from {chat_name(target)}, but the "
@@ -3874,6 +4124,38 @@ async def retract_payment(chat_id, message_id, user_id):
                 "The totals are correct - the old message is still sitting there "
                 "showing the figures from before. Delete it by hand.")
     return True
+
+
+# Replied under a forwarded copy that could not be deleted. Deliberately free
+# of anything the readers of the group recognise: no "received" and no dollar
+# figure (the report and the catch-up sweep would count it as a payment), no
+# "adjusted by" (the report reads that as a correction), and no totals block
+# (recover_ledgers() would adopt it as the books).
+RETRACTED_NOTE = ("↩️ Taken back — this payment no longer counts.\n"
+                  "The totals on it are out of date; the newest adjustment "
+                  "below it has the right figures.")
+
+
+async def mark_retracted_copy(target, message_id, entity=None):
+    """Say so under a copy that stays, because it could not be deleted.
+
+    Routed the way delete_forwarded_copy() is, for the same reason: an id the
+    user account FOUND means nothing to the bot in a basic group, so it replies
+    through the account that read it - and only if USERBOT_SEND allows that
+    account to post at all. Returns True if the note landed."""
+    try:
+        if entity is None:
+            sent = await send_group(target, RETRACTED_NOTE,
+                                    reply_to_message_id=message_id)
+            return sent is not None
+        if not USERBOT_SEND or _active_client is None or chat_paused(target):
+            return False
+        await _active_client.send_message(entity, RETRACTED_NOTE, reply_to=message_id)
+        return True
+    except Exception as e:
+        print(f"⚠️ [RETRACT] could not reply under {message_id} in "
+              f"{chat_name(target)}: {e}", flush=True)
+        return False
 
 
 async def delete_forwarded_copy(target, message_id, entity=None):
@@ -4600,6 +4882,7 @@ async def cashout_from_bot_api(message, is_edit=False):
                if getattr(message, 'date', None) else None)
     text = getattr(message, 'text', None) or getattr(message, 'caption', None)
     sender = getattr(message, 'from_user', None)
+    note_person(message.chat.id, sender)
     full_name = ' '.join(part for part in (getattr(sender, 'first_name', None),
                                            getattr(sender, 'last_name', None)) if part)
     await observe_cashout(message.chat.id, text, message.message_id, sent_at,
@@ -5000,6 +5283,7 @@ async def on_request_reaction(reaction):
     if route_paused(getattr(reaction.chat, 'id', None)):
         return                      # out of service: not even a ❤ or a retraction
     remember_user(user)
+    note_person(getattr(reaction.chat, 'id', None), user)
     full_name = ' '.join(part for part in (getattr(user, 'first_name', None),
                                            getattr(user, 'last_name', None)) if part)
     await note_cashout_seen(reaction.chat.id, reaction.message_id,
@@ -6321,6 +6605,296 @@ async def recover_ledgers(client):
         await recover_one_ledger(client, target)
 
 
+# ---------------------------------------------------------------------------
+# Open-request recovery
+# ---------------------------------------------------------------------------
+#
+# Open requests live in memory, so every deploy forgot them - and deploys are
+# frequent. A crew /out answering a forgotten request then found nothing open
+# and was not relayed (since 2026-09-24 not even on a screenshot), leaving the
+# group that asked with no /out and its Total Out short until somebody noticed.
+#
+# The groups are the durable record here exactly as they are for the ledger.
+# A request the bot forwarded is still open when:
+#   - its copy is still in the handling group (deleting either end settles it),
+#   - its original in the chime group carries no ❤, and
+#   - no /out in the handling group after it pairs to it (_pair_cashouts, the
+#     same rule the report uses) - the ❤ can fail, so it is not the only sign.
+#
+# Picked back up QUIETLY - the user's call on 2026-09-24. No reminder is
+# posted, nobody is re-tagged and the crew are not DMed: the ladder is marked
+# as already run. The request is simply there again, so the crew's /out is
+# relayed, booked and hearted as normal. Ethan and Larry get one DM listing
+# what came back, which is what makes re-opening on the evidence safe.
+CASHOUT_RECOVER_HOURS = float(os.getenv('CASHOUT_RECOVER_HOURS', '24'))
+CASHOUT_RECOVER_SCAN_LIMIT = int(os.getenv('CASHOUT_RECOVER_SCAN_LIMIT', '400'))
+
+
+def _sender_id(msg):
+    sender_id = getattr(msg, 'sender_id', None)
+    if sender_id is None:
+        sender_id = getattr(getattr(msg, 'sender', None), 'id', None)
+    return sender_id
+
+
+def _has_heart(msg):
+    """Does this message carry the ❤ - placed by the bot, the account or by hand?
+
+    Anyone's counts: CLAUDE.md tells Ethan to place it by hand when the bot
+    could not, and that has to settle the request here too."""
+    want = CASHOUT_HEART.replace('️', '')
+    reactions = getattr(msg, 'reactions', None)
+    for result in (getattr(reactions, 'results', None) or []):
+        emoticon = getattr(getattr(result, 'reaction', None), 'emoticon', None)
+        if emoticon and emoticon.replace('️', '') == want:
+            return True
+    return False
+
+
+async def _recover_scan(client, chat_id, since):
+    """Messages newer than `since`, oldest first. None when unreadable.
+
+    None is not "nothing there": a group that could not be read recovers
+    nothing and is named in the DM, the same rule recover_one_ledger() keeps."""
+    entity = await _resolve_one(client, chat_id)
+    if entity is None:
+        return None
+    rows = []
+    try:
+        async for msg in client.iter_messages(entity,
+                                              limit=CASHOUT_RECOVER_SCAN_LIMIT):
+            if msg.date < since:
+                break
+            rows.append(msg)
+    except Exception as e:
+        print(f"⚠️ [RECOVER] could not read {chat_name(chat_id)}: {e}", flush=True)
+        return None
+    rows.reverse()
+    return rows
+
+
+def _request_line(text, when):
+    tag = request_tag(text) or '?'
+    amount = request_amount(text)
+    figure = f"{amount:,.2f}$" if amount is not None else 'no amount'
+    return f"{tag}, {figure} (asked {_hhmm(when)})"
+
+
+async def recover_open_requests(client):
+    """Pick back up every request a redeploy forgot. Returns how many.
+
+    Safe to run again on a reconnect in the same process: a copy already open
+    in _pending_cashouts is skipped."""
+    if BOT_ID is None:
+        return 0
+    since = datetime.now(timezone.utc) - timedelta(hours=CASHOUT_RECOVER_HOURS)
+    recovered, unpaired_heart, unreadable = [], [], []
+
+    for source, route in CASHOUT_ROUTES.items():
+        handling = route['handling']
+        if route_paused(source) or route_paused(handling):
+            continue
+        handling_rows = await _recover_scan(client, handling, since)
+        source_rows = await _recover_scan(client, source, since)
+        if handling_rows is None or source_rows is None:
+            unreadable.append(f"{chat_name(source)} → {chat_name(handling)}")
+            continue
+
+        # The copies the bot posted. Strictly the bot's own: the handling groups
+        # are supergroups, where Telegram does attribute the bot's posts to it.
+        copies = [m for m in handling_rows
+                  if _sender_id(m) == BOT_ID and is_cashout_request(m.raw_text or '')]
+        if not copies:
+            continue
+
+        # The /outs, from anyone but the bot - the bot's own reminders say
+        # "/out" too, and must not read as the answer to themselves.
+        outs = []
+        for m in handling_rows:
+            text = m.raw_text or getattr(m, 'message', '') or ''
+            if _sender_id(m) != BOT_ID and _OUT_CMD_RE.search(text):
+                outs.append({'at': m.date, 'amount': out_amount(text),
+                             'reply_to': getattr(m, 'reply_to_msg_id', None)
+                             or getattr(getattr(m, 'reply_to', None),
+                                        'reply_to_msg_id', None),
+                             'by': None})
+        paired = _pair_cashouts(
+            [{'at': c.date, 'id': c.id, 'asked': request_amount(c.raw_text),
+              'paid_at': None, 'paid': None, 'by': None} for c in copies], outs)
+        paid_ids = {r['id'] for r in paired if r['paid_at'] is not None}
+
+        # The originals, which is where the ❤ goes and the only id the rest of
+        # the flow can mark or match an edit against.
+        originals = []
+        for m in source_rows:
+            text = m.raw_text or ''
+            if _sender_id(m) == BOT_ID or not is_cashout_request(text):
+                continue
+            if is_admin_crew_note(text, _sender_id(m),
+                                  getattr(getattr(m, 'sender', None), 'username', None)):
+                continue
+            originals.append(m)
+
+        used = set()
+        for copy in copies:
+            text = copy.raw_text or ''
+            if any(r['message_id'] == copy.id
+                   for r in _pending_cashouts.get(handling, [])):
+                continue                    # already open - a reconnect, not a boot
+            key = ((request_tag(text) or '').lower(), request_amount(text))
+            # The newest original at or before the copy with the same tag and
+            # amount. The tag survives redaction on the way over (c87308e), and
+            # an edit rewrites both ends, so the two still agree.
+            origin = None
+            for m in originals:
+                if m.id in used or m.date > copy.date:
+                    continue
+                if ((request_tag(m.raw_text) or '').lower(),
+                        request_amount(m.raw_text)) == key:
+                    origin = m
+            if origin is None:
+                # The original was deleted - which withdraws the request, the
+                # same as close_deleted_cashouts() treats it live. Logged, not
+                # DMed: it is settled, and a DM for every withdrawn request on
+                # every deploy would be noise.
+                print(f"♻️ [RECOVER] {chat_name(handling)} msg {copy.id} has no "
+                      f"original in {chat_name(source)} - withdrawn, left closed",
+                      flush=True)
+                continue
+            used.add(origin.id)
+
+            hearted = _has_heart(origin)
+            if hearted:
+                continue
+            if copy.id in paid_ids:
+                # Answered, but the ❤ never landed - or the /out was never
+                # relayed because the request had been forgotten. Either way
+                # somebody should look; neither is safe to re-open.
+                unpaired_heart.append(f"{chat_name(source)}: "
+                                      f"{_request_line(origin.raw_text, origin.date)}")
+                continue
+
+            request = _request_record(source, origin.raw_text, origin.id,
+                                      copy.id, copy.date)
+            request.update({
+                'recovered': True,
+                'origin_via_user': True,
+                # The ladder is marked as already run, so the watchdog leaves it
+                # alone: nothing posted, nobody tagged, no DMs.
+                'nudges': _ladder_rounds(),
+                'exhausted': True,
+                'crew_told': True,
+                'admin_told': True,
+                'larry_told': True,
+            })
+            _pending_cashouts.setdefault(handling, []).append(request)
+            recovered.append(f"{chat_name(source)} → {chat_name(handling)}: "
+                             f"{_request_line(origin.raw_text, origin.date)}")
+            print(f"♻️ [RECOVER] {chat_name(source)} request (msg {origin.id}) is "
+                  f"open again in {chat_name(handling)} (msg {copy.id}), quietly",
+                  flush=True)
+
+    if recovered or unpaired_heart or unreadable:
+        await warn_unreachable(await dm_handles(
+            CASHOUT_ADMIN_HANDLES,
+            recovered_requests_text(recovered, unpaired_heart, unreadable)))
+    else:
+        print("♻️ [RECOVER] no open cashout requests to pick back up", flush=True)
+    return len(recovered)
+
+
+# ---------------------------------------------------------------------------
+# Boot health check
+# ---------------------------------------------------------------------------
+#
+# Two things the code cannot see make features fail silently: Telegram only
+# delivers reactions to a bot that is an ADMINISTRATOR in the chat (so a
+# crew ❤-acknowledgement and a payment retraction both vanish without one),
+# and a RETRACT_SOURCES set in Railway replaces the default in the code
+# outright. Checked once per process, after the group switch is known so a
+# group out of service is not reported. Silent when everything is fine.
+_health_checked = False
+
+
+async def health_check():
+    """Problems found, as lines. Also DMs the admin when there are any."""
+    global _health_checked
+    if _health_checked or BOT_ID is None:
+        return []
+    _health_checked = True
+    problems = []
+
+    # Where reactions have to reach the bot: the handling groups (crew
+    # acknowledgements) and the retract sources (undoing a payment).
+    need_admin = {handling for handling in _CASHOUT_HANDLERS}
+    need_admin |= {rule for rule in FORWARD_RULES if rule in RETRACT_SOURCES}
+    # Where the bot posts: every live forward target.
+    need_member = {t for targets in FORWARD_RULES.values() for t in targets}
+
+    for chat in sorted(need_admin | need_member):
+        if route_paused(chat):
+            continue
+        try:
+            member = await bot.get_chat_member(chat, BOT_ID)
+            status = getattr(member, 'status', None)
+        except Exception as e:
+            problems.append(f"{chat_name(chat)}: could not check the bot there ({e})")
+            continue
+        if status in ('left', 'kicked'):
+            problems.append(f"{chat_name(chat)}: the bot is NOT a member")
+        elif chat in need_admin and status not in ('administrator', 'creator'):
+            what = []
+            if chat in _CASHOUT_HANDLERS:
+                what.append("crew reactions on cashout requests")
+            if chat in RETRACT_SOURCES:
+                what.append("reactions that undo a payment")
+            problems.append(f"{chat_name(chat)}: the bot is not an admin, so "
+                            f"{' and '.join(what)} never reach it")
+
+    # Only the groups the code means to be retractable. MH X LARRY GROUP 2 is
+    # left out on purpose, and must not be reported as missing.
+    missing = [rule for rule in (int(c) for c in RETRACT_SOURCES_DEFAULT.split(','))
+               if not route_paused(rule) and rule not in RETRACT_SOURCES]
+    if missing:
+        problems.append(
+            "A reaction does NOT undo a payment in "
+            + ', '.join(f"{chat_name(r)} ({r})" for r in missing)
+            + ": RETRACT_SOURCES is set in Railway and replaces the default - "
+              f"set it to {RETRACT_SOURCES_DEFAULT} or delete it.")
+
+    if problems:
+        print("🩺 [HEALTH] " + ' | '.join(problems), flush=True)
+        await notify_admin("🩺 Start-up check found problems:\n\n"
+                           + '\n'.join(f"• {p}" for p in problems))
+    else:
+        print("🩺 [HEALTH] bot is admin where reactions matter; every live "
+              "source can undo a payment", flush=True)
+    return problems
+
+
+def recovered_requests_text(recovered, unpaired_heart, unreadable):
+    """For Ethan and Larry, once per boot, only when there is something to say."""
+    parts = []
+    if recovered:
+        parts.append(
+            "♻️ Picked back up after the restart — still waiting on a /out:\n"
+            + '\n'.join(f"• {line}" for line in recovered)
+            + "\n\nNo reminders were posted and the crew were not tagged again. "
+              "Their /out will be relayed, booked and ❤ as normal.")
+    if unpaired_heart:
+        parts.append(
+            f"⚠️ Answered with a /out but never marked {CASHOUT_HEART}:\n"
+            + '\n'.join(f"• {line}" for line in unpaired_heart)
+            + "\n\nNot picked back up. Check the /out reached the group that asked "
+              f"and was booked, then place the {CASHOUT_HEART} by hand.")
+    if unreadable:
+        parts.append(
+            "⚠️ Could not read these groups, so any open request there was NOT "
+            "picked back up:\n"
+            + '\n'.join(f"• {line}" for line in unreadable))
+    return '\n\n'.join(parts)
+
+
 async def run_userbot():
     global userbot_status
 
@@ -6370,11 +6944,18 @@ async def run_userbot():
 
             me = await client.get_me()
             print(f"🔐 [TELETHON] Logged in as {me.first_name} (@{me.username})", flush=True)
-            global _userbot_username
+            global _userbot_username, _userbot_id
             _userbot_username = (me.username or '').lower()
+            _userbot_id = me.id
 
             # Warms the entity cache so numeric chat ids resolve reliably.
             await client.get_dialogs()
+            # Who is on which side, before the first request can be cleaned -
+            # see names_from(). Never allowed to hold up the listener.
+            try:
+                await learn_sides(client)
+            except Exception as e:
+                print(f"⚠️ [SIDES] member lists not read: {e}", flush=True)
 
             chats = await _resolve_source_chats(client, _configured_source_chats())
             if not chats:
@@ -6410,6 +6991,7 @@ async def run_userbot():
                 if not text and plain:
                     return
                 remember_user(sender)
+                note_person(event.chat_id, sender)
 
                 sender_id = getattr(sender, 'id', None)
                 if BOT_ID is not None and sender_id == BOT_ID:
@@ -6469,6 +7051,7 @@ async def run_userbot():
                 if not text and plain:
                     return
                 remember_user(sender)
+                note_person(event.chat_id, sender)
 
                 sender_id = getattr(sender, 'id', None)
                 if BOT_ID is not None and sender_id == BOT_ID:
@@ -6497,6 +7080,12 @@ async def run_userbot():
             # left out of service must not be swept, and one that came back
             # must not have the window it missed replayed into it.
             await recover_group_switch(client)
+            # Once per process, now that which groups are out of service is
+            # known. Never allowed to hold up the listener.
+            try:
+                await health_check()
+            except Exception as e:
+                print(f"⚠️ [HEALTH] check failed: {e}", flush=True)
             await recover_ledgers(client)
             try:
                 await catch_up(client)
@@ -6505,6 +7094,18 @@ async def run_userbot():
                 # on a few messages beats being deaf to all of them.
                 print(f"⚠️ [CATCHUP] sweep failed: {e} - continuing to listen.",
                       flush=True)
+            # Before the gate opens, so a /out queued behind it finds the
+            # request it answers. Guarded for the same reason as the sweep.
+            try:
+                await recover_open_requests(client)
+            except Exception as e:
+                print(f"⚠️ [RECOVER] open-request recovery failed: {e} - "
+                      "continuing to listen.", flush=True)
+                await notify_admin(
+                    f"⚠️ Open cashout requests could not be picked back up after "
+                    f"the restart: {e}\n\nAny request still waiting from before "
+                    "is forgotten - a crew /out on it will not be relayed. Your "
+                    "own /out still completes it.")
             ready.set()
 
             target = SOURCE_BOTS if SOURCE_BOTS.strip() else 'any bot'

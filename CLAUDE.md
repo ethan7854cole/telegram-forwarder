@@ -13,11 +13,14 @@ a duplicate cannot be taken back.
 **Run the tests before every push:**
 
 ```bash
-python3 tests/run.py            # all suites
-python3 tests/run.py cashout    # only matching suites
+tests/test.sh                   # all suites
+tests/test.sh cashout           # only matching suites
 ```
 
-1480 checks across 33 suites, all stubbed — nothing touches Telegram, the
+`tests/test.sh` picks an interpreter that has the packages (see the note on
+`python3` under Gotchas) and builds `.venv` only if none does.
+
+1633 checks across 36 suites, all stubbed — nothing touches Telegram, the
 network, or the live groups. They cover the pre-existing behaviour as well as
 the new, so they are the guard against a change quietly altering something that
 already worked.
@@ -624,6 +627,31 @@ The chime and VENMO groups are told figures, never who moved them.
   DM naming who is stuck would be worthless redacted. Both are pass-throughs
   and both are tested.
 
+**Names too, not just handles — "by any cost"** (2026-09-24). The bot files
+everyone it sees under the side their group belongs to (`note_person()`,
+`_side_people`): every group's member list is read at boot (`learn_sides()`)
+and topped up by whoever speaks or reacts. `names_from(side)` is then stripped
+— first, last and full name and the bare handle, whole words only — from
+everything crossing: `strip_foreign_handles()` (chime → crew: the request, the
+chase DM, the edit notice) and `strip_identities(crew_names=True)` from
+`clean_out_for_relay()` (crew → chime: any crew member named in a `/out`, not
+only its sender).
+
+- **Never filed:** Ethan, Larry, the bot, the user account, bots, anyone found
+  on BOTH sides (nothing to hide), names under three letters and words a
+  request is made of (`_NAME_STOPWORDS`).
+- **Every `$cashtag` and `@tag` is masked first** (`_strip_names()`), so a
+  person called "Jenny" cannot carve up `$jenny-buhr`.
+- **NOT at the `send_group()` door.** The door also carries forwarded payments,
+  whose payer names are customers — and the catch-up sweep matches copies by
+  name + amount, so rewriting a name there would re-send and re-book it.
+- **No fallback to the original.** `strip_foreign_handles()` used to hand back
+  the untouched text when cleaning emptied it, handles and all.
+- **Screenshots cannot be cleaned** — the bot has no OCR. A name inside an
+  image travels with it.
+
+Pinned by `tests/test_sides.py`.
+
 **The rule runs BOTH ways** (2026-08-18). Everything above keeps crew names out
 of the chime groups; `strip_foreign_handles()` keeps chime names away from the
 crew. That half had no guard at all: a `CASHOUT REQUEST` is written on the chime
@@ -897,7 +925,8 @@ Pinned by `tests/test_msgcmd.py`.
 ## Marking a cashout done
 
 The ❤ on the original request is the **only durable record** that a cashout was
-actioned: the open requests live in memory and a redeploy wipes them. A request
+actioned: the open requests live in memory and a redeploy wipes them (they are
+read back at boot from exactly this mark — see "Recovering open requests"). A request
 that was paid but never marked reads as still outstanding to anyone scrolling.
 
 **A `/out` settles the request it PAID, not the oldest one.** With two
@@ -1001,6 +1030,53 @@ of `GAFFER VENMO`.
   the bot token first, then the user account holding that entity.
 - **Still bounded by Telegram**, which refuses to let a bot delete a group
   message more than 48 hours old, and by `RETRACT_SCAN_LIMIT` (300 messages).
+- **A copy that cannot be deleted gets a note** (since 2026-09-24):
+  `mark_retracted_copy()` replies `RETRACTED_NOTE` ("↩️ Taken back — this
+  payment no longer counts") under it, routed like the delete — the bot for its
+  own id, the user account (only if `USERBOT_SEND`) for an id it found. The
+  note must never contain "received", a dollar figure, "adjusted by" or a
+  totals block: the report, the catch-up sweep and `recover_ledgers()` would
+  each read it as something it is not. Pinned in `tests/test_retract.py`.
+
+## Recovering open requests
+
+Open requests live in memory, so every deploy forgot them, and since
+2026-09-24 a crew `/out` with nothing open is never relayed. So at boot, after
+the ledgers and the catch-up sweep and before the listener's gate opens,
+`recover_open_requests()` reads the last `CASHOUT_RECOVER_HOURS` (24) of each
+live route back. A request is re-opened when **all** hold:
+
+- the bot's copy is still in the handling group (a deleted copy — or a deleted
+  original — means withdrawn, as it does live),
+- its original in the chime group carries no ❤ (anyone's ❤ counts, since the
+  admin is told to place it by hand when the bot cannot), and
+- no `/out` from anyone but the bot in the handling group pairs to it under
+  `_pair_cashouts()` — the ❤ can fail, so it is not the only sign. The bot's
+  own reminders say "/out" too and must never count.
+
+The copy and the original are matched by tag and amount. **Recovered requests
+wait quietly** (the user's call): the ladder is marked as already run, so
+nothing is posted and nobody is tagged or DMed. Ethan and Larry get one DM
+listing what came back, what was answered but never ❤'d, and any group that
+could not be read — unreadable recovers nothing, never "empty".
+
+**The original's id was read by the user account**, and both chime groups are
+basic groups, where each account numbers messages its own way. Handing that id
+to the bot would ❤ or reply to some other message. So a recovered request has
+`origin_via_user`: `heart_request(user_only=True)` skips the bot, and
+`update_cashout_request()` does not reply by that id. An edit arriving down
+the bot's path (with the bot's id) is matched to it by tag —
+`_recovered_by_tag()` — or it would open a second request. Idempotent across
+reconnects. Pinned by `tests/test_recover.py`.
+
+## Start-up health check
+
+`health_check()` runs once per process, after the group switch is known, and
+DMs the admin only when something is wrong: the bot not an **admin** in a
+handling group or retract source (reactions never reach it otherwise), not a
+member of a forward target, a chat that could not be checked, or a Railway
+`RETRACT_SOURCES` missing a group from `RETRACT_SOURCES_DEFAULT`. Paused groups
+are skipped. Never allowed to hold up boot. Pinned by `tests/test_health.py`.
 
 ## Mention watch
 
@@ -1162,8 +1238,7 @@ cashout requests.
   `/usr/bin/python3` has both. `tests/run.py` launches each suite with
   `sys.executable`, so the whole suite fails to import and every line reads
   `ModuleNotFoundError` — which looks like a broken bot and is a broken shell.
-  Run `/usr/bin/python3 tests/run.py`, or `pip3 install -r requirements.txt`
-  into whichever interpreter you want to be the one.
+  Run `tests/test.sh`, which finds one that works (or builds `.venv`).
 - Reaction updates only reach a bot that is an **administrator** in the chat,
   and `message_reaction` must be listed in `allowed_updates` explicitly.
 - Telegram only says which chat a deletion happened in when it was a channel.
@@ -1183,10 +1258,10 @@ cashout requests.
 
 ## Known gaps
 
-- **Open cashout requests do not survive a redeploy.** They live in memory, so a
-  restart stops the chasing, loses the ❤, and a later `/out` finds nothing
-  pending. Fixable with a boot sweep: re-open any `CASHOUT REQUEST` not yet
-  carrying a ❤, which already works as a durable "done" marker.
+- **Open requests are picked back up at boot, but quietly and only for 24h**
+  — see "Recovering open requests". The chase does not resume after a
+  redeploy; that is deliberate. An edit that changes a recovered request's TAG
+  and arrives down the bot's path cannot be matched and opens a second one.
 - **A duplicate payment is not detected.** When the catch-up sweep re-sent a
   window in Aug 2026, it re-booked every amount and nothing noticed. Cashout
   *requests* are guarded (`CASHOUT_DEDUP_SECONDS`); payments are not.
@@ -1215,6 +1290,9 @@ cashout requests.
 | `tests/test_startup.py` | Polling waits out the changeover; the conflict watcher |
 | `tests/test_mentions.py` | An `@` in a muted group arrives as a DM |
 | `tests/test_retract.py` | Reacting to a payment undoes it in the target |
+| `tests/test_sides.py` | Neither side sees the other's names or handles |
+| `tests/test_recover.py` | Open requests come back quietly after a redeploy |
+| `tests/test_health.py` | The start-up check names silent failures |
 | `tests/test_catchup.py` | The sweep re-sends nothing — including a retracted payment |
 | `tests/test_race.py` | Two copies of one request arriving at the same moment |
 | `tests/test_screenshot.py` | The screenshot travels with the `/out`, carrying no identity |

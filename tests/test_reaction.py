@@ -320,9 +320,9 @@ async def main():
     reset()
     order = []
     real_heart = f.heart_request
-    async def traced_heart(chat_id, message_id):
+    async def traced_heart(chat_id, message_id, **kwargs):
         order.append('heart')
-        return await real_heart(chat_id, message_id)
+        return await real_heart(chat_id, message_id, **kwargs)
     f.heart_request = traced_heart
     real_dm = f.dm_handles
     async def traced_dm(handles, text):

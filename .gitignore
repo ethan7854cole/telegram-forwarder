@@ -6,3 +6,4 @@ __pycache__/
 .bot_token
 debug.py
 forwarder_backup.py
+.venv/
