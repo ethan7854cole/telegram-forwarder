@@ -20,7 +20,7 @@ tests/test.sh cashout           # only matching suites
 `tests/test.sh` picks an interpreter that has the packages (see the note on
 `python3` under Gotchas) and builds `.venv` only if none does.
 
-1661 checks across 37 suites, all stubbed — nothing touches Telegram, the
+1687 checks across 38 suites, all stubbed — nothing touches Telegram, the
 network, or the live groups. They cover the pre-existing behaviour as well as
 the new, so they are the guard against a change quietly altering something that
 already worked.
@@ -976,6 +976,17 @@ of `GAFFER VENMO`.
 - **An anonymous admin's reaction names nobody** — Telegram sends the group as
   the actor. `on_anonymous_reaction()` retracts only when it can be pinned on
   Ethan or Larry; see "Anonymous admins".
+- **Reply `/undo` where a reaction will not stick** — `undo_command()`
+  (2026-09-27). Telegram REJECTS a reaction Larry makes as the group in
+  `MH x LARRY VENMO`: it shows for half a second and vanishes, and the bot is
+  never told (seen on a screen recording). His messages do arrive, so `/undo`
+  as a reply to the payment runs the same `retract_payment()`. The bot then
+  reacts `UNDO_MARK` (👎) on the original itself — that is the mark
+  `_retraction_mark()` reads, so the bot's own reaction counts as a retraction
+  there (it reacts on a payment in a retract source for no other reason). If
+  the mark cannot be placed the admin is warned, because the next deploy could
+  re-send the payment. The `/undo` is deleted and the outcome DMed; anyone
+  else's `/undo` is left alone. Pinned by `tests/test_undo.py`.
 - **Only the Gaffer and Gaffer Venmo routes** (`RETRACT_SOURCES`). A reaction
   on a payment in `MH X LARRY GROUP 2` does nothing. If Railway sets
   `RETRACT_SOURCES` itself, that value replaces the default in the code and has
@@ -1329,6 +1340,7 @@ cashout requests.
 | `tests/test_startup.py` | Polling waits out the changeover; the conflict watcher |
 | `tests/test_mentions.py` | An `@` in a muted group arrives as a DM |
 | `tests/test_retract.py` | Reacting to a payment undoes it in the target |
+| `tests/test_undo.py` | Reply /undo to a payment: the same as reacting, where a reaction will not stick |
 | `tests/test_anonymous.py` | Ethan and Larry keep their access when posting as an anonymous admin |
 | `tests/test_sides.py` | Neither side sees the other's names or handles |
 | `tests/test_recover.py` | Open requests come back quietly after a redeploy |

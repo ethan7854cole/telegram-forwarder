@@ -4332,6 +4332,12 @@ async def help_command(message):
         "the books are rebuilt from the newest of those\n"
         "after every deploy. Add force to override.\n"
         "\n"
+        "UNDOING A PAYMENT — in Chime Rev or MH x LARRY VENMO\n"
+        "\n"
+        "React to the payment, or reply /undo to it where a\n"
+        "reaction will not stick. Its copy is deleted and the\n"
+        "amount comes back off Total In.\n"
+        "\n"
         "PAYMENT PROMPTS — here in private, or silently in a group\n"
         "\n"
         "/pause — stops prompts in both groups\n"
@@ -4997,6 +5003,88 @@ def _carries_ledger(text):
     up until the next redeploy, which is the worst possible moment to find out."""
     total_in, total_out = parse_totals(text)
     return total_in is not None and total_out is not None
+
+
+# The bot's own mark on an original it undid for /undo. Sits where the admin's
+# reaction would have, so _retraction_mark() - and anyone scrolling - can see it.
+UNDO_MARK = '👎'
+
+
+async def _undo_notice(user_id, text):
+    """/undo answers in private: the group sees only the result, never a chat."""
+    try:
+        await bot.send_message(user_id, text)
+    except Exception as e:
+        print(f"⚠️ [UNDO] could not DM {user_id}: {e}", flush=True)
+
+
+@bot.message_handler(commands=['undo'])
+async def undo_command(message):
+    """Reply /undo to a payment: the same as reacting to it.
+
+    Added 2026-09-27. Larry is an anonymous admin in MH x LARRY VENMO, and
+    Telegram rejects a reaction made as the group there - it shows for half a
+    second and vanishes, and the bot never hears of it. His MESSAGES do arrive,
+    and are his again since anonymous attribution. So a reply names the payment
+    where a reaction cannot, and retract_payment() does the rest exactly as for
+    a reaction: correction posted, books committed, copy deleted.
+
+    The bot then reacts on the original itself. That is the durable mark the
+    catch-up sweep reads (see _retraction_mark), so a redeploy cannot bring the
+    payment back - the reaction the admin could not place, placed for them.
+
+    Retract sources only, Ethan and Larry only. The command is removed from the
+    group and the outcome DMed, so the group is left with the correction alone.
+    Anyone else's /undo is ordinary chatter and is left alone entirely."""
+    chat_id = message.chat.id
+    user_id = getattr(message.from_user, 'id', None)
+    if chat_id not in RETRACT_SOURCES or route_paused(chat_id):
+        return
+    if user_id not in LEDGER_ADMINS:
+        print(f"⛔ [UNDO] {user_id} may not /undo in {chat_name(chat_id)}", flush=True)
+        return
+
+    try:
+        await bot.delete_message(chat_id, message.message_id)
+    except Exception as e:
+        print(f"⚠️ [UNDO] could not remove the /undo in {chat_name(chat_id)}: {e}",
+              flush=True)
+
+    target = getattr(message, 'reply_to_message', None)
+    if target is None:
+        await _undo_notice(user_id, "↩️ Reply /undo to the payment you want taken "
+                                    f"back in {chat_name(chat_id)}.")
+        return
+    amount = parse_received_amount(getattr(target, 'text', None) or '')
+    if amount is None:
+        await _undo_notice(user_id, f"↩️ Nothing undone in {chat_name(chat_id)}: "
+                                    "that message is not a payment.")
+        return
+
+    rule_key = resolve_rule_key(chat_id)
+    targets = ', '.join(chat_name(t) for t in FORWARD_RULES.get(rule_key, []))
+    if not await retract_payment(chat_id, target.message_id, user_id):
+        await _undo_notice(
+            user_id,
+            f"↩️ Nothing undone in {chat_name(chat_id)}: no forwarded copy of that "
+            f"{amount:,.2f}$ payment was found in {targets or 'its target'} - it "
+            "was already taken back, or never forwarded.")
+        return
+
+    try:
+        await bot.set_message_reaction(chat_id, target.message_id,
+                                       [ReactionTypeEmoji(UNDO_MARK)])
+    except Exception as e:
+        # Not cosmetic: without a mark the next deploy's sweep may re-send it.
+        print(f"⚠️ [UNDO] could not mark the original in {chat_name(chat_id)}: {e}",
+              flush=True)
+        await notify_admin(
+            f"⚠️ /undo took {amount:,.2f}$ back off {targets}, but the bot could "
+            f"not react on the original in {chat_name(chat_id)} ({e}).\n\n"
+            "React on it by hand if you can - without a reaction there the next "
+            "deploy may send that payment again.")
+    await _undo_notice(user_id, f"↩️ Undone: {amount:,.2f}$ taken back off "
+                                f"{targets}, and the copy removed.")
 
 
 @bot.message_handler(commands=['del', 'delete', 'edit'])
@@ -6348,7 +6436,10 @@ def _retraction_mark(msg):
             peers.append(user_id)
     if not peers:
         return 'unconfirmed'
-    return 'admin' if any(uid in LEDGER_ADMINS for uid in peers) else None
+    # The bot's own reaction is the mark /undo leaves - the bot reacts on a
+    # payment in a retract source for no other reason.
+    return 'admin' if any(uid in LEDGER_ADMINS or (BOT_ID and uid == BOT_ID)
+                          for uid in peers) else None
 
 
 async def _delivered_signatures(client, target):
