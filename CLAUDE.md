@@ -20,7 +20,7 @@ tests/test.sh cashout           # only matching suites
 `tests/test.sh` picks an interpreter that has the packages (see the note on
 `python3` under Gotchas) and builds `.venv` only if none does.
 
-1633 checks across 36 suites, all stubbed — nothing touches Telegram, the
+1661 checks across 37 suites, all stubbed — nothing touches Telegram, the
 network, or the live groups. They cover the pre-existing behaviour as well as
 the new, so they are the guard against a change quietly altering something that
 already worked.
@@ -973,6 +973,9 @@ of `GAFFER VENMO`.
 - **ANY reaction retracts** — the user's explicit choice, with no confirmation
   step. A stray tap on a payment in that group really does move the books.
 - **Only Ethan and Larry**, like every other ledger movement.
+- **An anonymous admin's reaction names nobody** — Telegram sends the group as
+  the actor. `on_anonymous_reaction()` retracts only when it can be pinned on
+  Ethan or Larry; see "Anonymous admins".
 - **Only the Gaffer and Gaffer Venmo routes** (`RETRACT_SOURCES`). A reaction
   on a payment in `MH X LARRY GROUP 2` does nothing. If Railway sets
   `RETRACT_SOURCES` itself, that value replaces the default in the code and has
@@ -1037,6 +1040,42 @@ of `GAFFER VENMO`.
   note must never contain "received", a dollar figure, "adjusted by" or a
   totals block: the report, the catch-up sweep and `recover_ledgers()` would
   each read it as something it is not. Pinned in `tests/test_retract.py`.
+
+## Anonymous admins
+
+**Larry is an anonymous admin in `MH x LARRY VENMO`** (an ordinary member in
+Chime Rev). Telegram hides an anonymous admin behind the group: a message comes
+with the group as `sender_chat` and `GroupAnonymousBot` as `from_user`, a
+reaction with no user and the group as `actor_chat`, and the userbot sees the
+group as the sender. Until 2026-09-27 nothing he did there reached the bot as
+him — the same retraction that worked in Chime Rev silently did nothing.
+
+The user's rule: **Ethan and Larry get the same access through the bot in every
+group, and only they.** So an anonymous post or reaction is attributed to them
+when — and only when — **every** anonymous admin in that chat is Ethan or Larry
+(`anonymous_ledger_admin()`).
+
+- **One place per input path, before anything reads the sender.** Bot API:
+  `bot.process_new_updates` is wrapped, so `from_user` is already Larry by the
+  time any handler — `/add`, `/out`, `/set`, `/del`, `/edit`, `/group`, the
+  cashout flow — looks. Userbot: `anonymous_telethon_sender()` at the top of
+  both listeners, so the two paths agree and dedup cannot keep the wrong one.
+  Reactions: `on_anonymous_reaction()`.
+- **Anybody else anonymous there too, and nothing is attributed** — the post
+  could be theirs, and only those two may move the books. Same if the admin
+  list cannot be read. Refused, never guessed.
+- **The bot is anonymous in Chime Rev.** Its own posts come back through the
+  userbot credited to the group, and because the bot is not in `LEDGER_ADMINS`
+  it spoils the "every anonymous admin" test there. That is deliberate: its
+  `/out` relay must never read as Larry typing one.
+- **Channel posts are never a person** — the Bot API side only looks at groups,
+  the userbot side requires `event.is_group`.
+- The admin list is cached `ANON_ADMIN_CACHE_SECONDS` (30): long enough that the
+  bot's own anonymous posts do not cost a lookup each, short enough that a crew
+  member switching anonymity on does not inherit Larry's standing for long.
+
+Pinned by `tests/test_anonymous.py` (including an anonymous `/out` going all the
+way to GAFFER VENMO's books) and `tests/test_retract.py` 4c.
 
 ## Recovering open requests
 
@@ -1290,6 +1329,7 @@ cashout requests.
 | `tests/test_startup.py` | Polling waits out the changeover; the conflict watcher |
 | `tests/test_mentions.py` | An `@` in a muted group arrives as a DM |
 | `tests/test_retract.py` | Reacting to a payment undoes it in the target |
+| `tests/test_anonymous.py` | Ethan and Larry keep their access when posting as an anonymous admin |
 | `tests/test_sides.py` | Neither side sees the other's names or handles |
 | `tests/test_recover.py` | Open requests come back quietly after a redeploy |
 | `tests/test_health.py` | The start-up check names silent failures |

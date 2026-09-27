@@ -3,11 +3,12 @@ import io
 import os
 import re
 import signal
+import time
 from collections import Counter, OrderedDict
 from datetime import datetime, timedelta, timezone
 
 from telebot.async_telebot import AsyncTeleBot
-from telebot.types import InputFile, ReactionTypeEmoji
+from telebot.types import InputFile, ReactionTypeEmoji, User
 
 from telethon import TelegramClient, events, utils
 from telethon.errors import (AuthKeyDuplicatedError, AuthKeyUnregisteredError,
@@ -5273,12 +5274,13 @@ async def on_request_reaction(reaction):
     Telegram only delivers these to a bot that is an ADMINISTRATOR in the chat,
     which is why run_bot() has to ask for message_reaction explicitly and why
     the bot needs admin rights in the handling groups. A reaction being removed
-    is not an answer, and an anonymous admin cannot be attributed to anyone, so
-    both are ignored."""
+    is not an answer, so it is ignored. An anonymous admin's reaction carries
+    no user - see on_anonymous_reaction()."""
     if not getattr(reaction, 'new_reaction', None):
         return
     user = getattr(reaction, 'user', None)
     if user is None:
+        await on_anonymous_reaction(reaction)
         return
     if route_paused(getattr(reaction.chat, 'id', None)):
         return                      # out of service: not even a ❤ or a retraction
@@ -5296,6 +5298,153 @@ async def on_request_reaction(reaction):
     # a request carries no "You received" amount, so it retracts nothing.
     await retract_payment(reaction.chat.id, reaction.message_id,
                           getattr(user, 'id', None))
+
+
+# ---------------------------------------------------------------------------
+# Anonymous admins
+# ---------------------------------------------------------------------------
+#
+# Telegram hides an anonymous admin behind the group itself: a reaction arrives
+# with no user and the group as the actor, a message with the group as its
+# sender_chat (and GroupAnonymousBot as from_user on the Bot API side). Larry is
+# an anonymous admin in MH x LARRY VENMO, so until 2026-09-27 nothing he did
+# there reached the bot as him - a retraction that worked in Chime Rev, where he
+# is an ordinary member, silently did nothing in venmo, and his /add, /set,
+# /out, /del and /edit there were read as nobody's.
+#
+# The user's rule: Ethan and Larry get the same access through the bot in every
+# group, whatever their Telegram standing there. So an anonymous post or
+# reaction is attributed to them - but ONLY when every anonymous admin in that
+# chat is one of them. If anybody else is anonymous too, it could be theirs,
+# and only those two may move the books, so it is refused rather than guessed.
+#
+# The bot itself is anonymous in Chime Rev, and its own posts come back through
+# the userbot credited to the group. Because the bot is not in LEDGER_ADMINS it
+# spoils the "every anonymous admin" test there, which is exactly right: the
+# bot's own "/out" relay must never be mistaken for Larry typing one.
+
+# How long one admin list is trusted. Short, because a crew member switching
+# anonymity on must not inherit Larry's standing for long; non-zero, because
+# the bot's own anonymous posts in Chime Rev would otherwise cost a lookup each.
+ANON_ADMIN_CACHE_SECONDS = int(os.getenv('ANON_ADMIN_CACHE_SECONDS', '30'))
+_anon_admin_cache = {}          # chat id -> (monotonic time, admin id or None)
+
+# What an attributed post is dressed as, so every handler reads it exactly as
+# if the account itself had typed it.
+_ADMIN_PROFILES = {LARRY_ID: ('Larry', 'Larryyxx'),
+                   ETHAN_ID: ('Ethan', 'ethannxxxx')}
+
+
+def _same_chat(a, b):
+    return a is not None and b is not None and (a == b or a in _id_variants(b))
+
+
+async def anonymous_ledger_admin(chat_id):
+    """Which ledger admin an anonymous post or reaction here must be, or None."""
+    now = time.monotonic()
+    cached = _anon_admin_cache.get(chat_id)
+    if cached and now - cached[0] < ANON_ADMIN_CACHE_SECONDS:
+        return cached[1]
+    try:
+        admins = await bot.get_chat_administrators(chat_id)
+    except Exception as e:
+        # Not cached: the next attempt should ask again rather than inherit
+        # a refusal caused by one failed call.
+        print(f"⚠️ [ANON] could not list the admins of {chat_name(chat_id)}: {e}",
+              flush=True)
+        return None
+    hidden = [getattr(getattr(m, 'user', None), 'id', None)
+              for m in admins or [] if getattr(m, 'is_anonymous', False)]
+    who = None
+    if hidden and all(uid in LEDGER_ADMINS for uid in hidden):
+        who = hidden[0]
+    elif hidden:
+        print(f"⛔ [ANON] {chat_name(chat_id)} has an anonymous admin other than "
+              "Ethan or Larry - anonymous posts there are not attributed.",
+              flush=True)
+    _anon_admin_cache[chat_id] = (now, who)
+    return who
+
+
+def _admin_user(user_id):
+    """A telebot User standing for Ethan or Larry, as if they had typed it."""
+    first, username = _ADMIN_PROFILES.get(user_id, (None, None))
+    return User(id=user_id, is_bot=False, first_name=first or str(user_id),
+                username=username)
+
+
+async def attribute_anonymous_message(message):
+    """Put Ethan or Larry back on a Bot API message an anonymous admin posted.
+
+    Done once, before any handler runs, so every command and every path reads
+    the same sender - /add, /set, /out, /del, /edit, /group and the cashout
+    flow alike. Returns True when the message was re-attributed."""
+    chat = getattr(message, 'chat', None)
+    sender_chat = getattr(message, 'sender_chat', None)
+    if chat is None or sender_chat is None:
+        return False
+    if getattr(chat, 'type', None) not in ('group', 'supergroup'):
+        return False            # a channel post is the channel, not a person
+    if not _same_chat(getattr(sender_chat, 'id', None), chat.id):
+        return False            # posted as some other channel: nobody we know
+    who = await anonymous_ledger_admin(chat.id)
+    if who is None:
+        return False
+    message.from_user = _admin_user(who)
+    message.sender_chat = None
+    return True
+
+
+async def anonymous_telethon_sender(event):
+    """The same, for the userbot: Ethan or Larry behind an anonymous post."""
+    if not getattr(event, 'is_group', False):
+        return None             # broadcast channel posts are always "the channel"
+    sender_id = getattr(getattr(event, 'message', None), 'sender_id', None)
+    if not _same_chat(sender_id, getattr(event, 'chat_id', None)):
+        return None
+    who = await anonymous_ledger_admin(event.chat_id)
+    return _admin_user(who) if who is not None else None
+
+
+_process_new_updates_raw = bot.process_new_updates
+
+
+async def _process_new_updates_attributed(updates):
+    """telebot's dispatch, with anonymous admins named first."""
+    for update in updates or []:
+        for message in (getattr(update, 'message', None),
+                        getattr(update, 'edited_message', None)):
+            if message is None:
+                continue
+            try:
+                await attribute_anonymous_message(message)
+            except Exception as e:
+                print(f"⚠️ [ANON] could not attribute a message: {e}", flush=True)
+    await _process_new_updates_raw(updates)
+
+
+bot.process_new_updates = _process_new_updates_attributed
+
+
+async def on_anonymous_reaction(reaction):
+    """A reaction from an anonymous admin: a retraction, if it can be pinned
+    on Ethan or Larry. Nothing else - the crew acknowledgement needs a named
+    responder, and Ethan and Larry are not responders anyway."""
+    chat_id = getattr(getattr(reaction, 'chat', None), 'id', None)
+    actor_id = getattr(getattr(reaction, 'actor_chat', None), 'id', None)
+    # The group reacting as itself is an anonymous admin. A channel reacting on
+    # somebody's behalf is not, and is nobody we could name.
+    if not _same_chat(actor_id, chat_id):
+        return
+    if chat_id not in RETRACT_SOURCES or route_paused(chat_id):
+        return
+    who = await anonymous_ledger_admin(chat_id)
+    if who is None:
+        print(f"↩️ [RETRACT] anonymous reaction on {reaction.message_id} in "
+              f"{chat_name(chat_id)} - not attributable to Ethan or Larry, "
+              "nothing retracted.", flush=True)
+        return
+    await retract_payment(chat_id, reaction.message_id, who)
 
 
 # ══════════════════════════ THE DAILY REPORT ══════════════════════════
@@ -6977,6 +7126,9 @@ async def run_userbot():
             async def on_source_message(event):
                 await ready.wait()
                 sender = await event.get_sender()
+                # An anonymous admin posts as the group. Ethan or Larry behind
+                # it get their own name back - see anonymous_ledger_admin().
+                sender = await anonymous_telethon_sender(event) or sender
                 text = event.raw_text or ''
                 plain = _is_plain_text(event.message)
                 in_handling = _canonical(event.chat_id, _CASHOUT_HANDLERS) is not None
@@ -7042,6 +7194,9 @@ async def run_userbot():
                 would forward and book the same deposit twice."""
                 await ready.wait()
                 sender = await event.get_sender()
+                # An anonymous admin posts as the group. Ethan or Larry behind
+                # it get their own name back - see anonymous_ledger_admin().
+                sender = await anonymous_telethon_sender(event) or sender
                 text = event.raw_text or ''
                 plain = _is_plain_text(event.message)
                 in_handling = _canonical(event.chat_id, _CASHOUT_HANDLERS) is not None

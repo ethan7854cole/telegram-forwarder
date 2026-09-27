@@ -12,6 +12,7 @@ import asyncio
 import os
 import sys
 from datetime import datetime, timezone
+from types import SimpleNamespace as NS
 
 os.environ['TELEGRAM_BOT_TOKEN'] = '111222:FAKE'
 os.environ.setdefault('PAUSED_CHATS', '')      # both routes live here - see run.py
@@ -57,6 +58,13 @@ class FakeBot:
     async def set_message_reaction(self, *a, **k):
         return True
 
+    admins = []
+
+    async def get_chat_administrators(self, chat_id):
+        if isinstance(self.admins, Exception):
+            raise self.admins
+        return self.admins
+
 
 f.bot = FakeBot()
 f.USERBOT_SEND = False
@@ -76,6 +84,7 @@ def reset(opening=(100.0, 20.0)):
     sent.clear(); deleted.clear(); user_deleted.clear(); dms.clear()
     replies.clear(); user_sent.clear()
     f._ledger.clear(); f._delivered.clear(); f._seen_messages.clear()
+    f._anon_admin_cache.clear()
     f.bot.fail_send = f.bot.fail_delete = False
     if opening:
         f.ledger_commit(GAFFER, opening)
@@ -233,6 +242,76 @@ async def main():
     await forward(source=LVENMO, mid=504)
     check('a stranger cannot retract on venmo either',
           await f.retract_payment(LVENMO, 504, STRANGER) is False)
+
+    # -- 4c. Larry reacting as an ANONYMOUS admin ----------------------------
+    # 2026-09-27: Larry is an anonymous admin in MH x LARRY VENMO, so Telegram
+    # sends his reaction with no user and the group as the actor. It used to be
+    # dropped silently. The live admin list there: the bot, Larry (anonymous),
+    # and @Maynuddin23 as owner (not anonymous).
+    def admin(uid, anonymous):
+        return NS(user=NS(id=uid), is_anonymous=anonymous)
+
+    def anon_reaction(chat, mid, actor=None):
+        return NS(chat=NS(id=chat), message_id=mid, user=None,
+                  actor_chat=NS(id=chat if actor is None else actor),
+                  new_reaction=[NS(type='emoji', emoji='👍')])
+
+    VENMO_ADMINS = [admin(8614082158, False), admin(LARRY, True),
+                    admin(6030387329, False)]
+
+    reset()
+    f.ledger_commit(GVENMO, (100.0, 20.0))
+    f.bot.admins = VENMO_ADMINS
+    await forward(source=LVENMO, mid=505)
+    vcopy = [i for c, _, i in sent if c == GVENMO][0]
+    sent.clear()
+    await f.on_request_reaction(anon_reaction(LVENMO, 505))
+    check('an anonymous Larry reaction retracts in venmo',
+          deleted == [(GVENMO, vcopy)], str(deleted))
+    check('and takes it back off GAFFER VENMO Total In',
+          f.ledger_snapshot(GVENMO)[0] == 100.0, str(f.ledger_snapshot(GVENMO)))
+
+    # A crew member who is ALSO anonymous could be the one who reacted.
+    reset()
+    f.ledger_commit(GVENMO, (100.0, 20.0))
+    f.bot.admins = VENMO_ADMINS + [admin(77, True)]
+    await forward(source=LVENMO, mid=506)
+    await f.on_request_reaction(anon_reaction(LVENMO, 506))
+    check('not when somebody else is anonymous there too', deleted == [], str(deleted))
+    check('and the books are left alone', f.ledger_snapshot(GVENMO)[0] == 115.0,
+          str(f.ledger_snapshot(GVENMO)))
+
+    # Nobody anonymous at all: nothing to attribute it to.
+    reset()
+    f.ledger_commit(GVENMO, (100.0, 20.0))
+    f.bot.admins = [admin(LARRY, False), admin(6030387329, False)]
+    await forward(source=LVENMO, mid=507)
+    await f.on_request_reaction(anon_reaction(LVENMO, 507))
+    check('not when no admin is anonymous', deleted == [], str(deleted))
+
+    # A channel reacting on somebody's behalf is not an anonymous admin.
+    reset()
+    f.ledger_commit(GVENMO, (100.0, 20.0))
+    f.bot.admins = VENMO_ADMINS
+    await forward(source=LVENMO, mid=508)
+    await f.on_request_reaction(anon_reaction(LVENMO, 508, actor=-1009999999))
+    check('not when a different chat is the actor', deleted == [], str(deleted))
+
+    # The admin list cannot be read: refuse, never guess.
+    reset()
+    f.ledger_commit(GVENMO, (100.0, 20.0))
+    f.bot.admins = RuntimeError('chat not found')
+    await forward(source=LVENMO, mid=509)
+    await f.on_request_reaction(anon_reaction(LVENMO, 509))
+    check('not when the admin list cannot be read', deleted == [], str(deleted))
+
+    # Outside the retract sources an anonymous reaction does nothing at all.
+    reset()
+    f.bot.admins = [admin(LARRY, True)]
+    await forward(source=MHLARRY, mid=510)
+    await f.on_request_reaction(anon_reaction(MHLARRY, 510))
+    check('not on the route that does not retract', deleted == [], str(deleted))
+    f.bot.admins = []
 
     # -- 5. a message we never forwarded -------------------------------------
     reset()
