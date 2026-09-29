@@ -187,6 +187,10 @@ last_messages = []
 
 userbot_status = 'disabled'
 
+# Forward target -> when a payment was last booked there, this process. Read by
+# /test only; nothing else depends on it.
+_last_payment = {}
+
 # Set once run_userbot() has a client, so the shutdown handler can release it.
 _active_client = None
 
@@ -3911,6 +3915,7 @@ async def deliver_to_target(target, fixed, text, from_bot, source_key=None):
 
     if movement:
         ledger_commit(target, movement[1])
+        _last_payment[target] = datetime.now(timezone.utc)  # for /test
         await note_payment(target)  # a real payment landed: reset the clock
     remember_delivery(source_key, target, getattr(sent, 'message_id', None),
                       (movement[1][0] - movement[0][0]) if movement else 0.0)
@@ -4288,6 +4293,37 @@ async def status(message):
         await bot.reply_to(message, txt)
 
 
+TELEGRAM_MESSAGE_LIMIT = 4096
+
+
+def split_message(text, limit=TELEGRAM_MESSAGE_LIMIT):
+    """Parts no longer than `limit`, broken at blank lines where possible,
+    then at line ends, and only as a last resort mid-line."""
+    parts, current = [], ''
+    for block in text.split('\n\n'):
+        candidate = f"{current}\n\n{block}" if current else block
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        if current:
+            parts.append(current)
+        current = ''
+        for line in block.split('\n'):
+            candidate = f"{current}\n{line}" if current else line
+            if len(candidate) <= limit:
+                current = candidate
+                continue
+            if current:
+                parts.append(current)
+            while len(line) > limit:
+                parts.append(line[:limit])
+                line = line[limit:]
+            current = line
+    if current:
+        parts.append(current)
+    return parts
+
+
 @bot.message_handler(commands=['help'])
 async def help_command(message):
     """Private-chat command reference. Values come from the live config so this
@@ -4296,7 +4332,9 @@ async def help_command(message):
         return
 
     groups = ' or '.join(IDLE_NAMES[t] for t in sorted(IDLE_ALERT_CHATS))
-    await send_group(message.chat.id,
+    # Telegram refuses anything over 4096 characters outright - the whole
+    # reply, not the tail - and the list outgrew that, so it goes in parts.
+    for part in split_message(
         "📖 COMMANDS\n"
         "\n"
         f"LEDGER — type these inside {groups}\n"
@@ -4413,6 +4451,8 @@ async def help_command(message):
         "/status — bot state, userbot, paused groups, and\n"
         "whether the cashout flow is stopped\n"
         "/ping — quick alive check\n"
+        "/test — full check: bot, userbot, every route and\n"
+        "when it last took a payment. Posts nothing in any group\n"
         "/help — this list\n"
         "\n"
         "GOOD TO KNOW\n"
@@ -4430,7 +4470,54 @@ async def help_command(message):
             + ', '.join(chat_name(c) for c in PAUSED_CHAT_IDS)
             + "\nThe bot does nothing at all in those groups —\n"
               "no forwarding, no cashouts, no prompts, no replies.")
-           if PAUSED_CHAT_IDS else ""))
+           if PAUSED_CHAT_IDS else "")):
+        await send_group(message.chat.id, part)
+
+
+def test_report_text(problems):
+    """The /test reply. Reads state only - posts nothing, books nothing."""
+    listening = str(userbot_status).startswith('listening')
+    lines = ["🧪 TEST", "",
+             f"✅ Bot: online (up {get_uptime()})",
+             f"{'✅' if listening else '❌'} Userbot: {userbot_status}",
+             "", "ROUTES"]
+    now = datetime.now(timezone.utc)
+    for source, targets in FORWARD_RULES.items():
+        for target in targets:
+            route = f"{chat_name(source)} → {chat_name(target)}"
+            if route_paused(source) or route_paused(target):
+                lines.append(f"⏸ {route}: out of service")
+                continue
+            lines.append(f"✅ {route}")
+            last = _last_payment.get(target)
+            if last is None:
+                seen = f"no payment since the restart {get_uptime()} ago"
+            else:
+                minutes = (now - last).total_seconds() // 60
+                seen = ("last payment just now" if minutes < 1
+                        else f"last payment {_humanise(minutes)} ago")
+            sent = _idle_slot(target)['sent'] if target in IDLE_ALERT_CHATS else 0
+            if sent:
+                seen += f" (idle prompt #{sent})"
+            lines.append(f"   {seen}")
+    lines.append("")
+    if problems:
+        lines.append("❌ Problems:")
+        lines.extend(f"• {p}" for p in problems)
+    else:
+        lines.append("✅ Admin in all handling groups")
+    lines.append(f"Cashout flow: {'⏸ STOPPED' if _cashout_stopped else 'running'}")
+    return '\n'.join(lines)
+
+
+# The filter, not an early return: a /test typed anywhere else must fall through
+# to the handlers that saw it before this command existed.
+@bot.message_handler(commands=['test'],
+                     func=lambda m: m.chat.id in LEDGER_ADMINS)
+async def test_command(message):
+    """A health report for Ethan and Larry, in private. Checks, never posts."""
+    problems = await health_problems() if BOT_ID is not None else []
+    await bot.reply_to(message, test_report_text(problems))
 
 
 @bot.message_handler(commands=['ping'])
@@ -7062,6 +7149,20 @@ async def health_check():
     if _health_checked or BOT_ID is None:
         return []
     _health_checked = True
+    problems = await health_problems()
+
+    if problems:
+        print("🩺 [HEALTH] " + ' | '.join(problems), flush=True)
+        await notify_admin("🩺 Start-up check found problems:\n\n"
+                           + '\n'.join(f"• {p}" for p in problems))
+    else:
+        print("🩺 [HEALTH] bot is admin where reactions matter; every live "
+              "source can undo a payment", flush=True)
+    return problems
+
+
+async def health_problems():
+    """What health_check() and /test both look for, as lines. Sends nothing."""
     problems = []
 
     # Where reactions have to reach the bot: the handling groups (crew
@@ -7101,14 +7202,6 @@ async def health_check():
             + ', '.join(f"{chat_name(r)} ({r})" for r in missing)
             + ": RETRACT_SOURCES is set in Railway and replaces the default - "
               f"set it to {RETRACT_SOURCES_DEFAULT} or delete it.")
-
-    if problems:
-        print("🩺 [HEALTH] " + ' | '.join(problems), flush=True)
-        await notify_admin("🩺 Start-up check found problems:\n\n"
-                           + '\n'.join(f"• {p}" for p in problems))
-    else:
-        print("🩺 [HEALTH] bot is admin where reactions matter; every live "
-              "source can undo a payment", flush=True)
     return problems
 
 

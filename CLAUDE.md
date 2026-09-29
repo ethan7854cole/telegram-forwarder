@@ -20,7 +20,7 @@ tests/test.sh cashout           # only matching suites
 `tests/test.sh` picks an interpreter that has the packages (see the note on
 `python3` under Gotchas) and builds `.venv` only if none does.
 
-1687 checks across 38 suites, all stubbed — nothing touches Telegram, the
+1728 checks across 39 suites, all stubbed — nothing touches Telegram, the
 network, or the live groups. They cover the pre-existing behaviour as well as
 the new, so they are the guard against a change quietly altering something that
 already worked.
@@ -1128,6 +1128,19 @@ member of a forward target, a chat that could not be checked, or a Railway
 `RETRACT_SOURCES` missing a group from `RETRACT_SOURCES_DEFAULT`. Paused groups
 are skipped. Never allowed to hold up boot. Pinned by `tests/test_health.py`.
 
+**`/test` runs the same check on demand**, from a private chat, Ethan and
+Larry only — `test_command()`, sharing `health_problems()` with the boot check.
+It replies with the bot, the userbot, every route and when each last booked a
+payment (`_last_payment`, this process only), idle prompts, paused routes and
+the cashout switch. It **posts nothing in any group and books nothing**, and it
+does not use up the once-per-boot DM. The handler is registered with a `func`
+filter rather than an early return, so a `/test` typed in a group still falls
+through to the handlers that saw it before. Pinned by `tests/test_testcmd.py`.
+
+**`/help` goes in parts** — `split_message()`, at blank lines, each under
+Telegram's 4096 characters. It outgrew the limit and Telegram refuses an
+over-long message whole, so until 2026-09-29 `/help` answered nothing at all.
+
 ## Mention watch
 
 The six cashout groups are **muted**, so an `@Larryyxx` or `@ethannxxxx` in one
@@ -1345,6 +1358,7 @@ cashout requests.
 | `tests/test_sides.py` | Neither side sees the other's names or handles |
 | `tests/test_recover.py` | Open requests come back quietly after a redeploy |
 | `tests/test_health.py` | The start-up check names silent failures |
+| `tests/test_testcmd.py` | `/test` reports without posting; `/help` fits Telegram |
 | `tests/test_catchup.py` | The sweep re-sends nothing — including a retracted payment |
 | `tests/test_race.py` | Two copies of one request arriving at the same moment |
 | `tests/test_screenshot.py` | The screenshot travels with the `/out`, carrying no identity |

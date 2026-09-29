@@ -181,7 +181,7 @@ async def main():
 
     reset()
     await f.help_command(M(LARRY, '/help', LARRY))
-    body = sent[-1][1]
+    body = '\n\n'.join(t for _, t in sent)   # /help now goes in parts
     for token in ['/add 500', '/out 100', '/set in 800', '/pause', '/resume',
                   '/status', '/ping', '/help']:
         check(f'/help still documents {token}', token in body)
