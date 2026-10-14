@@ -559,6 +559,10 @@ def ledger_commit(target, after, note=''):
 # ---------------------------------------------------------------------------
 
 IDLE_ALERT_MINUTES = int(os.getenv('IDLE_ALERT_MINUTES', '90'))
+# No prompt is sent once a group has been quiet longer than this - the user's
+# call, 2026-10-14. With prompts every 90 minutes that is two (1h30 and 3h),
+# then nothing until a payment or /resume restarts the clock. 0 means no limit.
+IDLE_STOP_MINUTES = int(os.getenv('IDLE_STOP_MINUTES', '240'))
 IDLE_ALERT_CHATS = {-5580596463, -5350880041}      # CHIME GAFFER, CHIME PICCASO
 
 IDLE_NAMES = {-5580596463: 'CHIME GAFFER', -5350880041: 'CHIME PICCASO'}
@@ -665,6 +669,8 @@ async def idle_watchdog():
                 continue
             quiet = (now - slot['since']).total_seconds() / 60.0
             due = IDLE_ALERT_MINUTES * (slot['sent'] + 1)
+            if IDLE_STOP_MINUTES and due > IDLE_STOP_MINUTES:
+                continue            # quiet too long: stop asking until a payment
             if quiet < due:
                 continue
             try:
@@ -4471,6 +4477,8 @@ async def help_command(message):
         f"and every {MILESTONE_OUT_STEP:,}$ out.\n"
         f"Prompts ask the group after {_humanise(IDLE_ALERT_MINUTES)} "
         "without a payment.\n"
+        + (f"They stop once it has been quiet {_humanise(IDLE_STOP_MINUTES)}.\n"
+           if IDLE_STOP_MINUTES else "") +
         "\n"
         "In a group, /pause and /resume post nothing at all — check /status."
         + (("\n\nOUT OF SERVICE: "
