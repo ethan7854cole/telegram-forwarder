@@ -56,24 +56,27 @@ class M:
 async def main():
     now = datetime.now(timezone.utc)
 
-    # -- VENMO goes to GAFFER VENMO and nowhere else -------------------------
-    # It fanned out to PICCASO VENMO as well until 2026-08-18. One payment
-    # moving two groups' books was the thing being corrected, so the second
-    # check is the point of this one: not just that GAFFER VENMO gets it, but
-    # that PICCASO VENMO no longer does.
+    # -- VENMO goes to GAFFER VENMO and PICCASO VENMO -----------------------
+    # Fed to GAFFER VENMO only from 2026-08-18; PICCASO VENMO was put back on
+    # 2026-10-14 at the user's request, knowing one payment then moves both
+    # groups' books. test_shared.py covers the cashout side of that.
     reset()
+    f._ledger[GVENMO] = {'in': 50.0, 'out': 5.0}
+    f._ledger[PVENMO] = {'in': 300.0, 'out': 40.0}
     await f.process_incoming(VENMO, 'You received $10.00\nTotal In: 50\nTotal Out: 5',
                              'test', from_bot=True, sent_at=now)
-    check('VENMO forwards to GAFFER VENMO',
-          [c for c, _ in sent] == [GVENMO], str(sent))
-    check('and PICCASO VENMO is not fed at all',
-          not any(c == PVENMO for c, _ in sent), str(sent))
-    check('so one payment moves one set of books', len(sent) == 1, str(sent))
+    check('VENMO forwards to GAFFER VENMO and PICCASO VENMO',
+          sorted(c for c, _ in sent) == sorted([GVENMO, PVENMO]), str(sent))
+    check('once each', len(sent) == 2, str(sent))
+    check('each group books it on its own figures',
+          f.ledger_snapshot(GVENMO) == (60.0, 5.0)
+          and f.ledger_snapshot(PVENMO) == (310.0, 40.0),
+          f"{f.ledger_snapshot(GVENMO)} {f.ledger_snapshot(PVENMO)}")
 
-    # -- ...but PICCASO VENMO keeps its books ---------------------------------
-    # What it stopped getting is FORWARDS. The group is still there, the same
-    # people are in it, and its figures are still Ethan's and Larry's to
-    # correct - exactly as in GAFFER VENMO and CHIME GAFFER.
+    # -- PICCASO VENMO's books -----------------------------------------------
+    # Kept through the months it was not fed, and still. Its figures are
+    # Ethan's and Larry's to correct - exactly as in GAFFER VENMO and CHIME
+    # GAFFER.
     reset()
     f._ledger[PVENMO] = {'in': 1000.0, 'out': 200.0}
     await f.ledger_command(M(PVENMO, '/add 500', LARRY))

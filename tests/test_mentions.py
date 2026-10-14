@@ -99,10 +99,16 @@ async def main():
         check(f'{f.chat_name(chat)} is watched', len(alerts()) == 2, str(dms))
 
     # -- 3. ...and nowhere else ----------------------------------------------
-    # PICCASO VENMO is the honest test now: a real group, still redacted, but
-    # on no route at all - so nobody is chased about an @ in it.
+    # PICCASO VENMO asks for cashouts since 2026-10-14, so it is watched like
+    # GAFFER VENMO now.
     reset()
     await mention(-5306739731, 'ping @ethannxxxx', mid=300)
+    check('PICCASO VENMO is watched now it asks for cashouts', len(alerts()) == 2,
+          str(dms))
+
+    # A group on no cashout route at all is not watched.
+    reset()
+    await mention(-5100231155, 'ping @ethannxxxx', mid=302)
     check('a group on no route is not watched', alerts() == [], str(dms))
 
     reset()

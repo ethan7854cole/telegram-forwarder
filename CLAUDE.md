@@ -20,7 +20,7 @@ tests/test.sh cashout           # only matching suites
 `tests/test.sh` picks an interpreter that has the packages (see the note on
 `python3` under Gotchas) and builds `.venv` only if none does.
 
-1728 checks across 39 suites, all stubbed — nothing touches Telegram, the
+1799 checks across 41 suites, all stubbed — nothing touches Telegram, the
 network, or the live groups. They cover the pre-existing behaviour as well as
 the new, so they are the guard against a change quietly altering something that
 already worked.
@@ -39,19 +39,21 @@ Payments travel outward. Cashout requests travel back.
 MH X LARRY GROUP 2   --"You received"------>  CHIME PICCASO      (Total In  ↑)
 Chime Rev & out no-7 --"You received"------>  CHIME GAFFER       (Total In  ↑)
 MH x LARRY VENMO     --"You received"------>  GAFFER VENMO       (Total In  ↑)
+                                       +-->  PICCASO VENMO      (Total In  ↑)
 
 CHIME PICCASO  --"CASHOUT REQUEST"-------->  MH X LARRY GROUP 2
 CHIME GAFFER   --"CASHOUT REQUEST"-------->  Chime Rev & out no-7
 GAFFER VENMO   --"CASHOUT REQUEST"-------->  MH x LARRY VENMO
+PICCASO VENMO  --"CASHOUT REQUEST"-------->  MH x LARRY VENMO   (shared - see below)
         ^                                            |
         +--------------- /out --------------------- +   (Total Out ↑, ❤ on the request)
 ```
 
-**MH X LARRY GROUP 2 and CHIME PICCASO are currently OUT OF SERVICE** — that
-whole route, both directions. The tables above still describe it exactly; the
-bot is simply deaf and mute in those two chats. `/group on piccaso` from a
-private chat puts it back, `/group off piccaso` takes it out again; see "Taking
-a group out of service" below.
+**MH X LARRY GROUP 2 and CHIME PICCASO ship out of service** (`PAUSED_CHATS`),
+but were turned back on with `/group on piccaso` on 2026-10-14 and the marker
+keeps them on across deploys; see "Taking a group out of service" below. Since
+the same day that route runs exactly as Chime Rev's: bot-only payments, and a
+reaction or `/undo` retracts.
 
 **The venmo pair now runs the full flow** (2026-08-18): payments out, cashout
 requests back, crew tagged and chased, `/out` relayed and booked, a ❤ on the
@@ -63,17 +65,45 @@ nothing else. `MH x LARRY VENMO` joined `BOT_ONLY_SOURCES` with the route —
 the moment a group also handles cashouts, people talk in it, and a pasted
 notification must never be booked as a fresh deposit.
 
-**MH x LARRY VENMO feeds GAFFER VENMO only**, as of 2026-08-18. It fanned out
-to PICCASO VENMO as well until then, so one payment moved two groups' books;
-the venmo side now matches the chime side, where each source feeds exactly one
-target.
+**MH x LARRY VENMO feeds GAFFER VENMO and PICCASO VENMO** (2026-10-14, the
+user's call). It fanned out to both until 2026-08-18, then fed GAFFER VENMO
+only because one payment moved two groups' books — which is now intended again:
+one venmo payment raises **both** groups' Total In, and an undo takes it back
+off both. `FEED_STARTED` stops the boot sweep back-filling PICCASO VENMO with
+the payments it missed while unfed (to `catch_up()` they all look "missing").
+`FORMER_TARGETS` is empty again.
 
-What PICCASO VENMO stopped getting is **forwards** — not its books and not its
-rules. It is no longer fed or swept, but `/add`, `/out` and `/set` still work
-there, its confirmations still carry both totals, `recover_ledgers()` still
-reads them back after a deploy, and crew names are still stripped on the way
-in. `FORMER_TARGETS` is what keeps all of that true; see `LEDGER_CHATS` and
-`REDACTED_CHATS`.
+### One handling group, two groups asking
+
+**PICCASO VENMO asks for cashouts in MH x LARRY VENMO too** — the first handling
+group serving two. `_CASHOUT_HANDLERS` maps a handling group to a LIST of
+asking groups; `shared_handling()` says when there is more than one. The user's
+rule: a request is remembered with the group that asked, and its `/out` goes
+back to THAT group, **never the other one**.
+
+- **A reply decides** — to the request, or (everywhere, since this change) to
+  one of its reminders.
+- **No reply**: the candidates are the open requests for the `/out`'s figure, or
+  every open one. If they all come from ONE group, the oldest of them is paid,
+  as before. If they span two, `_match_request(strict=True)` returns None and
+  `hold_unclear_out()` relays nothing, books nothing, asks in the handling
+  group (naming no group) for the `/out` to be sent as a reply, and DMs Ethan
+  and Larry. The chime routes keep the old loose fallback.
+- **An admin `/out` with nothing open there is not force-completed** — there
+  is no request to say which group it pays. Both admins are DMed; they can type
+  the `/out` in the right venmo group directly.
+- **The copy carries no label** (the user's call). So the report and the boot
+  recovery tell the groups' requests apart with `attribute_copies()`: the same
+  tag and amount, the original at or up to `ATTRIBUTE_WINDOW_SECONDS` (600)
+  before the copy. Matching originals in BOTH groups is `AMBIGUOUS` and never
+  guessed: the report counts it in neither row, and recovery does not re-open
+  it but lists it in the admin DM.
+- **The duplicate guard is per asking group** — identical text from the two
+  groups is two cashouts.
+- **Pausing:** a shared handling group is out of service only when every group
+  asking in it is.
+
+Pinned by `tests/test_shared.py`.
 
 `FORWARD_RULES` drives the first. `CASHOUT_ROUTES` drives the second, and is
 deliberately a **separate table** — putting the pairs in `FORWARD_RULES` would
@@ -118,7 +148,9 @@ nothing.
   and must be left completely alone, including the `/add`/`/out`/`/set` ledger
   commands.
 - **The exception: a `/out` from Ethan or Larry in a handling group always
-  completes a cashout**, open request or not — `force_complete_cashout()`.
+  completes a cashout**, open request or not — `force_complete_cashout()` —
+  **except in a handling group shared by two asking groups** (MH x LARRY
+  VENMO), where there is no telling which group it pays.
   Open requests live in memory, so a redeploy wipes them, and a redeploy is
   exactly when somebody needs to finish a cashout the bot has forgotten. Before
   this their `/out` did nothing at all: it sat in the group looking actioned to
@@ -604,9 +636,9 @@ The chime and VENMO groups are told figures, never who moved them.
   outbound function; it redacts whenever the destination is in `REDACTED_CHATS`
   — every target, **plus** `FORMER_TARGETS`, groups nothing is routed to any
   more. Redaction is about who is reading, not about which table an id is in
-  today: PICCASO VENMO stopped being fed on 2026-08-18 and is still full of the
-  same people. A group put back into `FORWARD_RULES` is covered again on its
-  own, so `FORMER_TARGETS` never needs undoing.
+  today: PICCASO VENMO went unfed from 2026-08-18 to 2026-10-14 and stayed
+  redacted throughout. A group put back into `FORWARD_RULES` is covered again
+  on its own, so `FORMER_TARGETS` never needs undoing.
   That is what makes "never" true for messages that do not exist yet — a new
   milestone, a new correction, anything added later.
 - **`strip_identities()` takes out ANY `@mention`**, not only the configured
@@ -992,10 +1024,10 @@ the start-up health check says so.
   the mark cannot be placed the admin is warned, because the next deploy could
   re-send the payment. The `/undo` is deleted and the outcome DMed; anyone
   else's `/undo` is left alone. Pinned by `tests/test_undo.py`.
-- **Only the Gaffer and Gaffer Venmo routes** (`RETRACT_SOURCES`). A reaction
-  on a payment in `MH X LARRY GROUP 2` does nothing. If Railway sets
-  `RETRACT_SOURCES` itself, that value replaces the default in the code and has
-  to list both sources.
+- **Every route's source** (`RETRACT_SOURCES`) since 2026-10-14. If Railway
+  sets `RETRACT_SOURCES` itself, that value replaces the default in the code
+  and has to list all three. An undo in MH x LARRY VENMO comes off both venmo
+  groups.
 - **Post, commit, delete — in that order.** The message being deleted is itself
   one of the messages `recover_ledgers()` reads back, so the correction has to
   publish both totals *first*. A delete that fails then still leaves the
@@ -1353,6 +1385,8 @@ cashout requests.
 | `tests/run.py` | Test runner; exits non-zero on any failure |
 | `tests/test_regress*.py` | Guard the pre-existing behaviour |
 | `tests/test_parity.py` | Both cashout routes must behave identically |
+| `tests/test_shared.py` | Two venmo groups sharing MH x LARRY VENMO: each `/out` goes home, never to the other |
+| `tests/test_idlestop.py` | The no-payment prompts stop after 4 hours of quiet |
 | `tests/test_caption.py` | A `/out` captioning a screenshot, through both real dispatchers |
 | `tests/test_shutdown.py` | SIGTERM always reaches the exit, however the disconnect goes |
 | `tests/test_startup.py` | Polling waits out the changeover; the conflict watcher |

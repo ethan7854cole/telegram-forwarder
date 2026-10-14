@@ -136,10 +136,15 @@ async def main():
           str(vars(msg.from_user)))
     check('as a person, not a bot', msg.from_user.is_bot is False)
     # The interaction, not just the unit: his /out with nothing open is the
-    # admin's force-complete, relayed and booked exactly as in Chime Rev.
-    check('his /out reaches GAFFER VENMO',
-          any(c == GVENMO for c, _ in sent), str(sent))
-    check('and books Total Out there', f.ledger_snapshot(GVENMO)[1] == 25.0,
+    # admin's. Since 2026-10-14 two groups ask in MH x LARRY VENMO, so with
+    # nothing open there is no telling which one it pays - it is held and the
+    # admins are told, rather than guessed into either group's books.
+    check('his /out is taken as the admin\'s - told it was not relayed',
+          any('NOT relayed' in t and 'cannot tell which' in t for _, t in dms),
+          str(dms))
+    check('and reaches neither venmo group',
+          not any(c in (GVENMO, -5306739731) for c, _ in sent), str(sent))
+    check('nor books anything', f.ledger_snapshot(GVENMO)[1] == 0.0,
           str(f.ledger_snapshot(GVENMO)))
 
     # -- 2. ONLY Ethan and Larry --------------------------------------------
@@ -151,6 +156,8 @@ async def main():
           not any(c == GVENMO for c, _ in sent), str(sent))
     check('and nothing is booked', f.ledger_snapshot(GVENMO) == (0.0, 0.0),
           str(f.ledger_snapshot(GVENMO)))
+    check('and it is not treated as the admin\'s /out',
+          not any('cannot tell which' in t for _, t in dms), str(dms))
 
     reset({LVENMO: VENMO_ADMINS[:1] + [admin(ETHAN, True), admin(LARRY, True)]})
     msg = (await dispatch(update(LVENMO, 'hi', sender_chat=LVENMO)))[0]

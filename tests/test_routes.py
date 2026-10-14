@@ -36,7 +36,8 @@ def use_routes(spec):
     f.CASHOUT_ROUTES.clear()
     f.CASHOUT_ROUTES.update(f._parse_cashout_routes(spec))
     f._CASHOUT_HANDLERS.clear()
-    f._CASHOUT_HANDLERS.update({r['handling']: s for s, r in f.CASHOUT_ROUTES.items()})
+    for s, r in f.CASHOUT_ROUTES.items():
+        f._CASHOUT_HANDLERS.setdefault(r['handling'], []).append(s)
 
 
 async def main():

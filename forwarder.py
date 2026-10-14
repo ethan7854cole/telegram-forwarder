@@ -60,18 +60,19 @@ FORWARD_RULES = {
     -1003894781195: [-5350880041],
     # Chime Rev & out no-7 -> CHIME GAFFER
     -1002335630148: [-5580596463],
-    # MH x LARRY VENMO -> GAFFER VENMO
+    # MH x LARRY VENMO -> GAFFER VENMO and PICCASO VENMO
     #
-    # GAFFER VENMO only, as of 2026-08-18. It used to fan out to PICCASO VENMO
-    # as well, which meant one payment moved two sets of books - the venmo side
-    # now matches the chime side, where each source feeds exactly one target.
+    # Both, again, since 2026-10-14 - the user's call. It fanned out to both
+    # until 2026-08-18, then fed GAFFER VENMO only. One venmo payment moves BOTH
+    # groups' Total In, and an undo takes it back off both. FEED_STARTED keeps
+    # the boot sweep from back-filling what PICCASO VENMO missed meanwhile.
     #
     # The source was -5339749243 until 2026-08-18. That group was RE-CREATED,
     # and a new group gets a new id even under the same name with the same
     # people in it, so the old id resolved to nothing and every venmo payment
     # went unforwarded for half an hour with only a console line to show for
     # it. warn_missing_sources() now says so out loud.
-    -1004298140797: [-5100231154],
+    -1004298140797: [-5100231154, -5306739731],
 }
 
 # Sources where ONLY bot messages may be forwarded, never humans. Messages from
@@ -365,11 +366,20 @@ LEDGER_ADMINS = {ETHAN_ID, LARRY_ID}
 TARGET_CHATS = {t for targets in FORWARD_RULES.values() for t in targets}
 
 # Groups the bot still keeps for, though nothing is routed to them any more.
-# PICCASO VENMO stopped being fed on 2026-08-18 and is still a live group with
-# the same people in it, so what it stops getting is FORWARDS - not its books
-# and not its rules. A group put back into FORWARD_RULES is covered by
-# TARGET_CHATS again automatically, so nothing here needs undoing.
-FORMER_TARGETS = {-5306739731}                      # PICCASO VENMO
+# What a group stops getting is FORWARDS - not its books and not its rules.
+# PICCASO VENMO sat here from 2026-08-18 until it was fed again on 2026-10-14;
+# TARGET_CHATS covers it now.
+FORMER_TARGETS = set()
+
+# When a target started (or started again) receiving forwards. catch_up() never
+# hands such a group anything older: the sweep reads back up to
+# CATCHUP_LOOKBACK_MINUTES of the source, and everything from before this moment
+# is "missing" from the new target only because it was never meant to go there.
+# Delivering it would post and BOOK hours of payments the group never had.
+# Self-expiring once it is older than the sweep window.
+FEED_STARTED = {
+    -5306739731: datetime(2026, 10, 14, 11, 6, tzinfo=timezone.utc),  # PICCASO VENMO
+}
 
 # What send_group() scrubs on the way out - see strip_identities(). Redaction
 # follows who is READING a group, not which table its id is in today, and the
@@ -740,11 +750,22 @@ CASHOUT_ROUTES = _parse_cashout_routes(os.getenv(
     'CASHOUT_ROUTES',
     '-5350880041:-1003894781195,'        # CHIME PICCASO -> MH X LARRY GROUP 2
     '-5580596463:-1002335630148,'        # CHIME GAFFER  -> Chime Rev & out no-7
-    '-5100231154:-1004298140797'))       # GAFFER VENMO  -> MH x LARRY VENMO
+    '-5100231154:-1004298140797,'        # GAFFER VENMO  -> MH x LARRY VENMO
+    '-5306739731:-1004298140797'))       # PICCASO VENMO -> MH x LARRY VENMO
 
-# Reverse lookup, for recognising a message posted in a handling group.
-_CASHOUT_HANDLERS = {route['handling']: source
-                     for source, route in CASHOUT_ROUTES.items()}
+# Reverse lookup, for recognising a message posted in a handling group: every
+# group that asks there, in route order. MH x LARRY VENMO is the one handling
+# group serving two (2026-10-14), and that is why this is a list - a /out there
+# must go back to the group that asked and NEVER to the other one, so nothing
+# downstream may assume a handling group has a single origin.
+_CASHOUT_HANDLERS = {}
+for _source, _route in CASHOUT_ROUTES.items():
+    _CASHOUT_HANDLERS.setdefault(_route['handling'], []).append(_source)
+
+
+def shared_handling(handling):
+    """Does more than one group ask in this handling group?"""
+    return len(_CASHOUT_HANDLERS.get(handling, [])) > 1
 
 CHAT_NAMES = {
     -5350880041: 'CHIME PICCASO',
@@ -1125,8 +1146,10 @@ def route_paused(chat_id):
 
     handling = _canonical(chat_id, _CASHOUT_HANDLERS)
     if handling is not None:
-        origin = _CASHOUT_HANDLERS[handling]
-        return chat_paused(origin) or chat_paused(CASHOUT_ROUTES[origin]['out_to'])
+        # Out only when EVERY group asking there is: a shared handling group
+        # keeps working for the one still in service.
+        return all(chat_paused(origin) or chat_paused(CASHOUT_ROUTES[origin]['out_to'])
+                   for origin in _CASHOUT_HANDLERS[handling])
 
     rule_key = resolve_rule_key(chat_id)
     if rule_key is not None:
@@ -1145,11 +1168,14 @@ def route_members(chat_id):
     create from a phone by naming one group and assuming the other followed."""
     members = {chat_id}
 
+    sources = []
     source = _canonical(chat_id, CASHOUT_ROUTES)
+    if source is not None:
+        sources.append(source)
     handling = _canonical(chat_id, _CASHOUT_HANDLERS)
     if handling is not None:
-        source = _CASHOUT_HANDLERS[handling]
-    if source is not None:
+        sources.extend(_CASHOUT_HANDLERS[handling])
+    for source in sources:
         route = CASHOUT_ROUTES[source]
         members.update((source, route['handling'], route['out_to']))
 
@@ -2224,7 +2250,10 @@ async def open_cashout_request(source, text, sent_at, origin_msg_id):
     now = datetime.now(timezone.utc)
     if CASHOUT_DEDUP_SECONDS:
         for open_request in _pending_cashouts.get(handling, []):
-            if open_request.get('fingerprint') != fingerprint:
+            # Per group: the same words from two groups sharing a handling
+            # group are two cashouts, not one sent twice.
+            if (open_request.get('fingerprint') != fingerprint
+                    or open_request.get('origin') != source):
                 continue
             age = (now - open_request['opened']).total_seconds()
             if age <= CASHOUT_DEDUP_SECONDS:
@@ -2235,7 +2264,8 @@ async def open_cashout_request(source, text, sent_at, origin_msg_id):
 
     # The check above can only see requests that finished posting. This covers
     # the one still in flight - see _cashout_claims.
-    if not _claim_cashout(handling, fingerprint, now):
+    claim = f"{source}:{fingerprint}"
+    if not _claim_cashout(handling, claim, now):
         print(f"🔁 [CASHOUT] identical request already being posted to "
               f"{chat_name(handling)} - not posting a second copy", flush=True)
         return
@@ -2248,7 +2278,7 @@ async def open_cashout_request(source, text, sent_at, origin_msg_id):
     try:
         sent = await send_group(handling, body)
     except Exception as e:
-        _release_cashout(handling, fingerprint)
+        _release_cashout(handling, claim)
         print(f"❌ [CASHOUT] could not post {chat_name(source)} request to "
               f"{chat_name(handling)}: {e}", flush=True)
         await notify_admin(
@@ -2264,7 +2294,7 @@ async def open_cashout_request(source, text, sent_at, origin_msg_id):
         # rather than left to raise, because a request record with no message
         # id behind it would strand the claim and take the listener down with
         # it. Silent, like everything else about a paused group.
-        _release_cashout(handling, fingerprint)
+        _release_cashout(handling, claim)
         return
 
     request = _request_record(source, text, origin_msg_id, sent.message_id, now)
@@ -2274,7 +2304,7 @@ async def open_cashout_request(source, text, sent_at, origin_msg_id):
     # rather than on a clock of its own keeps _pending_cashouts the single
     # answer to "is this a duplicate" - two windows that could disagree is how
     # the guard would start refusing genuine second cashouts.
-    _release_cashout(handling, fingerprint)
+    _release_cashout(handling, claim)
     print(f"📤 [CASHOUT] {chat_name(source)} -> {chat_name(handling)} "
           f"(msg {sent.message_id}), waiting {CASHOUT_TIMEOUT_MINUTES}m for /out",
           flush=True)
@@ -2879,7 +2909,7 @@ async def flag_amount_mismatch(handling, request, text):
         cashout_shortfall_text(request, handling, asked, paid)))
 
 
-def _match_request(queue, reply_to, text=None):
+def _match_request(queue, reply_to, text=None, strict=False):
     """Which open request a /out is answering.
 
     An explicit reply is unambiguous, so it wins.
@@ -2894,21 +2924,35 @@ def _match_request(queue, reply_to, text=None):
     The oldest is still the fallback, for a /out with no figure or a figure
     matching nothing, because settling the wrong request is recoverable and
     dropping a real /out strands a cashout. Among several asking for the same
-    amount the oldest wins, which is the order they are worked in."""
+    amount the oldest wins, which is the order they are worked in.
+
+    `strict` is for a handling group more than one group asks in. There the
+    guess is never allowed to cross groups - the user's rule, 2026-10-14: a /out
+    goes back to the group that asked and NEVER to the other one. A reply still
+    decides outright. Otherwise the candidates (the requests for that figure,
+    or every open one) must all come from ONE group; if they span two, this
+    returns None and the /out is held until somebody replies to the request."""
     if reply_to:
         for request in queue:
             if request['message_id'] == reply_to:
                 return request
+        # A reply to one of its reminders points at the request just as surely.
+        for request in queue:
+            if reply_to in request.get('group_notice', []):
+                return request
 
+    candidates = []
     paid = _OUT_AMOUNT_RE.search(text or '')
     if paid:
         wanted = _to_float(paid.group(1))
         if wanted is not None:
-            for request in queue:
-                if request_amount(request.get('text')) == wanted:
-                    return request
+            candidates = [r for r in queue if request_amount(r.get('text')) == wanted]
+    if not candidates:
+        candidates = list(queue)
 
-    return queue[0]
+    if strict and len({r['origin'] for r in candidates}) > 1:
+        return None
+    return candidates[0]
 
 
 # ---------------------------------------------------------------------------
@@ -3062,9 +3106,26 @@ async def force_complete_cashout(handling, text, user_id, username,
     There is nothing to ❤: the request this answers is not in memory, so its
     message id is not either. The money side is what matters here, and it is
     done exactly as the ordinary completion does it."""
-    source = _CASHOUT_HANDLERS.get(handling)
-    if source is None:
+    sources = _CASHOUT_HANDLERS.get(handling)
+    if not sources:
         return
+    if len(sources) > 1:
+        # Nothing open, and more than one group asks here: there is no request
+        # to say which group this pays, and guessing could hand one group's
+        # money to the other. Ethan and Larry can book it in the right group.
+        print(f"✋ [CASHOUT] admin /out in {chat_name(handling)} with nothing "
+              "open - cannot tell which group, not relayed", flush=True)
+        await warn_unreachable(await dm_handles(
+            CASHOUT_ADMIN_HANDLES,
+            f"✋ A /out in {chat_name(handling)} was NOT relayed.\n\n"
+            f"{' '.join((text or '').split())[:200]}\n\n"
+            "Nothing is open there, and "
+            f"{' and '.join(chat_name(s) for s in sources)} both ask in that "
+            "group, so the bot cannot tell which one it pays.\n\n"
+            "Nothing was sent or booked. To finish it, type the /out in the "
+            "group it belongs to."))
+        return
+    source = sources[0]
     out_to = CASHOUT_ROUTES.get(source, {}).get('out_to', source)
 
     why = "by hand" if by_admin else "on the screenshot"
@@ -3093,6 +3154,47 @@ async def force_complete_cashout(handling, text, user_id, username,
         f"Booked: {f'{booked:,.2f}$' if booked else 'nothing (no figure in the /out)'}\n\n"
         "No ❤ was placed: the original request is not in memory, so there is "
         "nothing to mark. Worth adding by hand if it is still there."))
+
+
+def cashout_out_held_text():
+    """Posted in the handling group. Names no group: the crew are never told
+    which chime group asks, only which message to answer."""
+    return ("⚠️ This /out was NOT sent anywhere.\n\n"
+            "More than one cashout is open here, from different groups, and it "
+            "could be paying either. Send it again as a REPLY to the cashout "
+            "request it pays.")
+
+
+async def hold_unclear_out(handling, queue, text, message_id, username,
+                           full_name=None):
+    """A /out in a shared handling group that could belong to either group.
+
+    Nothing is relayed, booked or hearted - guessing is exactly how one group's
+    cashout would land in the other's. The crew are asked to reply to the
+    request instead, and Ethan and Larry are told what is being held."""
+    print(f"✋ [CASHOUT] /out in {chat_name(handling)} could answer requests from "
+          f"{', '.join(sorted({chat_name(r['origin']) for r in queue}))} - held, "
+          "asking for a reply", flush=True)
+    try:
+        try:
+            await send_group(handling, cashout_out_held_text(),
+                             reply_to_message_id=message_id)
+        except Exception:
+            # The id may be one only the user account knows; say it unattached.
+            await send_group(handling, cashout_out_held_text())
+    except Exception as e:
+        print(f"⚠️ [CASHOUT] could not post the hold notice in "
+              f"{chat_name(handling)}: {e}", flush=True)
+    lines = '\n'.join(f"• {chat_name(r['origin'])}: {_cashout_preview(r)}"
+                      for r in queue)
+    await warn_unreachable(await dm_handles(
+        CASHOUT_ADMIN_HANDLES,
+        f"✋ A /out in {chat_name(handling)} was HELD.\n\n"
+        f"{' '.join((text or '').split())[:200]}\n\n"
+        f"Sent by {describe_user(username, full_name)}, not as a reply, while "
+        f"requests from more than one group are open:\n{lines}\n\n"
+        "Nothing was sent or booked. The crew were asked to reply to the "
+        "request it pays."))
 
 
 async def handle_cashout_reply(handling, text, user_id, username, reply_to,
@@ -3138,6 +3240,8 @@ async def handle_cashout_reply(handling, text, user_id, username, reply_to,
                     "relay and book it."))
         return
     responder = _is_responder(user_id, username, handling)
+    # Loose for everything that only reaches Ethan and Larry; the /out itself
+    # is matched strictly further down.
     target = _match_request(queue, reply_to, text)
 
     # Read BEFORE the loop below sets it. The first thing a crew member says is
@@ -3161,6 +3265,12 @@ async def handle_cashout_reply(handling, text, user_id, username, reply_to,
         return
 
     request = target
+    if shared_handling(handling):
+        request = _match_request(queue, reply_to, text, strict=True)
+        if request is None:
+            await hold_unclear_out(handling, queue, text, message_id,
+                                   username, full_name)
+            return
     # Normally the group that asked, but a route may send the /out elsewhere.
     out_to = request.get('out_to', request['origin'])
 
@@ -4458,6 +4568,12 @@ async def help_command(message):
         "amount is added to that group's Total Out, and the\n"
         "original request there gets a ❤.\n"
         "A /out with nothing pending is ignored.\n"
+        "\n"
+        "MH x LARRY VENMO answers BOTH venmo groups. Each\n"
+        "/out goes back only to the group that asked. One\n"
+        "that could belong to either is held until it is\n"
+        "sent as a reply to its request, and an admin /out\n"
+        "there with nothing open is not relayed.\n"
         "\n"
         "INFO\n"
         "\n"
@@ -5813,6 +5929,7 @@ def _read_handling_side(messages):
         if CASHOUT_KEYWORD.lower() in text.lower() and not _chatter:
             requests.append({'at': msg.date, 'id': msg.id,
                              'asked': request_amount(text),
+                             'tag': (request_tag(text) or '').lower(),
                              'text': ' '.join(text.split())[:120],
                              'chases': 0, 'paid_at': None, 'paid': None,
                              'by': None})
@@ -5857,21 +5974,88 @@ def _pair_cashouts(requests, outs):
     An explicit reply wins outright. Otherwise the figure decides, because a
     /out settles the request it PAID and not the oldest one; taking queue[0]
     blindly is what mis-marked a live cashout on 2026-08-04. The oldest open
-    request is still the fallback for a /out with no figure."""
+    request is still the fallback for a /out with no figure.
+
+    Requests carrying an 'origin' (a shared handling group - see
+    attribute_copies()) follow the live strict rule: a /out that is not a reply
+    and could pay requests from two groups pays neither, exactly as the live
+    path held it. Each /out that does pair records the request in 'paid_id'."""
     for out in sorted(outs, key=lambda o: o['at']):
         open_now = [r for r in requests if r['paid_at'] is None
                     and r['at'] <= out['at']]
         if not open_now:
             continue
         match = next((r for r in open_now if r['id'] == out['reply_to']), None)
-        if match is None and out['amount'] is not None:
-            match = next((r for r in open_now if r['asked'] == out['amount']), None)
         if match is None:
-            match = open_now[0]
+            candidates = []
+            if out['amount'] is not None:
+                candidates = [r for r in open_now if r['asked'] == out['amount']]
+            candidates = candidates or open_now
+            if len({r.get('origin') for r in candidates}) > 1:
+                continue
+            match = candidates[0]
         match['paid_at'] = out['at']
         match['paid'] = out['amount']
         match['by'] = out['by']
+        out['paid_id'] = match['id']
     return requests
+
+
+# How close behind its original a copy is posted. The bot forwards in seconds;
+# this is slack for a slow send, not a matching window anyone should rely on.
+ATTRIBUTE_WINDOW_SECONDS = 600
+AMBIGUOUS = 'ambiguous'
+
+
+def attribute_copies(copies, originals):
+    """Which group asked for each request copy in a SHARED handling group.
+
+    `copies` are (id, date, tag, amount); `originals` maps each asking group to
+    its own (id, date, tag, amount) requests. The copy carries no label - the
+    user's call, 2026-10-14 - so it is matched the way recovery always matched
+    one: the same tag and amount, the original at or shortly before the copy.
+
+    Returns {copy id: group, None or AMBIGUOUS}. None means no original was
+    found anywhere (withdrawn, or asked before the window); AMBIGUOUS means a
+    matching original in more than one group. Callers must treat both as
+    unknown and never pick one, or a cashout ends up in the other group's
+    books."""
+    used = set()
+    result = {}
+    for cid, cdate, ctag, camount in sorted(copies, key=lambda c: c[1]):
+        best = {}
+        for group, rows in originals.items():
+            for oid, odate, otag, oamount in rows:
+                if (group, oid) in used or (otag, oamount) != (ctag, camount):
+                    continue
+                lag = (cdate - odate).total_seconds()
+                if not 0 <= lag <= ATTRIBUTE_WINDOW_SECONDS:
+                    continue
+                if group not in best or lag < best[group][0]:
+                    best[group] = (lag, oid)
+        if len(best) == 1:
+            group, (_, oid) = next(iter(best.items()))
+            used.add((group, oid))
+            result[cid] = group
+        else:
+            result[cid] = AMBIGUOUS if best else None
+    return result
+
+
+def _original_requests(rows):
+    """The requests people typed in a chime or venmo group, as attribute_copies()
+    reads them. Never the bot's own posts, never admin chatter."""
+    found = []
+    for m in rows or []:
+        text = m.raw_text or ''
+        if _sender_id(m) == BOT_ID or not is_cashout_request(text):
+            continue
+        if is_admin_crew_note(text, _sender_id(m),
+                              getattr(getattr(m, 'sender', None), 'username', None)):
+            continue
+        found.append((m.id, m.date, (request_tag(text) or '').lower(),
+                      request_amount(text)))
+    return found
 
 
 async def build_day_report(client, day):
@@ -5883,11 +6067,18 @@ async def build_day_report(client, day):
 async def build_report(client, start, end, day):
     """Everything both ends of every pair did in the window. Reads only."""
     report = {'day': day, 'pairs': [], 'unreadable': []}
+    scans = {}
+
+    async def scan(chat):
+        # Once per chat: a shared handling group serves two rows.
+        if chat not in scans:
+            scans[chat] = await _report_scan(client, chat, start, end)
+        return scans[chat]
 
     for pair in report_pairs():
         chime, handling = pair['chime'], pair['handling']
-        chime_msgs = await _report_scan(client, chime, start, end)
-        handling_msgs = await _report_scan(client, handling, start, end)
+        chime_msgs = await scan(chime)
+        handling_msgs = await scan(handling)
         if chime_msgs is None:
             report['unreadable'].append(chat_name(chime))
         if handling_msgs is None:
@@ -5895,7 +6086,24 @@ async def build_report(client, start, end, day):
 
         books = _read_chime_side(chime_msgs or [])
         floor = _read_handling_side(handling_msgs or [])
-        cashouts = _pair_cashouts(floor['requests'], floor['outs'])
+        if shared_handling(handling):
+            # Two groups ask in this one. Each row keeps only its own requests
+            # and the /outs that paid them - see attribute_copies().
+            originals = {}
+            for group in _CASHOUT_HANDLERS[handling]:
+                rows = chime_msgs if group == chime else await scan(group)
+                originals[group] = _original_requests(rows)
+            owner = attribute_copies(
+                [(r['id'], r['at'], r['tag'], r['asked']) for r in floor['requests']],
+                originals)
+            for r in floor['requests']:
+                r['origin'] = owner.get(r['id'])
+            _pair_cashouts(floor['requests'], floor['outs'])
+            mine = {r['id'] for r in floor['requests'] if r['origin'] == chime}
+            cashouts = [r for r in floor['requests'] if r['id'] in mine]
+            floor['outs'] = [o for o in floor['outs'] if o.get('paid_id') in mine]
+        else:
+            cashouts = _pair_cashouts(floor['requests'], floor['outs'])
 
         booked_in = sum(p['amount'] for p in books['payments'])
         booked_out = sum(o['amount'] for o in books['booked_out'])
@@ -6689,7 +6897,10 @@ async def catch_up(client):
 
             missing = []
             unjudged = 0
+            started = FEED_STARTED.get(target)
             for msg in pending:
+                if started and msg.date < started:
+                    continue                    # from before this group was fed
                 if reached is not None and msg.date < reached:
                     # Older than the target scan could see. Unknown, not absent.
                     unjudged += 1
@@ -7030,14 +7241,21 @@ async def recover_open_requests(client):
     if BOT_ID is None:
         return 0
     since = datetime.now(timezone.utc) - timedelta(hours=CASHOUT_RECOVER_HOURS)
-    recovered, unpaired_heart, unreadable = [], [], []
+    recovered, unpaired_heart, unreadable, unattributed = [], [], [], []
+    scans = {}
+
+    async def scan(chat):
+        # Once per chat: a shared handling group is read for two routes.
+        if chat not in scans:
+            scans[chat] = await _recover_scan(client, chat, since)
+        return scans[chat]
 
     for source, route in CASHOUT_ROUTES.items():
         handling = route['handling']
-        if route_paused(source) or route_paused(handling):
+        if route_paused(source) or chat_paused(handling):
             continue
-        handling_rows = await _recover_scan(client, handling, since)
-        source_rows = await _recover_scan(client, source, since)
+        handling_rows = await scan(handling)
+        source_rows = await scan(source)
         if handling_rows is None or source_rows is None:
             unreadable.append(f"{chat_name(source)} → {chat_name(handling)}")
             continue
@@ -7048,6 +7266,22 @@ async def recover_open_requests(client):
                   if _sender_id(m) == BOT_ID and is_cashout_request(m.raw_text or '')]
         if not copies:
             continue
+
+        owner = None
+        if shared_handling(handling):
+            # More than one group asks here, and the copy does not say which.
+            # Every asking group's originals decide it together; a copy that
+            # cannot be pinned on one group is never re-opened, because a
+            # guessed origin would send its /out to the wrong group.
+            originals = {}
+            for group in _CASHOUT_HANDLERS[handling]:
+                rows = await scan(group)
+                if rows is None or route_paused(group):
+                    continue
+                originals[group] = _original_requests(rows)
+            owner = attribute_copies(
+                [(c.id, c.date, (request_tag(c.raw_text or '') or '').lower(),
+                  request_amount(c.raw_text)) for c in copies], originals)
 
         # The /outs, from anyone but the bot - the bot's own reminders say
         # "/out" too, and must not read as the answer to themselves.
@@ -7062,8 +7296,17 @@ async def recover_open_requests(client):
                              'by': None})
         paired = _pair_cashouts(
             [{'at': c.date, 'id': c.id, 'asked': request_amount(c.raw_text),
-              'paid_at': None, 'paid': None, 'by': None} for c in copies], outs)
+              'paid_at': None, 'paid': None, 'by': None,
+              **({'origin': owner.get(c.id)} if owner is not None else {})}
+             for c in copies], outs)
         paid_ids = {r['id'] for r in paired if r['paid_at'] is not None}
+        if owner is not None:
+            for c in copies:
+                if (owner.get(c.id) == AMBIGUOUS and c.id not in paid_ids
+                        and source == _CASHOUT_HANDLERS[handling][0]):
+                    unattributed.append(f"{chat_name(handling)}: "
+                                        f"{_request_line(c.raw_text, c.date)}")
+            copies = [c for c in copies if owner.get(c.id) == source]
 
         # The originals, which is where the ❤ goes and the only id the rest of
         # the flow can mark or match an edit against.
@@ -7136,10 +7379,11 @@ async def recover_open_requests(client):
                   f"open again in {chat_name(handling)} (msg {copy.id}), quietly",
                   flush=True)
 
-    if recovered or unpaired_heart or unreadable:
+    if recovered or unpaired_heart or unreadable or unattributed:
         await warn_unreachable(await dm_handles(
             CASHOUT_ADMIN_HANDLES,
-            recovered_requests_text(recovered, unpaired_heart, unreadable)))
+            recovered_requests_text(recovered, unpaired_heart, unreadable,
+                                    unattributed)))
     else:
         print("♻️ [RECOVER] no open cashout requests to pick back up", flush=True)
     return len(recovered)
@@ -7207,8 +7451,8 @@ async def health_problems():
             problems.append(f"{chat_name(chat)}: the bot is not an admin, so "
                             f"{' and '.join(what)} never reach it")
 
-    # Only the groups the code means to be retractable. MH X LARRY GROUP 2 is
-    # left out on purpose, and must not be reported as missing.
+    # Only the groups the code means to be retractable - every route's source
+    # since 2026-10-14.
     missing = [rule for rule in (int(c) for c in RETRACT_SOURCES_DEFAULT.split(','))
                if not route_paused(rule) and rule not in RETRACT_SOURCES]
     if missing:
@@ -7220,7 +7464,8 @@ async def health_problems():
     return problems
 
 
-def recovered_requests_text(recovered, unpaired_heart, unreadable):
+def recovered_requests_text(recovered, unpaired_heart, unreadable,
+                            unattributed=()):
     """For Ethan and Larry, once per boot, only when there is something to say."""
     parts = []
     if recovered:
@@ -7240,6 +7485,13 @@ def recovered_requests_text(recovered, unpaired_heart, unreadable):
             "⚠️ Could not read these groups, so any open request there was NOT "
             "picked back up:\n"
             + '\n'.join(f"• {line}" for line in unreadable))
+    if unattributed:
+        parts.append(
+            "⚠️ Still open, but the bot cannot tell WHICH group asked — more than "
+            "one group sent a request with the same tag and amount:\n"
+            + '\n'.join(f"• {line}" for line in unattributed)
+            + "\n\nNot picked back up, so a /out for it will not be relayed. "
+              "Type the /out in the group it belongs to once it is paid.")
     return '\n\n'.join(parts)
 
 

@@ -277,6 +277,25 @@ async def main():
     check('a confirmed retraction raises no alert',
           [t for c, t in sent if c == f.ADMIN_ID] == [], str(sent))
 
+    # -- a group newly fed is not handed what came before (2026-10-14) -------
+    # PICCASO VENMO went back on the venmo route after two months off it. To
+    # the sweep, every venmo payment in the last three hours is "missing" from
+    # it - and posting them would book them. Only what came after counts.
+    started = NOW - timedelta(minutes=30)
+    saved = dict(f.FEED_STARTED)
+    f.FEED_STARTED.clear(); f.FEED_STARTED[GAFFER] = started
+    try:
+        before = [Msg(810, payment(4, 100.0, 20.0), 90, src_bot),
+                  Msg(811, payment(5, 100.0, 20.0), 45, src_bot)]
+        after = Msg(812, payment(6, 100.0, 20.0), 10, src_bot)
+        out = await run([after] + before[::-1], [], ledger={'in': 500.0, 'out': 0.0},
+                        source=CHIMEREV, target=GAFFER)
+        check('payments from before a group was fed are not swept into it',
+              not any('Person4' in t or 'Person5' in t for t in out), str(out))
+        check('one after it still is', len(out) == 1 and 'Person6' in out[0], str(out))
+    finally:
+        f.FEED_STARTED.clear(); f.FEED_STARTED.update(saved)
+
     print()
     if failures:
         print(f"{len(failures)} FAILED: " + '; '.join(failures)); sys.exit(1)
