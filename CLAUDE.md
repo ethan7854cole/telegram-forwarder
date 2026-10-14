@@ -750,9 +750,11 @@ Three places apply it, and they are the three places the words mean something:
   anonymous admin post is still read as ordinary traffic.
 - **It never touches the answer.** A `/out` from anyone, crew or admin, tagged
   or not, still settles the request, relays, books and hearts.
-- **`BOT_ONLY_SOURCES` overlaps it and does not replace it.** Chime Rev and MH
-  x LARRY VENMO already drop everything a human types; MH X LARRY GROUP 2 does
-  not, which is where the payment case actually bit.
+- **`BOT_ONLY_SOURCES` overlaps it and does not replace it.** Every source is
+  on it now — Chime Rev, MH x LARRY VENMO, and since 2026-10-14 MH X LARRY
+  GROUP 2, which until then forwarded (unbooked) a notification a human pasted
+  and is where the payment case actually bit. This check stays as the second
+  guard for any source added later without it.
 
 Pinned by `tests/test_chatter.py`, on all three routes and in both directions.
 
@@ -968,7 +970,10 @@ copy is in the group. **Reacting to the original** in `Chime Rev & out no-7`
 undoes both: `retract_payment()` deletes the forwarded copy in `CHIME GAFFER`
 and takes the amount back off that group's Total In. The venmo route works the
 same way (since 2026-09-24): react in `MH x LARRY VENMO` and the copy comes out
-of `GAFFER VENMO`.
+of `GAFFER VENMO`. So does MH X LARRY GROUP 2 → CHIME PICCASO since
+2026-10-14, when the user asked for that route to run exactly as Chime Rev's.
+A Railway `RETRACT_SOURCES` override predating that will not include it —
+the start-up health check says so.
 
 - **ANY reaction retracts** — the user's explicit choice, with no confirmation
   step. A stray tap on a payment in that group really does move the books.

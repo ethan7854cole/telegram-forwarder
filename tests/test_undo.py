@@ -23,7 +23,7 @@ from telebot.types import Update
 import forwarder as f
 
 CHIMEREV, GAFFER = -1002335630148, -5580596463
-MHLARRY = -1003894781195
+MHLARRY, PICCASO = -1003894781195, -5350880041
 LVENMO, GVENMO = -1004298140797, -5100231154
 ETHAN, LARRY, CREW, OWNER = f.ETHAN_ID, f.LARRY_ID, 77, 6030387329
 BOT = 8614082158
@@ -193,7 +193,7 @@ async def main():
     check('a reply to chatter is not a payment',
           any('not a payment' in t for t in said(LARRY)), str(dms))
 
-    # -- 6. Chime Rev too; the paused route not at all ---------------------
+    # -- 6. Chime Rev and MH X LARRY GROUP 2 too ---------------------------
     reset()
     await forward(CHIMEREV, 704)
     ccopy = copy_id(GAFFER)
@@ -202,9 +202,14 @@ async def main():
     check('CHIME GAFFER is back', f.ledger_snapshot(GAFFER) == (11172.44, 2745.0),
           str(f.ledger_snapshot(GAFFER)))
     reset()
+    f.ledger_commit(PICCASO, (11172.44, 2745.0))
+    await forward(MHLARRY, 705)
+    mcopy = copy_id(PICCASO)
     await f.undo_command(undo(MHLARRY, LARRY, reply_to=705))
-    check('MH X LARRY GROUP 2 is not a retract source: silence',
-          deleted == [] and dms == [], f"{deleted} {dms}")
+    check('Larry can /undo in MH X LARRY GROUP 2 (since 2026-10-14)',
+          (PICCASO, mcopy) in deleted, str(deleted))
+    check('CHIME PICCASO is back', f.ledger_snapshot(PICCASO) == (11172.44, 2745.0),
+          str(f.ledger_snapshot(PICCASO)))
 
     # -- 7. the mark that cannot be placed is not silent --------------------
     reset()

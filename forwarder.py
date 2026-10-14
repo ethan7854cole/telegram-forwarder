@@ -78,6 +78,10 @@ FORWARD_RULES = {
 # people in these chats are ignored even if they match a keyword.
 BOT_ONLY_SOURCES = {
     -1002335630148,
+    # MH X LARRY GROUP 2 since 2026-10-14, so its route runs exactly as Chime
+    # Rev's does. Until then a human pasting a notification there was forwarded
+    # (unbooked); now only the notification bot's posts count, as everywhere.
+    -1003894781195,
     # Added with the venmo cashout route on 2026-08-18, for the same reason
     # Chime Rev is here: the moment a group also HANDLES cashouts, people talk
     # in it. A crew member pasting a payment notification by hand - or quoting
@@ -1323,9 +1327,10 @@ async def set_groups_paused(chats, pausing, who=None):
 # confirmation step, so a stray tap on a payment in one of these groups really
 # does take the money off the books.
 #
-# Chime Rev & out no-7 (-> CHIME GAFFER) and, since 2026-09-24, MH x LARRY
-# VENMO (-> GAFFER VENMO), so the two live routes undo a payment the same way.
-RETRACT_SOURCES_DEFAULT = '-1002335630148,-1004298140797'
+# Chime Rev & out no-7 (-> CHIME GAFFER), since 2026-09-24 MH x LARRY VENMO
+# (-> GAFFER VENMO), and since 2026-10-14 MH X LARRY GROUP 2 (-> CHIME
+# PICCASO), so every route undoes a payment the same way.
+RETRACT_SOURCES_DEFAULT = '-1002335630148,-1004298140797,-1003894781195'
 RETRACT_SOURCES = _with_variants(
     [int(c.strip()) for c in
      os.getenv('RETRACT_SOURCES', RETRACT_SOURCES_DEFAULT).split(',')
@@ -3856,10 +3861,11 @@ async def process_incoming(chat_id, text, origin, from_bot=False, sent_at=None,
         return
 
     # Ethan or Larry quoting a payment back at the crew is not a new payment.
-    # BOT_ONLY_SOURCES already covers this for Chime Rev and MH x LARRY VENMO,
-    # where nothing a human types is forwarded at all - but MH X LARRY GROUP 2
-    # is not on that list, so "@Maynuddin23 he says he never got the 200 you
-    # received" went straight into CHIME PICCASO looking like a fresh deposit.
+    # BOT_ONLY_SOURCES covers this on every route now, where nothing a human
+    # types is forwarded at all. Before MH X LARRY GROUP 2 joined it on
+    # 2026-10-14, "@Maynuddin23 he says he never got the 200 you received" went
+    # straight into CHIME PICCASO looking like a fresh deposit; this stays as
+    # the second guard for any source added later without it.
     #
     # `from_bot` is in the condition to make the safe half of it structural: a
     # genuine notification comes from the notification bot, so this can never
@@ -4370,7 +4376,8 @@ async def help_command(message):
         "the books are rebuilt from the newest of those\n"
         "after every deploy. Add force to override.\n"
         "\n"
-        "UNDOING A PAYMENT — in Chime Rev or MH x LARRY VENMO\n"
+        "UNDOING A PAYMENT — in Chime Rev, MH X LARRY GROUP 2\n"
+        "or MH x LARRY VENMO\n"
         "\n"
         "React to the payment, or reply /undo to it where a\n"
         "reaction will not stick. Its copy is deleted and the\n"

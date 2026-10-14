@@ -241,11 +241,23 @@ async def main():
           f"{len(out)} sent")
 
     # -- a reaction where reacting does NOT retract changes nothing ---------
-    # MH X LARRY GROUP 2 is not a retract source; a reaction there is somebody
-    # acknowledging a payment, and it must still be forwarded.
-    out = await run([Msg(454, twin5, 5, src_bot, Reaction([ETHAN]))], [],
-                    ledger={'in': 1250.0, 'out': 340.0})
+    # Every route retracts since 2026-10-14, so the rule is pinned by taking
+    # MH X LARRY GROUP 2 out for the length of the check: a reaction outside
+    # RETRACT_SOURCES is somebody acknowledging a payment and must be forwarded.
+    saved_sources = set(f.RETRACT_SOURCES)
+    f.RETRACT_SOURCES -= f._with_variants([MHLARRY])
+    try:
+        out = await run([Msg(454, twin5, 5, src_bot, Reaction([ETHAN]))], [],
+                        ledger={'in': 1250.0, 'out': 340.0})
+    finally:
+        f.RETRACT_SOURCES.clear(); f.RETRACT_SOURCES.update(saved_sources)
     check('a reaction outside RETRACT_SOURCES is ignored', len(out) == 1,
+          f"{len(out)} sent")
+
+    # -- ...and MH X LARRY GROUP 2 is protected like Chime Rev (2026-10-14) --
+    out = await run([Msg(456, twin5, 5, src_bot, Reaction([ETHAN]))], [],
+                    ledger={'in': 1250.0, 'out': 340.0})
+    check('a retracted payment in MH X LARRY GROUP 2 is not re-sent', out == [],
           f"{len(out)} sent")
 
     # -- Telegram not saying who reacted errs towards holding back ----------

@@ -201,16 +201,31 @@ async def main():
     check('and nothing was deleted', deleted == [], str(deleted))
     check('Larry can retract', await f.retract_payment(CHIMEREV, 501, LARRY) is True)
 
-    # -- 4. the OTHER route is out of scope ----------------------------------
+    # -- 4. MH X LARRY GROUP 2 retracts exactly like Chime Rev ---------------
+    # Out of scope until 2026-10-14, when the route was made to match Chime
+    # Rev's in every respect.
     reset()
     await forward(source=MHLARRY, mid=502)
     check('it still forwards normally', any(c == PICCASO for c, _, _ in sent), str(sent))
     sent.clear()
     did = await f.retract_payment(MHLARRY, 502, ETHAN)
-    check('reacting in MH X LARRY retracts nothing', did is False)
-    check('PICCASO keeps the payment', f.ledger_snapshot(PICCASO)[0] == 115.0,
+    check('reacting in MH X LARRY retracts', did is True)
+    check('PICCASO loses the payment', f.ledger_snapshot(PICCASO)[0] == 100.0,
           str(f.ledger_snapshot(PICCASO)))
-    check('and nothing is deleted there', deleted == [], str(deleted))
+    check('and its copy is deleted there',
+          any(c == PICCASO for c, _ in deleted), str(deleted))
+
+    # A source outside RETRACT_SOURCES still retracts nothing.
+    reset()
+    await forward(source=MHLARRY, mid=503)
+    saved_sources = set(f.RETRACT_SOURCES)
+    f.RETRACT_SOURCES -= f._with_variants([MHLARRY])
+    try:
+        did = await f.retract_payment(MHLARRY, 503, ETHAN)
+    finally:
+        f.RETRACT_SOURCES.clear(); f.RETRACT_SOURCES.update(saved_sources)
+    check('outside RETRACT_SOURCES a reaction retracts nothing', did is False)
+    check('and nothing is deleted', deleted == [], str(deleted))
 
     # -- 4b. the venmo route retracts exactly like the chime one -------------
     # Added 2026-09-24: reacting in MH x LARRY VENMO takes the copy out of
@@ -309,8 +324,13 @@ async def main():
     reset()
     f.bot.admins = [admin(LARRY, True)]
     await forward(source=MHLARRY, mid=510)
-    await f.on_request_reaction(anon_reaction(MHLARRY, 510))
-    check('not on the route that does not retract', deleted == [], str(deleted))
+    saved_sources = set(f.RETRACT_SOURCES)
+    f.RETRACT_SOURCES -= f._with_variants([MHLARRY])
+    try:
+        await f.on_request_reaction(anon_reaction(MHLARRY, 510))
+    finally:
+        f.RETRACT_SOURCES.clear(); f.RETRACT_SOURCES.update(saved_sources)
+    check('not on a route that does not retract', deleted == [], str(deleted))
     f.bot.admins = []
 
     # -- 5. a message we never forwarded -------------------------------------

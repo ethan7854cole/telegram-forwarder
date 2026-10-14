@@ -221,15 +221,14 @@ async def test_real_payments_still_forwarded():
         check(f'{f.chat_name(source)}: and still books',
               f._ledger[target]['in'] == 1200.0, str(f._ledger.get(target)))
 
-    # The one place a human paste IS forwarded, and it stays that way: this
-    # change is about who is being addressed, not about who is typing.
+    # MH X LARRY GROUP 2 was the one place a human paste WAS forwarded, until
+    # 2026-10-14 put it in BOT_ONLY_SOURCES to match Chime Rev.
     reset()
     await f.process_incoming(MHLARRY, payment(), 'test', from_bot=False,
                              sent_at=NOW, user_id=ETHAN, username='ethannxxxx')
-    check('Ethan pasting a notification that names nobody is forwarded as before',
-          len(to(PICCASO)) == 1, str(to(PICCASO)))
-    check('and still moves no books, as before', PICCASO not in f._ledger,
-          str(f._ledger))
+    check('Ethan pasting a notification in MH X LARRY GROUP 2 is not forwarded',
+          to(PICCASO) == [], str(to(PICCASO)))
+    check('and moves no books', PICCASO not in f._ledger, str(f._ledger))
 
     # A bot notification can never be held back by this rule, however worded.
     reset()
