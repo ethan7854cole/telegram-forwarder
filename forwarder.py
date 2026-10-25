@@ -2197,24 +2197,40 @@ async def heart_request(chat_id, message_id, user_only=False):
 
 
 # CHIME PICCASO's requests are posted by @staffhelper with a "Status" button
-# under them, and pressing it is what marks the request completed on their
-# side. Pressed only when a crew /out completes the request - the same moment
-# Larry is DMed "completed". CHIME PICCASO only; every other group is untouched.
+# under them. Pressing it offers the choices, and pressing "Completed" there
+# rewrites the request to "Status : COMPLETED" - that is what marks it done on
+# their side. Pressed only when a crew /out completes the request - the same
+# moment Larry is DMed "completed". CHIME PICCASO only; every other group is
+# untouched.
 STATUS_BUTTON_CHATS = {-5350880041}             # CHIME PICCASO
 STATUS_BUTTON_SENDER = 'staffhelper'
 STATUS_BUTTON_TEXT = 'status'
+STATUS_DONE_TEXT = 'complete'
+_STATUS_DONE_RE = re.compile(r'status\s*[:=\-]\s*completed?\b', re.IGNORECASE)
 # How far back to look when the stored id cannot be trusted - see below.
 STATUS_SEARCH_LIMIT = 200
+# @staffhelper edits its message after each press; how long to wait for it.
+STATUS_STEP_TRIES = 6
+STATUS_STEP_SECONDS = 1.0
 
 
-def _status_button(message):
-    """The "Status" button on a request, or None. Matched loosely - an emoji or
-    different case on the label must not stop the press."""
+def _button(message, word):
+    """The first button whose label contains `word`, or None. Matched loosely -
+    an emoji or different case on the label must not stop the press."""
     for row in getattr(message, 'buttons', None) or []:
         for button in row:
-            if STATUS_BUTTON_TEXT in (getattr(button, 'text', '') or '').lower():
+            if word in (getattr(button, 'text', '') or '').lower():
                 return button
     return None
+
+
+def _message_text(message):
+    return getattr(message, 'raw_text', None) or getattr(message, 'message', '') or ''
+
+
+def _status_completed(message):
+    """@staffhelper already shows this request as "Status : COMPLETED"."""
+    return bool(_STATUS_DONE_RE.search(_message_text(message)))
 
 
 async def _is_staffhelper(message):
@@ -2233,7 +2249,7 @@ async def _is_staffhelper(message):
 def _same_request(message, request):
     """The message carries the request's own tag and figure. Both must read -
     an unreadable one is never taken as a match."""
-    text = getattr(message, 'raw_text', None) or getattr(message, 'message', '') or ''
+    text = _message_text(message)
     tag, amount = request_tag(request['text']), request_amount(request['text'])
     if tag is None or amount is None:
         return False
@@ -2248,32 +2264,74 @@ async def _find_status_request(client, entity, request):
     CHIME PICCASO is a basic group, where the bot and the user account number
     messages each their own way, so the stored id may be the bot's and point at
     some other message altogether. It is trusted only when that message is
-    @staffhelper's AND carries this request's tag and figure; otherwise recent
-    history is searched for exactly one that does. Two candidates is never
-    guessed - pressing the wrong one marks somebody else's cashout done."""
+    @staffhelper's, carries this request's tag and figure and is still open;
+    otherwise recent history is searched. The same customer asking for the same
+    figure again is ordinary, so requests already COMPLETED are passed over -
+    and two still-open ones are never guessed between, because pressing the
+    wrong one marks somebody else's cashout done."""
     by_id = await client.get_messages(entity, ids=request['origin_msg_id'])
     if (by_id is not None and await _is_staffhelper(by_id)
-            and _same_request(by_id, request)):
+            and _same_request(by_id, request) and not _status_completed(by_id)):
         return by_id, None
-    matches = []
+    open_ones, done = [], []
     async for message in client.iter_messages(entity, limit=STATUS_SEARCH_LIMIT):
         if _same_request(message, request) and await _is_staffhelper(message):
-            matches.append(message)
-    if len(matches) == 1:
-        return matches[0], None
-    if matches:
-        return None, (f'{len(matches)} @{STATUS_BUTTON_SENDER} requests carry '
-                      'that tag and amount - not guessing which')
+            (done if _status_completed(message) else open_ones).append(message)
+    if len(open_ones) == 1:
+        return open_ones[0], None
+    if open_ones:
+        return None, (f'{len(open_ones)} open @{STATUS_BUTTON_SENDER} requests '
+                      'carry that tag and amount - not guessing which')
+    if done:
+        return done[0], None        # already marked - nothing left to press
     return None, None               # not a @staffhelper request at all
 
 
+async def _press(button):
+    try:
+        await button.click()
+    except BotResponseTimeoutError:
+        pass                        # it reached @staffhelper; it did not answer
+
+
+async def _reread(client, entity, message):
+    """The message again, after @staffhelper has had a moment to edit it."""
+    await asyncio.sleep(STATUS_STEP_SECONDS)
+    return await client.get_messages(entity, ids=message.id) or message
+
+
+async def _mark_completed(client, entity, message):
+    """Status -> Completed on one @staffhelper request. None, or what stopped it."""
+    done = _button(message, STATUS_DONE_TEXT)
+    if done is None:
+        status = _button(message, STATUS_BUTTON_TEXT)
+        if status is None:
+            return 'the request has no "Status" button'
+        await _press(status)
+        for _ in range(STATUS_STEP_TRIES):
+            message = await _reread(client, entity, message)
+            done = _button(message, STATUS_DONE_TEXT)
+            if done is not None or _status_completed(message):
+                break
+        if done is None:
+            return ('"Status" was pressed but no "Completed" choice appeared'
+                    if not _status_completed(message) else None)
+    await _press(done)
+    for _ in range(STATUS_STEP_TRIES):
+        message = await _reread(client, entity, message)
+        if _status_completed(message):
+            return None
+    return ('"Completed" was pressed but the request does not show '
+            '"Status : COMPLETED"')
+
+
 async def press_status_button(request):
-    """Press @staffhelper's "Status" button on a completed CHIME PICCASO request.
+    """Mark a completed CHIME PICCASO request COMPLETED with @staffhelper.
 
     Through the user account, never the bot: the Bot API cannot press a button
     on another bot's message. A request typed by a person carries no button and
-    is left alone. Anything else that stops the press tells the admin account,
-    because a request left showing pending looks unpaid and may be paid twice."""
+    is left alone. Anything else that stops it tells the admin account, because
+    a request left showing pending looks unpaid and may be paid twice."""
     chat_id = request['origin']
     if chat_id not in STATUS_BUTTON_CHATS:
         return False
@@ -2291,30 +2349,27 @@ async def press_status_button(request):
                                                               request)
                 if message is None and problem is None:
                     return False    # not a @staffhelper request
+                if message is not None and _status_completed(message):
+                    print(f"🔘 [STATUS] {message.id} in {chat_name(chat_id)} "
+                          "already shows COMPLETED", flush=True)
+                    return True
                 if message is not None:
-                    button = _status_button(message)
-                    if button is None:
-                        problem = 'the request has no "Status" button'
-                    else:
-                        try:
-                            await button.click()
-                        except BotResponseTimeoutError:
-                            # The press reached @staffhelper; it did not answer.
-                            pass
-                        print(f"🔘 [STATUS] pressed Status on {message.id} in "
+                    problem = await _mark_completed(client, entity, message)
+                    if problem is None:
+                        print(f"🔘 [STATUS] marked {message.id} COMPLETED in "
                               f"{chat_name(chat_id)}", flush=True)
                         return True
         except Exception as e:
             problem = e
-    print(f"❌ [STATUS] could not press Status in {chat_name(chat_id)}: "
+    print(f"❌ [STATUS] could not mark COMPLETED in {chat_name(chat_id)}: "
           f"{problem}", flush=True)
     await notify_admin(
-        f"⚠️ A cashout in {chat_name(chat_id)} was completed but its \"Status\" "
-        f"button could NOT be pressed.\n\n"
+        f"⚠️ A cashout in {chat_name(chat_id)} was completed but could NOT be "
+        f"set to \"Status : COMPLETED\" on @{STATUS_BUTTON_SENDER}.\n\n"
         f"{_cashout_preview(request)}\n\n"
         f"Reason: {problem}\n\n"
         "The money side is done - the /out was sent and the totals are booked. "
-        "Press Status on that request by hand so it shows completed.")
+        "Press Status -> Completed on that request by hand.")
     return False
 
 
@@ -3462,7 +3517,7 @@ async def handle_cashout_reply(handling, text, user_id, username, reply_to,
 async def observe_cashout(chat_id, text, message_id, sent_at,
                           user_id=None, username=None, reply_to=None,
                           full_name=None, has_media=False, is_edit=False,
-                          media_group_id=None):
+                          media_group_id=None, from_bot=False):
     """Single entry point for both input paths.
 
     Called for every message in a watched chat that the gates upstream let
@@ -3553,6 +3608,17 @@ async def observe_cashout(chat_id, text, message_id, sent_at,
 
     handling = _canonical(chat_id, _CASHOUT_HANDLERS)
     if handling is not None:
+        # Another bot in a handling group is never the crew answering. MAYAN'S
+        # BOT refuses a /out with "Only bot admin/staff can use /out. Your ID:
+        # ..." - which carries the word /out, so it settled the open request and
+        # was relayed, Larry's id and all, into the group that asked. Only the
+        # handling side: on the source side @staffhelper, a bot, IS the request.
+        if from_bot:
+            if _OUT_CMD_RE.search(text or ''):
+                print(f"🤖 [CASHOUT] a bot's message in {chat_name(handling)} "
+                      "mentions /out - not a /out, left alone.", flush=True)
+            return
+
         # An edit is a NEW event for a message we have already seen, so it
         # cannot share the original's key or it would be dropped as a replay -
         # which is exactly how the /out edited onto a screenshot went missing.
@@ -7743,7 +7809,8 @@ async def run_userbot():
                                       full_name or None,
                                       has_media=not plain,
                                       media_group_id=getattr(event.message,
-                                                             'grouped_id', None))
+                                                             'grouped_id', None),
+                                      from_bot=bool(getattr(sender, 'bot', False)))
                 await observe_mentions(event.chat_id, text, event.id,
                                        event.message.date, sender_id,
                                        getattr(sender, 'username', None),
@@ -7799,7 +7866,8 @@ async def run_userbot():
                                       full_name or None,
                                       has_media=not plain, is_edit=True,
                                       media_group_id=getattr(event.message,
-                                                             'grouped_id', None))
+                                                             'grouped_id', None),
+                                      from_bot=bool(getattr(sender, 'bot', False)))
 
             @client.on(events.MessageDeleted)
             async def on_message_deleted(event):

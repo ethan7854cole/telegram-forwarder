@@ -20,7 +20,7 @@ tests/test.sh cashout           # only matching suites
 `tests/test.sh` picks an interpreter that has the packages (see the note on
 `python3` under Gotchas) and builds `.venv` only if none does.
 
-1827 checks across 42 suites, all stubbed — nothing touches Telegram, the
+1877 checks across 43 suites, all stubbed — nothing touches Telegram, the
 network, or the live groups. They cover the pre-existing behaviour as well as
 the new, so they are the guard against a change quietly altering something that
 already worked.
@@ -994,32 +994,49 @@ The usual causes are the bot not being an administrator in that group, or the
 group restricting which reactions may be used. Neither is visible from the code,
 which is why the error text is carried into the DM.
 
-### CHIME PICCASO: pressing @staffhelper's "Status"
+### CHIME PICCASO: marking @staffhelper's request COMPLETED
 
-CHIME PICCASO's requests are posted by `@staffhelper` with a **Status** button
-under them; pressing it marks the request completed on their side.
-`press_status_button()` presses it when a `/out` completes the request in
-`handle_cashout_reply()` — after the ❤, just before Larry's "COMPLETED
-SUCCESSFULLY" DM. `STATUS_BUTTON_CHATS` is CHIME PICCASO only; every other
-group is untouched.
+CHIME PICCASO's requests are posted by `@staffhelper`, reading `Status :
+PENDING` with a **Status** button. Pressing Status offers the choices;
+pressing **Completed** rewrites the request to `Status : COMPLETED` and the
+buttons go. `press_status_button()` does both presses when a `/out` completes
+the request in `handle_cashout_reply()` — after the ❤, just before Larry's
+"COMPLETED SUCCESSFULLY" DM — then re-reads the message until it shows
+COMPLETED. `STATUS_BUTTON_CHATS` is CHIME PICCASO only.
 
 - **Through the user account.** The Bot API cannot press a button on another
   bot's message.
 - **Never the wrong request.** CHIME PICCASO is a basic group, so the stored
   `origin_msg_id` may be the bot's numbering. It is trusted only if that message
-  is `@staffhelper`'s and carries the request's tag and figure; otherwise the
-  last `STATUS_SEARCH_LIMIT` (200) messages are searched for exactly one that
-  does. Two matches are never guessed.
+  is `@staffhelper`'s, carries the request's tag and figure and is not already
+  COMPLETED; otherwise the last `STATUS_SEARCH_LIMIT` (200) messages are
+  searched. Requests already COMPLETED are passed over — the same customer and
+  figure again is ordinary — and two still-open matches are never guessed.
 - **A request typed by a person** (no `@staffhelper` message matches) is left
-  alone, silently.
-- **Anything else that stops the press DMs the admin account** — no button,
-  two matches, user account down, the press erroring. The money side is never
-  affected and the completed DM still goes. `@staffhelper` not answering the
-  press (`BotResponseTimeoutError`) counts as pressed.
+  alone, silently. One already COMPLETED by hand is left alone too.
+- **Anything else DMs the admin account** — no Status button, no Completed
+  choice, two matches, user account down, the press erroring, or the request
+  never showing COMPLETED. The money side is never affected and the completed
+  DM still goes. `@staffhelper` not answering a press
+  (`BotResponseTimeoutError`) is not a failure.
 - Not on `force_complete_cashout()`: with nothing open there is no request to
   find.
 
 Pinned by `tests/test_status.py`.
+
+## Other bots in a handling group are never the crew
+
+**MAYAN'S BOT** answers a `/out` it will not take with "🚫 Only bot
+admin/staff can use /out. Your ID: … /addadmin …". That contains `/out`, so
+with a request open it was read as the crew's answer: it settled and hearted
+the request and was relayed — an admin's numeric id included — into the group
+that asked. `observe_cashout(from_bot=True)` (passed by both Telethon
+listeners from `sender.bot`) now returns at the top of the handling-group
+branch: not a `/out`, not an acknowledgement, not an issue, no DM. The request
+stays open for the real one. **Handling side only** — on the source side
+`@staffhelper`, a bot, *is* the request. The payment path is unaffected.
+Anonymous admins are not bots on this path (Telethon gives the group), so
+they are untouched. Pinned by `tests/test_botout.py` on all four routes.
 
 ## Retracting a payment
 
@@ -1428,7 +1445,8 @@ cashout requests.
 | `tests/test_catchup.py` | The sweep re-sends nothing — including a retracted payment |
 | `tests/test_race.py` | Two copies of one request arriving at the same moment |
 | `tests/test_screenshot.py` | The screenshot travels with the `/out`, carrying no identity |
-| `tests/test_status.py` | CHIME PICCASO: a completed cashout presses @staffhelper's Status |
+| `tests/test_status.py` | CHIME PICCASO: a completed cashout is set COMPLETED on @staffhelper |
+| `tests/test_botout.py` | Another bot's message in a handling group is never a /out |
 | `tests/test_heart.py` | A cashout that cannot be marked done is not silent |
 | `tests/test_switch.py` | `/cashout off` stops everything, and survives a redeploy |
 | `tests/test_redaction.py` | No crew name reaches a target group; every other route keeps them |

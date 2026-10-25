@@ -56,23 +56,37 @@ class User:
 
 
 class Button:
-    def __init__(self, text, mid, error=None):
-        self.text, self.mid, self.error = text, mid, error
+    def __init__(self, text, msg, error=None):
+        self.text, self.msg, self.error = text, msg, error
 
     async def click(self):
+        """@staffhelper as seen live: Status offers the choices, Completed
+        rewrites the request and takes the buttons away."""
         if self.error:
             raise self.error
-        clicks.append((self.mid, self.text))
+        clicks.append((self.msg.id, self.text))
+        label = self.text.lower()
+        if 'status' in label and self.msg.offers:
+            self.msg.set_buttons(self.msg.offers)
+        elif 'complete' in label and self.msg.obeys:
+            self.msg.raw_text = self.msg.raw_text.replace('PENDING', 'COMPLETED')
+            self.msg.buttons = None
 
 
 class UserMsg:
-    def __init__(self, mid, text, sender='staffhelper', buttons=('📊 Status',),
-                 error=None):
+    def __init__(self, mid, text, sender='staffhelper', buttons=('Status',),
+                 offers=('✅ Completed', 'Pending', 'Rejected'), error=None,
+                 obeys=True):
         self.id = mid
         self.raw_text = text
         self.sender = User(sender)
         self.via_bot = None
-        self.buttons = [[Button(b, mid, error) for b in buttons]] if buttons else None
+        self.offers, self.error, self.obeys = offers, error, obeys
+        self.set_buttons(buttons)
+
+    def set_buttons(self, labels):
+        self.buttons = ([[Button(b, self, self.error) for b in labels]]
+                        if labels else None)
 
 
 class FakeUserClient:
@@ -96,6 +110,7 @@ f.bot = FakeBot()
 f.USERBOT_SEND = False
 f.USERBOT_REACT = False
 f._resolve_one = _resolve_ok
+f.STATUS_STEP_SECONDS = 0
 
 failures = []
 
@@ -106,8 +121,10 @@ def check(label, cond, detail=''):
         failures.append(label)
 
 
-def request(tag, amount):
-    return f'!! Cashout Request !!\nTag name : {tag}\nAmount : {amount}'
+def request(tag, amount, status='PENDING'):
+    # @staffhelper's shape, as in the screenshot.
+    return (f'!! Cashout Request !!\nTag name : {tag}\nAmount : ${amount}.00\n'
+            f'Status : {status}')
 
 
 def reset(history=None):
@@ -120,7 +137,8 @@ def reset(history=None):
 
 
 def status_alerts():
-    return [t for c, t in dms if c == ADMIN and 'Status' in t and 'NOT be pressed' in t]
+    return [t for c, t in dms if c == ADMIN and 'Status : COMPLETED' in t
+            and 'could NOT be' in t]
 
 
 def completed_dms():
@@ -134,12 +152,21 @@ async def run_cashout(source, handling, text, mid, out='/out 25', reply=None):
                             username='Maynuddin23', reply_to=reply)
 
 
+def shown(history, mid):
+    return next(m for m in history if m.id == mid).raw_text
+
+
 async def main():
-    # -- 1. the crew /out completes it: Status is pressed --------------------
-    text = request('$jenny-buhr', 25)
-    reset([UserMsg(910, text)])
+    PRESSED = [(910, 'Status'), (910, '✅ Completed')]
+
+    # -- 1. the crew /out completes it: Status, then Completed ---------------
+    text = request('$Cayce-Parker-2', 25)
+    history = [UserMsg(910, text)]
+    reset(history)
     await run_cashout(PICCASO, MHLARRY, text, 910)
-    check('Status is pressed on the request', clicks == [(910, '📊 Status')], str(clicks))
+    check('Status is pressed, then Completed', clicks == PRESSED, str(clicks))
+    check('the request now reads Status : COMPLETED',
+          'Status : COMPLETED' in shown(history, 910), shown(history, 910))
     check('Larry still gets the completed DM', len(completed_dms()) == 1, str(dms))
     check('nobody is alerted', status_alerts() == [], str(dms))
     check('the /out still reaches CHIME PICCASO',
@@ -150,26 +177,52 @@ async def main():
     # In a basic group the id the bot saw may point at a different message for
     # the user account. That message is never pressed.
     other = request('$someone-else', 25)
-    reset([UserMsg(910, other), UserMsg(925, text)])
+    history = [UserMsg(910, other), UserMsg(925, text)]
+    reset(history)
     await run_cashout(PICCASO, MHLARRY, text, 910)
-    check('the matching request is pressed, not the one at the id',
-          clicks == [(925, '📊 Status')], str(clicks))
+    check('the matching request is marked, not the one at the id',
+          [m for m, _ in clicks] == [925, 925], str(clicks))
+    check('the one at the id is untouched', 'PENDING' in shown(history, 910))
     check('no alert', status_alerts() == [], str(dms))
 
-    # -- 3. two identical requests: never guessed -----------------------------
+    # -- 3. the same customer and figure again: the COMPLETED one is skipped --
+    history = [UserMsg(905, request('$Cayce-Parker-2', 25, 'COMPLETED'), buttons=()),
+               UserMsg(925, text)]
+    reset(history)
+    await run_cashout(PICCASO, MHLARRY, text, 999)
+    check('a repeat request: the open one is marked',
+          [m for m, _ in clicks] == [925, 925], str(clicks))
+    check('no alert', status_alerts() == [], str(dms))
+
+    # ...even when the stored id points straight at the old, completed one.
+    history = [UserMsg(905, request('$Cayce-Parker-2', 25, 'COMPLETED'), buttons=()),
+               UserMsg(925, text)]
+    reset(history)
+    await run_cashout(PICCASO, MHLARRY, text, 905)
+    check('an id pointing at the old completed one still finds the open one',
+          [m for m, _ in clicks] == [925, 925], str(clicks))
+
+    # -- 4. two identical OPEN requests: never guessed ------------------------
     reset([UserMsg(950, other), UserMsg(925, text), UserMsg(926, text)])
     await run_cashout(PICCASO, MHLARRY, text, 950)
-    check('nothing pressed when two requests match', clicks == [], str(clicks))
+    check('nothing pressed when two open requests match', clicks == [], str(clicks))
     check('the admin account is told instead', len(status_alerts()) == 1, str(dms))
     check('the completed DM still goes', len(completed_dms()) == 1)
 
-    # -- 4. a request a person typed: no button to press, nobody bothered -----
-    reset([UserMsg(910, text, sender='someperson', buttons=())])
+    # -- 5. already COMPLETED by hand: nothing pressed, nobody bothered -------
+    reset([UserMsg(910, request('$Cayce-Parker-2', 25, 'COMPLETED'), buttons=())])
     await run_cashout(PICCASO, MHLARRY, text, 910)
+    check('already completed: nothing pressed', clicks == [], str(clicks))
+    check('already completed: no alert', status_alerts() == [], str(dms))
+
+    # -- 6. a request a person typed: no button to press, nobody bothered -----
+    plain = '!! Cashout Request !!\nTag name : $Cayce-Parker-2\nAmount : 25'
+    reset([UserMsg(910, plain, sender='someperson', buttons=())])
+    await run_cashout(PICCASO, MHLARRY, plain, 910)
     check('a human request is left alone', clicks == [], str(clicks))
     check('and raises no alert', status_alerts() == [], str(dms))
 
-    # -- 5. @staffhelper's request with no Status button ----------------------
+    # -- 7. no Status button --------------------------------------------------
     reset([UserMsg(910, text, buttons=('Open',))])
     await run_cashout(PICCASO, MHLARRY, text, 910)
     check('no button: nothing pressed', clicks == [])
@@ -177,9 +230,34 @@ async def main():
     check('no button: the admin account is told', len(alerts) == 1, str(dms))
     if alerts:
         check('the alert says the money side is done', 'booked' in alerts[0], alerts[0])
-        check('the alert shows which request', '$jenny-buhr' in alerts[0], alerts[0])
+        check('the alert shows which request', '$Cayce-Parker-2' in alerts[0], alerts[0])
+        check('the alert says what to press', 'Status -> Completed' in alerts[0], alerts[0])
 
-    # -- 6. the press fails: told, and the money is unaffected ----------------
+    # -- 8. Status offers no Completed ----------------------------------------
+    reset([UserMsg(910, text, offers=('Pending',))])
+    await run_cashout(PICCASO, MHLARRY, text, 910)
+    check('no Completed choice: only Status pressed',
+          clicks == [(910, 'Status')], str(clicks))
+    alerts = status_alerts()
+    check('and the admin account is told', len(alerts) == 1, str(dms))
+    if alerts:
+        check('saying no Completed choice appeared', 'no "Completed"' in alerts[0], alerts[0])
+
+    # -- 9. Completed pressed but the request never changes -------------------
+    reset([UserMsg(910, text, obeys=False)])
+    await run_cashout(PICCASO, MHLARRY, text, 910)
+    check('both pressed', clicks == PRESSED, str(clicks))
+    alerts = status_alerts()
+    check('an unconfirmed press is reported', len(alerts) == 1, str(dms))
+
+    # -- 10. a Completed button already showing is pressed directly -----------
+    reset([UserMsg(910, text, buttons=('Completed', 'Pending'))])
+    await run_cashout(PICCASO, MHLARRY, text, 910)
+    check('Completed already on show: pressed straight away',
+          clicks == [(910, 'Completed')], str(clicks))
+    check('no alert', status_alerts() == [], str(dms))
+
+    # -- 11. the press fails: told, and the money is unaffected ---------------
     reset([UserMsg(910, text, error=RuntimeError('MESSAGE_ID_INVALID'))])
     await run_cashout(PICCASO, MHLARRY, text, 910)
     alerts = status_alerts()
@@ -189,18 +267,27 @@ async def main():
     check('the booking stands', f.ledger_snapshot(PICCASO)[1] == 25.0)
     check('the completed DM still goes', len(completed_dms()) == 1)
 
-    # -- 7. @staffhelper not answering the press is still a press -------------
-    reset([UserMsg(910, text, error=f.BotResponseTimeoutError(None))])
+    # -- 12. @staffhelper not answering the press is still a press ------------
+    msg = UserMsg(910, text)
+    for row in msg.buttons:
+        for button in row:
+            real = button.click
+            async def slow(real=real):
+                await real()
+                raise f.BotResponseTimeoutError(None)
+            button.click = slow
+    reset([msg])
     await run_cashout(PICCASO, MHLARRY, text, 910)
     check('a slow @staffhelper raises no alert', status_alerts() == [], str(dms))
+    check('and it still gets to COMPLETED', 'COMPLETED' in msg.raw_text, msg.raw_text)
 
-    # -- 8. the user account is down: told -----------------------------------
+    # -- 13. the user account is down: told -----------------------------------
     reset(None)
     await run_cashout(PICCASO, MHLARRY, text, 910)
     check('no user account: the admin account is told', len(status_alerts()) == 1, str(dms))
     check('and the cashout still completes', len(completed_dms()) == 1)
 
-    # -- 9. CHIME PICCASO only ------------------------------------------------
+    # -- 14. CHIME PICCASO only -----------------------------------------------
     reset([UserMsg(910, text)])
     await run_cashout(GAFFER, CHIMEREV, text, 910)
     check('CHIME GAFFER: nothing pressed', clicks == [], str(clicks))
@@ -212,7 +299,7 @@ async def main():
     check('CHIME GAFFER with the user account down: still no alert',
           status_alerts() == [], str(dms))
 
-    # -- 10. a request still open is never pressed -----------------------------
+    # -- 15. a request still open is never pressed ----------------------------
     reset([UserMsg(910, text)])
     await f.observe_cashout(PICCASO, text, 910, datetime.now(timezone.utc), user_id=42)
     check('an open request is not pressed', clicks == [], str(clicks))
