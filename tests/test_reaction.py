@@ -7,6 +7,10 @@ os.environ.setdefault('PAUSED_CHATS', '')      # both routes live here - see run
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import forwarder as f
 
+# No user account here, so CHIME PICCASO's Status press would add its own
+# alert to the DMs counted below. That press is test_status.py's business.
+f.STATUS_BUTTON_CHATS = set()
+
 PICCASO, MHLARRY = -5350880041, -1003894781195
 LARRY, CREW = f.LARRY_ID, 77
 sent, dms, failures = [], [], []

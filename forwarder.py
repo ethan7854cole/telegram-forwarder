@@ -12,7 +12,8 @@ from telebot.types import InputFile, ReactionTypeEmoji, User
 
 from telethon import TelegramClient, events, utils
 from telethon.errors import (AuthKeyDuplicatedError, AuthKeyUnregisteredError,
-                             SessionRevokedError, UserDeactivatedBanError)
+                             BotResponseTimeoutError, SessionRevokedError,
+                             UserDeactivatedBanError)
 from telethon.sessions import StringSession
 from telethon.tl.functions.messages import SendReactionRequest
 from telethon.tl.types import MessageMediaWebPage, ReactionEmoji
@@ -2195,6 +2196,128 @@ async def heart_request(chat_id, message_id, user_only=False):
     return await _heart_via_user(chat_id, message_id, bot_error)
 
 
+# CHIME PICCASO's requests are posted by @staffhelper with a "Status" button
+# under them, and pressing it is what marks the request completed on their
+# side. Pressed only when a crew /out completes the request - the same moment
+# Larry is DMed "completed". CHIME PICCASO only; every other group is untouched.
+STATUS_BUTTON_CHATS = {-5350880041}             # CHIME PICCASO
+STATUS_BUTTON_SENDER = 'staffhelper'
+STATUS_BUTTON_TEXT = 'status'
+# How far back to look when the stored id cannot be trusted - see below.
+STATUS_SEARCH_LIMIT = 200
+
+
+def _status_button(message):
+    """The "Status" button on a request, or None. Matched loosely - an emoji or
+    different case on the label must not stop the press."""
+    for row in getattr(message, 'buttons', None) or []:
+        for button in row:
+            if STATUS_BUTTON_TEXT in (getattr(button, 'text', '') or '').lower():
+                return button
+    return None
+
+
+async def _is_staffhelper(message):
+    """Posted by @staffhelper, directly or "via" it."""
+    sender = getattr(message, 'sender', None)
+    if sender is None and hasattr(message, 'get_sender'):
+        try:
+            sender = await message.get_sender()
+        except Exception:
+            sender = None
+    names = {(getattr(who, 'username', '') or '').lower()
+             for who in (sender, getattr(message, 'via_bot', None))}
+    return STATUS_BUTTON_SENDER in names
+
+
+def _same_request(message, request):
+    """The message carries the request's own tag and figure. Both must read -
+    an unreadable one is never taken as a match."""
+    text = getattr(message, 'raw_text', None) or getattr(message, 'message', '') or ''
+    tag, amount = request_tag(request['text']), request_amount(request['text'])
+    if tag is None or amount is None:
+        return False
+    found = request_tag(text)
+    return (found is not None and found.lower() == tag.lower()
+            and request_amount(text) == amount)
+
+
+async def _find_status_request(client, entity, request):
+    """The @staffhelper message this request was opened from, or (None, why).
+
+    CHIME PICCASO is a basic group, where the bot and the user account number
+    messages each their own way, so the stored id may be the bot's and point at
+    some other message altogether. It is trusted only when that message is
+    @staffhelper's AND carries this request's tag and figure; otherwise recent
+    history is searched for exactly one that does. Two candidates is never
+    guessed - pressing the wrong one marks somebody else's cashout done."""
+    by_id = await client.get_messages(entity, ids=request['origin_msg_id'])
+    if (by_id is not None and await _is_staffhelper(by_id)
+            and _same_request(by_id, request)):
+        return by_id, None
+    matches = []
+    async for message in client.iter_messages(entity, limit=STATUS_SEARCH_LIMIT):
+        if _same_request(message, request) and await _is_staffhelper(message):
+            matches.append(message)
+    if len(matches) == 1:
+        return matches[0], None
+    if matches:
+        return None, (f'{len(matches)} @{STATUS_BUTTON_SENDER} requests carry '
+                      'that tag and amount - not guessing which')
+    return None, None               # not a @staffhelper request at all
+
+
+async def press_status_button(request):
+    """Press @staffhelper's "Status" button on a completed CHIME PICCASO request.
+
+    Through the user account, never the bot: the Bot API cannot press a button
+    on another bot's message. A request typed by a person carries no button and
+    is left alone. Anything else that stops the press tells the admin account,
+    because a request left showing pending looks unpaid and may be paid twice."""
+    chat_id = request['origin']
+    if chat_id not in STATUS_BUTTON_CHATS:
+        return False
+    client = _active_client
+    problem = None
+    if client is None:
+        problem = 'the user account is not connected'
+    else:
+        try:
+            entity = await _resolve_one(client, chat_id)
+            if entity is None:
+                problem = 'the user account could not resolve that chat'
+            else:
+                message, problem = await _find_status_request(client, entity,
+                                                              request)
+                if message is None and problem is None:
+                    return False    # not a @staffhelper request
+                if message is not None:
+                    button = _status_button(message)
+                    if button is None:
+                        problem = 'the request has no "Status" button'
+                    else:
+                        try:
+                            await button.click()
+                        except BotResponseTimeoutError:
+                            # The press reached @staffhelper; it did not answer.
+                            pass
+                        print(f"🔘 [STATUS] pressed Status on {message.id} in "
+                              f"{chat_name(chat_id)}", flush=True)
+                        return True
+        except Exception as e:
+            problem = e
+    print(f"❌ [STATUS] could not press Status in {chat_name(chat_id)}: "
+          f"{problem}", flush=True)
+    await notify_admin(
+        f"⚠️ A cashout in {chat_name(chat_id)} was completed but its \"Status\" "
+        f"button could NOT be pressed.\n\n"
+        f"{_cashout_preview(request)}\n\n"
+        f"Reason: {problem}\n\n"
+        "The money side is done - the /out was sent and the totals are booked. "
+        "Press Status on that request by hand so it shows completed.")
+    return False
+
+
 async def _heart_via_user(chat_id, message_id, bot_error):
     """The user-account half of heart_request(), and the alert if it fails too."""
     user_error = None
@@ -3322,6 +3445,10 @@ async def handle_cashout_reply(handling, text, user_id, username, reply_to,
     # /out - the money really did move - but it is not what was asked for, and
     # nothing else in the flow would ever say so.
     await flag_amount_mismatch(handling, request, text)
+
+    # CHIME PICCASO only: @staffhelper's "Status" button marks it completed on
+    # their side too. A no-op for every other group.
+    await press_status_button(request)
 
     # Last, once the request is marked done in the chime group: Larry is told it
     # completed and which group the screenshot goes to. Sent even if the ❤ could

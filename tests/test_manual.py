@@ -28,6 +28,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import forwarder as f
 
+# No user account here, so CHIME PICCASO's Status press would add its own
+# alert to the DMs counted below. That press is test_status.py's business.
+f.STATUS_BUTTON_CHATS = set()
+
 PICCASO, GAFFER = -5350880041, -5580596463
 MHLARRY, CHIMEREV = -1003894781195, -1002335630148
 GVENMO, LVENMO = -5100231154, -1004298140797

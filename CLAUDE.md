@@ -20,7 +20,7 @@ tests/test.sh cashout           # only matching suites
 `tests/test.sh` picks an interpreter that has the packages (see the note on
 `python3` under Gotchas) and builds `.venv` only if none does.
 
-1799 checks across 41 suites, all stubbed — nothing touches Telegram, the
+1827 checks across 42 suites, all stubbed — nothing touches Telegram, the
 network, or the live groups. They cover the pre-existing behaviour as well as
 the new, so they are the guard against a change quietly altering something that
 already worked.
@@ -994,6 +994,33 @@ The usual causes are the bot not being an administrator in that group, or the
 group restricting which reactions may be used. Neither is visible from the code,
 which is why the error text is carried into the DM.
 
+### CHIME PICCASO: pressing @staffhelper's "Status"
+
+CHIME PICCASO's requests are posted by `@staffhelper` with a **Status** button
+under them; pressing it marks the request completed on their side.
+`press_status_button()` presses it when a `/out` completes the request in
+`handle_cashout_reply()` — after the ❤, just before Larry's "COMPLETED
+SUCCESSFULLY" DM. `STATUS_BUTTON_CHATS` is CHIME PICCASO only; every other
+group is untouched.
+
+- **Through the user account.** The Bot API cannot press a button on another
+  bot's message.
+- **Never the wrong request.** CHIME PICCASO is a basic group, so the stored
+  `origin_msg_id` may be the bot's numbering. It is trusted only if that message
+  is `@staffhelper`'s and carries the request's tag and figure; otherwise the
+  last `STATUS_SEARCH_LIMIT` (200) messages are searched for exactly one that
+  does. Two matches are never guessed.
+- **A request typed by a person** (no `@staffhelper` message matches) is left
+  alone, silently.
+- **Anything else that stops the press DMs the admin account** — no button,
+  two matches, user account down, the press erroring. The money side is never
+  affected and the completed DM still goes. `@staffhelper` not answering the
+  press (`BotResponseTimeoutError`) counts as pressed.
+- Not on `force_complete_cashout()`: with nothing open there is no request to
+  find.
+
+Pinned by `tests/test_status.py`.
+
 ## Retracting a payment
 
 A payment is forwarded and booked within seconds of landing, so by the time
@@ -1401,6 +1428,7 @@ cashout requests.
 | `tests/test_catchup.py` | The sweep re-sends nothing — including a retracted payment |
 | `tests/test_race.py` | Two copies of one request arriving at the same moment |
 | `tests/test_screenshot.py` | The screenshot travels with the `/out`, carrying no identity |
+| `tests/test_status.py` | CHIME PICCASO: a completed cashout presses @staffhelper's Status |
 | `tests/test_heart.py` | A cashout that cannot be marked done is not silent |
 | `tests/test_switch.py` | `/cashout off` stops everything, and survives a redeploy |
 | `tests/test_redaction.py` | No crew name reaches a target group; every other route keeps them |
