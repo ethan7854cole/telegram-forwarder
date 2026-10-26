@@ -2331,10 +2331,13 @@ async def press_status_button(request):
     Through the user account, never the bot: the Bot API cannot press a button
     on another bot's message. A request typed by a person carries no button and
     is left alone. Anything else that stops it tells the admin account, because
-    a request left showing pending looks unpaid and may be paid twice."""
+    a request left showing pending looks unpaid and may be paid twice.
+
+    True once it shows COMPLETED, False if that failed (the admin is told),
+    None when there is no @staffhelper request to press - the caller ❤s it."""
     chat_id = request['origin']
     if chat_id not in STATUS_BUTTON_CHATS:
-        return False
+        return None
     client = _active_client
     problem = None
     if client is None:
@@ -2348,7 +2351,7 @@ async def press_status_button(request):
                 message, problem = await _find_status_request(client, entity,
                                                               request)
                 if message is None and problem is None:
-                    return False    # not a @staffhelper request
+                    return None     # not a @staffhelper request
                 if message is not None and _status_completed(message):
                     print(f"🔘 [STATUS] {message.id} in {chat_name(chat_id)} "
                           "already shows COMPLETED", flush=True)
@@ -3486,8 +3489,14 @@ async def handle_cashout_reply(handling, text, user_id, username, reply_to,
     # The ❤ goes on the original request in the chime group, not on the copy in
     # the handling group: it is the group that asked which needs to see, at a
     # glance, which of its requests have been dealt with.
-    await heart_request(request['origin'], request['origin_msg_id'],
-                        user_only=request.get('origin_via_user', False))
+    #
+    # CHIME PICCASO marks it with @staffhelper's own button INSTEAD - Status,
+    # then Completed - and no ❤ (the user's call, 2026-10-26). The ❤ is only
+    # the fallback: a request that is not @staffhelper's has no button, and a
+    # press that failed must not leave a paid request looking unpaid.
+    if not await press_status_button(request):
+        await heart_request(request['origin'], request['origin_msg_id'],
+                            user_only=request.get('origin_via_user', False))
 
     # ...and the chase is unsaid, now that it is wrong - privately to the crew,
     # and in the handling group where the same words are still tagging them.
@@ -3500,10 +3509,6 @@ async def handle_cashout_reply(handling, text, user_id, username, reply_to,
     # /out - the money really did move - but it is not what was asked for, and
     # nothing else in the flow would ever say so.
     await flag_amount_mismatch(handling, request, text)
-
-    # CHIME PICCASO only: @staffhelper's "Status" button marks it completed on
-    # their side too. A no-op for every other group.
-    await press_status_button(request)
 
     # Last, once the request is marked done in the chime group: Larry is told it
     # completed and which group the screenshot goes to. Sent even if the ❤ could
@@ -7174,6 +7179,33 @@ async def recover_one_ledger(client, target):
     return False
 
 
+# How far back a switch marker is looked for by name, on top of the newest
+# messages. The private chat fills with cashout notices - thousands between one
+# switch and the next - so reading only the newest 100 lost a /group on from
+# 2026-10-14 and the 2026-10-26 deploy booted CHIME PICCASO out of service for
+# five hours. Telegram's own search finds a marker however old it is.
+MARKER_SEARCH_LIMIT = 100
+
+
+async def _marker_candidates(client, entity, marks, limit=100):
+    """The private chat's newest messages plus every message found by searching
+    for each marker, newest first. A failed search is logged and the newest
+    messages are still read, exactly as before."""
+    found = {}
+    async for message in client.iter_messages(entity, limit=limit):
+        found[message.id] = message
+    for mark in marks:
+        words = mark.split(' ', 1)[-1]          # Telegram searches words, not emoji
+        try:
+            async for message in client.iter_messages(
+                    entity, search=words, limit=MARKER_SEARCH_LIMIT):
+                found.setdefault(message.id, message)
+        except Exception as e:
+            print(f"⚠️ [SWITCH] searching the private chat for '{words}' "
+                  f"failed: {e}", flush=True)
+    return sorted(found.values(), key=lambda m: (m.date, m.id), reverse=True)
+
+
 async def recover_cashout_switch(client):
     """Restore the emergency stop from the last marker the bot published.
 
@@ -7201,7 +7233,8 @@ async def recover_cashout_switch(client):
     # the exact failure it was written to prevent.
     try:
         entity = await client.get_entity(BOT_ID)
-        async for message in client.iter_messages(entity, limit=100):
+        for message in await _marker_candidates(
+                client, entity, (CASHOUT_STOP_MARK, CASHOUT_RESUME_MARK)):
             sender = await message.get_sender()
             if BOT_ID is None or getattr(sender, 'id', None) != BOT_ID:
                 continue               # our own side of the conversation
@@ -7275,7 +7308,8 @@ async def recover_group_switch(client):
     # userbot never finishes starting.
     try:
         entity = await client.get_entity(BOT_ID)
-        async for message in client.iter_messages(entity, limit=100):
+        for message in await _marker_candidates(
+                client, entity, (GROUP_PAUSE_MARK, GROUP_RESUME_MARK)):
             sender = await message.get_sender()
             if BOT_ID is None or getattr(sender, 'id', None) != BOT_ID:
                 continue                       # our own side of the conversation
@@ -7541,7 +7575,8 @@ async def recover_open_requests(client):
                 continue
             used.add(origin.id)
 
-            hearted = _has_heart(origin)
+            # CHIME PICCASO's are marked with @staffhelper's button, not a ❤.
+            hearted = _has_heart(origin) or _status_completed(origin)
             if hearted:
                 continue
             if copy.id in paid_ids:

@@ -29,7 +29,7 @@ PICCASO, MHLARRY = -5350880041, -1003894781195
 GAFFER, CHIMEREV = -5580596463, -1002335630148
 ADMIN = f.ADMIN_ID
 
-sent, dms, clicks = [], [], []
+sent, dms, clicks, hearts = [], [], [], []
 
 
 class FakeMsg:
@@ -47,6 +47,7 @@ class FakeBot:
         return FakeMsg(7900)
 
     async def set_message_reaction(self, chat_id, message_id, reaction):
+        hearts.append((chat_id, message_id))
         return True
 
 
@@ -128,7 +129,7 @@ def request(tag, amount, status='PENDING'):
 
 
 def reset(history=None):
-    sent.clear(); dms.clear(); clicks.clear()
+    sent.clear(); dms.clear(); clicks.clear(); hearts.clear()
     f._pending_cashouts.clear()
     f._seen_messages.clear()
     f._cashout_claims.clear()
@@ -169,6 +170,8 @@ async def main():
           'Status : COMPLETED' in shown(history, 910), shown(history, 910))
     check('Larry still gets the completed DM', len(completed_dms()) == 1, str(dms))
     check('nobody is alerted', status_alerts() == [], str(dms))
+    # 2026-10-26, the user: "instead of reacting click the button".
+    check('the button replaces the ❤ - no reaction', hearts == [], str(hearts))
     check('the /out still reaches CHIME PICCASO',
           any(c == PICCASO for c, _ in sent), str(sent))
     check('Total Out is booked', f.ledger_snapshot(PICCASO)[1] == 25.0)
@@ -214,6 +217,7 @@ async def main():
     await run_cashout(PICCASO, MHLARRY, text, 910)
     check('already completed: nothing pressed', clicks == [], str(clicks))
     check('already completed: no alert', status_alerts() == [], str(dms))
+    check('already completed: no ❤ either', hearts == [], str(hearts))
 
     # -- 6. a request a person typed: no button to press, nobody bothered -----
     plain = '!! Cashout Request !!\nTag name : $Cayce-Parker-2\nAmount : 25'
@@ -221,6 +225,8 @@ async def main():
     await run_cashout(PICCASO, MHLARRY, plain, 910)
     check('a human request is left alone', clicks == [], str(clicks))
     check('and raises no alert', status_alerts() == [], str(dms))
+    check('no button to press, so it is ❤\'d as before',
+          hearts == [(PICCASO, 910)], str(hearts))
 
     # -- 7. no Status button --------------------------------------------------
     reset([UserMsg(910, text, buttons=('Open',))])
@@ -228,6 +234,8 @@ async def main():
     check('no button: nothing pressed', clicks == [])
     alerts = status_alerts()
     check('no button: the admin account is told', len(alerts) == 1, str(dms))
+    check('a press that failed falls back to the ❤, so it never looks unpaid',
+          hearts == [(PICCASO, 910)], str(hearts))
     if alerts:
         check('the alert says the money side is done', 'booked' in alerts[0], alerts[0])
         check('the alert shows which request', '$Cayce-Parker-2' in alerts[0], alerts[0])
@@ -293,6 +301,7 @@ async def main():
     check('CHIME GAFFER: nothing pressed', clicks == [], str(clicks))
     check('CHIME GAFFER: no alert', status_alerts() == [], str(dms))
     check('CHIME GAFFER: completed as before', len(completed_dms()) == 1)
+    check('CHIME GAFFER: still ❤\'d', hearts == [(GAFFER, 910)], str(hearts))
 
     reset(None)
     await run_cashout(GAFFER, CHIMEREV, text, 910)

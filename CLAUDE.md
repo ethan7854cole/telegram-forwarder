@@ -20,7 +20,7 @@ tests/test.sh cashout           # only matching suites
 `tests/test.sh` picks an interpreter that has the packages (see the note on
 `python3` under Gotchas) and builds `.venv` only if none does.
 
-1877 checks across 43 suites, all stubbed — nothing touches Telegram, the
+1887 checks across 43 suites, all stubbed — nothing touches Telegram, the
 network, or the live groups. They cover the pre-existing behaviour as well as
 the new, so they are the guard against a change quietly altering something that
 already worked.
@@ -427,6 +427,12 @@ every branch, and `cashout_watchdog()` skips its whole round.
   resume, not a refusal — a refusal in a group would announce that a kill switch
   exists, to exactly the people it is kept from. Typed in a group, even the
   confirmation comes back as a DM to whoever ran it.
+- **The marker is found however old it is** — `_marker_candidates()`. The
+  private chat fills with cashout notices, and reading only the newest 100
+  lost the 2026-10-14 `/group on piccaso`: the 2026-10-26 deploy booted CHIME
+  PICCASO and MH X LARRY GROUP 2 out of service for five hours. Telegram's
+  search now looks for each marker on top of the newest 100. Same for
+  `/group` below.
 - **It survives a redeploy.** Railway wipes the disk on every push, and the
   incident that made somebody stop the flow is very often the reason a push is
   coming — a switch held only in memory would turn itself back on at the worst
@@ -1000,9 +1006,16 @@ CHIME PICCASO's requests are posted by `@staffhelper`, reading `Status :
 PENDING` with a **Status** button. Pressing Status offers the choices;
 pressing **Completed** rewrites the request to `Status : COMPLETED` and the
 buttons go. `press_status_button()` does both presses when a `/out` completes
-the request in `handle_cashout_reply()` — after the ❤, just before Larry's
-"COMPLETED SUCCESSFULLY" DM — then re-reads the message until it shows
-COMPLETED. `STATUS_BUTTON_CHATS` is CHIME PICCASO only.
+the request in `handle_cashout_reply()` — in place of the ❤ — then re-reads
+the message until it shows COMPLETED. `STATUS_BUTTON_CHATS` is CHIME PICCASO
+only.
+
+- **The button replaces the ❤** (the user's call, 2026-10-26): a request
+  marked COMPLETED gets no reaction. The ❤ is only the fallback — a request
+  with no @staffhelper message (typed by a person), or a press that failed,
+  is ❤'d as before, so a paid request never looks unpaid.
+- **Restart recovery reads `Status : COMPLETED` as settled**, the way it reads
+  a ❤ (`recover_open_requests()`).
 
 - **Through the user account.** The Bot API cannot press a button on another
   bot's message.

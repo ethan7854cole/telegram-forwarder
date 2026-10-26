@@ -100,8 +100,12 @@ class Cmd:
 
 # ---- a Telethon client for the boot-recovery path ------------------------
 
+_tele_ids = iter(range(90000, 0, -1))
+
+
 class TeleMessage:
     def __init__(self, text, when, sender_id=BOTID):
+        self.id = next(_tele_ids)
         self.raw_text = text
         self.date = when
         self._sender_id = sender_id
@@ -121,10 +125,12 @@ class FakeClient:
             raise RuntimeError('CHANNEL_PRIVATE')
         return type('E', (), {'id': cid})()
 
-    def iter_messages(self, entity, limit=100):
+    def iter_messages(self, entity, limit=100, search=None):
         if self.explode == 'iter':
             raise AttributeError('no iter_messages here')
         msgs = self.history.get(entity.id, [])
+        if search:
+            msgs = [m for m in msgs if search in m.raw_text]
 
         async def gen():
             for m in msgs[:limit]:
@@ -330,6 +336,18 @@ async def main():
     ]})
     await f.recover_cashout_switch(client)
     check('and the other way round', f.cashout_stopped() is False)
+
+    # A stop from long ago, behind more notices than the newest-100 scan
+    # reads, must still be found - the same hole that paused CHIME PICCASO on
+    # the 2026-10-26 deploy.
+    reset()
+    noise = [TeleMessage('📨 CASHOUT REQUEST HAS BEEN SUBMITTED',
+                         now - timedelta(minutes=i)) for i in range(150)]
+    client = FakeClient({BOTID: noise + [
+        TeleMessage(f.CASHOUT_STOP_MARK, now - timedelta(days=12))]})
+    await f.recover_cashout_switch(client)
+    check('a stop buried behind 150 notices is still restored',
+          f.cashout_stopped() is True)
 
     # Somebody else's message carrying the same words must not count.
     reset()

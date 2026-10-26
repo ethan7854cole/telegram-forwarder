@@ -226,6 +226,21 @@ async def main():
     check('a 👍 on the original does not settle it',
           await f.recover_open_requests(client) == 1)
 
+    # CHIME PICCASO's are marked with @staffhelper's button instead of a ❤
+    # (2026-10-26), so "Status : COMPLETED" settles it the same way.
+    reset()
+    client = FakeClient({GAFFER: [chime(text=REQUEST + '\nStatus : COMPLETED')],
+                         CHIMEREV: [copy()]})
+    n = await f.recover_open_requests(client)
+    check('a request showing Status : COMPLETED is settled',
+          n == 0 and not f._pending_cashouts, str(f._pending_cashouts))
+
+    reset()
+    client = FakeClient({GAFFER: [chime(text=REQUEST + '\nStatus : PENDING')],
+                         CHIMEREV: [copy()]})
+    check('one still PENDING comes back',
+          await f.recover_open_requests(client) == 1)
+
     # -- 5. answered, but the ❤ never landed ---------------------------------
     reset()
     answered = [Msg(802, '/out 150', 20, CREW, username='Maynuddin23'), copy()]

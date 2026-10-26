@@ -95,8 +95,12 @@ class Cmd:
         self.message_id = 4100
 
 
+_tele_ids = iter(range(90000, 0, -1))
+
+
 class TeleMessage:
     def __init__(self, text, when, sender_id=BOTID):
+        self.id = next(_tele_ids)
         self.raw_text, self.date, self._sender_id = text, when, sender_id
 
     async def get_sender(self):
@@ -112,12 +116,15 @@ class FakeClient:
             raise RuntimeError('CHANNEL_PRIVATE')
         return type('E', (), {'id': cid})()
 
-    def iter_messages(self, entity, limit=100):
+    def iter_messages(self, entity, limit=100, search=None):
         if self.explode == 'iter':
             raise AttributeError('no iter_messages here')
 
         async def gen():
-            for m in self.history.get(entity.id, [])[:limit]:
+            msgs = self.history.get(entity.id, [])
+            if search:
+                msgs = [m for m in msgs if search in m.raw_text]
+            for m in msgs[:limit]:
                 yield m
         return gen()
 
@@ -306,6 +313,26 @@ async def test_recovery():
     check('and nobody is told about groups that are working',
           not any('out of service' in t.lower() for t in admin_dms()),
           str(admin_dms()))
+
+    # 2026-10-26: the /group on from 12 days earlier sat behind thousands of
+    # cashout notices, the newest-100 scan missed it, and the deploy booted
+    # CHIME PICCASO out of service for five hours. Search finds it.
+    reset(paused=[PICCASO, MHLARRY])
+    resumed = f.group_switch_marker(False, [PICCASO, MHLARRY], [], '@larryyxx')
+    noise = [TeleMessage('✅ CASHOUT TO CHIME GAFFER COMPLETED SUCCESSFULLY',
+                         now - timedelta(minutes=i)) for i in range(150)]
+    await f.recover_group_switch(FakeClient(
+        {BOTID: noise + [TeleMessage(resumed, now - timedelta(days=12))]}))
+    check('a resume buried behind 150 notices still puts them back',
+          f.PAUSED_CHAT_IDS == [], str(f.PAUSED_CHAT_IDS))
+
+    reset()
+    paused = f.group_switch_marker(True, [PICCASO, MHLARRY], [PICCASO, MHLARRY],
+                                   '@larryyxx')
+    await f.recover_group_switch(FakeClient(
+        {BOTID: noise + [TeleMessage(paused, now - timedelta(days=12))]}))
+    check('and a buried pause still keeps them out of service',
+          f.chat_paused(PICCASO) and f.chat_paused(MHLARRY), str(f.PAUSED_CHAT_IDS))
 
     # somebody else's messages in the same DM are not markers
     reset()
